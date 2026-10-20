@@ -4,7 +4,7 @@ Thank you for helping improve `dsh-acp`.
 
 ## Development setup
 
-Install Rust 1.88 or newer and provide a DeepSeek-compatible endpoint for
+Install Rust 1.89 or newer and provide a DeepSeek-compatible endpoint for
 manual testing. Automated tests use a loopback mock provider and do not need an
 API key.
 
