@@ -451,7 +451,7 @@ name = "dsh-acp"
 version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "clap",
  "futures-util",
