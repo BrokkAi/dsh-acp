@@ -1088,7 +1088,9 @@ async fn v2_command_reports_agent_owned_terminal_output() {
     assert_eq!(idle["params"]["update"]["stopReason"], "end_turn");
     assert!(peer.updates.iter().any(|update| {
         update["params"]["update"]["sessionUpdate"] == "terminal_update"
-            && update["params"]["update"]["command"] == "sh"
+            && update["params"]["update"]["command"]
+                .as_str()
+                .is_some_and(|command| command.starts_with("sh "))
     }));
     assert!(peer.updates.iter().any(|update| {
         update["params"]["update"]["sessionUpdate"] == "terminal_output_chunk"
