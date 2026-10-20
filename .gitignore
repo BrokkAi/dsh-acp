@@ -1,0 +1,39 @@
+# Rust build output
+/target/
+
+# Local harness state and generated session transcripts
+/.dsh-acp/
+/sessions/
+
+# Secrets and local configuration
+/.env
+/.env.*
+!/.env.example
+*.pem
+*.key
+
+# Logs and temporary output
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+
+# Test and coverage artifacts
+/coverage/
+*.profraw
+*.profdata
+lcov.info
+
+# Editor and OS metadata
+/.claude/
+/.brokk/
+/.mjolnir/
+/.codex/
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
+
+# Keep Cargo.lock: this repository builds an application binary.
+
