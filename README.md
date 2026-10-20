@@ -1,37 +1,65 @@
 # dsh-acp
 
-`dsh-acp` is a DeepSeek-powered coding agent that speaks the
-[Agent Client Protocol](https://agentclientprotocol.com/) over stdio. It is
-built on `agent-client-protocol` 3.4, negotiates ACP v2 when the client
-requests it, and falls back to ACP v1 for older clients.
+**Run a full DeepSeek coding agent in Zed, JetBrains IDEs, and any other
+[Agent Client Protocol](https://agentclientprotocol.com/) client.**
+
+[![CI](https://github.com/BrokkAi/dsh-acp/actions/workflows/ci.yml/badge.svg)](https://github.com/BrokkAi/dsh-acp/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/BrokkAi/dsh-acp)](https://github.com/BrokkAi/dsh-acp/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
+[![ACP](https://img.shields.io/badge/ACP-v1%20%7C%20v2-blue.svg)](https://agentclientprotocol.com/)
+
+`dsh-acp` is a DeepSeek-powered coding agent and ACP server built on
+`agent-client-protocol` 3.4. It negotiates ACP v2 when the client requests it
+and falls back to ACP v1 for older clients.
 
 It is not a chat-only adapter. The agent can stream reasoning and responses,
 call filesystem and terminal operations through the ACP client, run local
 fallback tools, use permission prompts, consume MCP servers, persist and replay
 sessions, switch modes and models, and report token usage.
 
-## Build
+> `dsh-acp` is an independent community project. DeepSeek is a product of its
+> respective owner. This project is not affiliated with, endorsed by, or
+> supported by DeepSeek.
+
+## Why dsh-acp
+
+- **ACP v1 and v2:** version negotiation, asynchronous v2 prompt acceptance,
+  foreground state, replay cursors, structured diffs, agent-owned terminals,
+  and v1 compatibility in one stdio binary.
+- **Real coding tools:** workspace-confined file reads and edits, command
+  execution, regex search, web fetch, planning, user questions, and MCP tools.
+- **Durable sessions:** atomic JSON persistence, resume, replay, fork, list,
+  delete, and close with tool outcomes and rendered state restored.
+- **Steering:** the ecosystem `_session/steering` extension on both ACP
+  versions, including the `promptRequired` idle policy.
+- **DeepSeek streaming:** text, reasoning, image prompts, tool-call assembly,
+  provider configuration, and current context occupancy.
+
+Detailed compatibility and extension notes live in
+[docs/acp-support.md](docs/acp-support.md), with steering behavior in
+[docs/steering.md](docs/steering.md).
+
+## Quick start
+
+Install from the repository:
 
 ```bash
-cargo build --release
+cargo install --git https://github.com/BrokkAi/dsh-acp
 ```
 
-The binary is `target/release/dsh-acp`.
-
-## Run
-
-ACP agents communicate on stdout, so diagnostics are written to stderr.
+Set a DeepSeek API key and launch the stdio server from your ACP client:
 
 ```bash
 export DEEPSEEK_API_KEY="..."
-./target/release/dsh-acp
+dsh-acp
 ```
 
-Typical client configuration:
+Example client configuration:
 
 ```json
 {
-  "command": "/absolute/path/to/dsh-acp",
+  "command": "dsh-acp",
   "args": [],
   "env": {
     "DEEPSEEK_API_KEY": "..."
@@ -39,7 +67,24 @@ Typical client configuration:
 }
 ```
 
-Useful options:
+ACP traffic uses stdout. Diagnostics and tracing use stderr, so the server is
+safe to launch as a client subprocess.
+
+## Build from source
+
+Requirements:
+
+- Rust 1.88 or newer
+- A DeepSeek API key, or compatible provider headers
+- An ACP client or another process capable of speaking ACP over stdio
+
+```bash
+cargo build --release
+```
+
+The binary is `target/release/dsh-acp`.
+
+## Configuration
 
 ```text
 --base-url <URL>                 OpenAI-compatible API root
@@ -167,16 +212,69 @@ parent-session links, cumulative token usage, and current context occupancy.
 Replay restores failed and cancelled tool statuses, rendered diffs and patches,
 terminal state, plans, compactions, and image/resource prompt content.
 
+## Architecture
+
+One process hosts both ACP protocol implementations through the SDK protocol
+router:
+
+```mermaid
+flowchart LR
+    C[ACP Client] <-->|stdio JSON-RPC| R[v1 / v2 router]
+    R <--> V1[ACP v1 adapter]
+    R <--> V2[ACP v2 adapter]
+    V1 --> S[Session runtime and replay store]
+    V2 --> S
+    V1 --> D[DeepSeek streaming client]
+    V2 --> D
+    V1 --> T[Built-in tools and MCP]
+    V2 --> T
+```
+
+The v1 and v2 wire surfaces stay separate while sharing session records, model
+transport, and tool execution. A request routed to v2 never receives a v1
+projection, and unexpected protocol fields are left to the SDK's extensible
+types rather than rejected by this application.
+
+See [docs/architecture.md](docs/architecture.md) for the lifecycle, storage,
+security boundaries, and concurrency model.
+
+## Security model
+
+- File tools are confined to the session `cwd` and additional workspace roots,
+  with symlink and lexical escape checks.
+- Writes, commands, and MCP calls request ACP permission unless policy or an
+  in-session "allow always" decision authorizes them.
+- `web_fetch` rejects loopback, private, link-local, multicast, and unsafe
+  redirect targets.
+- Credentials are read from launch configuration or provider requests and are
+  not written to session transcripts.
+
+Report vulnerabilities privately according to [SECURITY.md](SECURITY.md).
+
 ## Verification
 
 ```bash
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo build --release
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo build --release --locked
 ```
 
 The integration suite performs real ACP v1 and v2 stdio handshakes and runs
 mocked DeepSeek streams through complete tool round trips, permissions, and
 cancellation. Binding its loopback mock server may require network permission
 in heavily sandboxed environments.
+
+## Documentation
+
+- [ACP support matrix](docs/acp-support.md)
+- [Architecture and lifecycle](docs/architecture.md)
+- [Steering extension](docs/steering.md)
+- [Contributing](CONTRIBUTING.md)
+- [Changelog](CHANGELOG.md)
+- [Release process](RELEASING.md)
+
+## License
+
+MIT. See [LICENSE](LICENSE).
 
