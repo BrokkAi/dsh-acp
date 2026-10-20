@@ -6,7 +6,7 @@
 [![CI](https://github.com/BrokkAi/dsh-acp/actions/workflows/ci.yml/badge.svg)](https://github.com/BrokkAi/dsh-acp/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/BrokkAi/dsh-acp)](https://github.com/BrokkAi/dsh-acp/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.89%2B-orange.svg)](https://www.rust-lang.org/)
 [![ACP](https://img.shields.io/badge/ACP-v1%20%7C%20v2-blue.svg)](https://agentclientprotocol.com/)
 
 `dsh-acp` is a DeepSeek-powered coding agent and ACP server built on
@@ -74,7 +74,7 @@ safe to launch as a client subprocess.
 
 Requirements:
 
-- Rust 1.88 or newer
+- Rust 1.89 or newer
 - A DeepSeek API key, or compatible provider headers
 - An ACP client or another process capable of speaking ACP over stdio
 

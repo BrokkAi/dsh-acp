@@ -4,6 +4,17 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+
+- Raised the minimum supported Rust version to 1.89.
+- Updated all dependencies to their latest releases, including `reqwest` 0.13,
+  `base64` 0.23, `tokio` 1.54, `uuid` 1.28, and `schemars` 1.2.3.
+- HTTPS now verifies certificates against the operating system's trust store
+  (`reqwest` 0.13 `rustls` with the platform verifier) instead of bundled
+  WebPKI roots.
+
 ## 0.1.0 - 2026-10-20
 
 ### Added
