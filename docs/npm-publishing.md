@@ -22,38 +22,32 @@ matches exactly; different contents require a new version. Prereleases use
 the `next` dist-tag. After publishing, verification waits up to five minutes
 for npm's registry metadata to become available without publishing again.
 
-## First publication and trusted publisher setup
+## Initial package bootstrap and trusted publisher setup
 
-The package must exist before configuring its trusted publisher, so the first
-npm version is published by hand. Use an npm account with publishing access to
-the `@brokkai` scope and 2FA enabled. `npm trust` is built into the npm CLI; no
-Cargo plugin is required.
+npm requires a package to exist before a trusted publisher can be configured.
+The package name is reserved by a metadata-only `0.0.1` bootstrap release under
+the `bootstrap` dist-tag. npm assigns the first package version to `latest`
+even when another tag is requested, so `0.0.1` is deprecated and must be
+replaced as `latest` by the first substantive release. The bootstrap package
+contains no executable and must not be used.
 
-`v0.1.0` predates the release workflow and has no complete set of platform
-archives, so the first npm version is the first release that `release.yml`
-publishes. That tag run publishes the GitHub release, then its npm step fails
-because the package does not exist yet. From a clean checkout at that tag, with
-its verified release assets in `dist/`, run:
+Trusted publishing is configured for owner `BrokkAi`, repository `dsh-acp`,
+and workflow filename `release.yml`, with direct publishing allowed and no
+environment restriction (the workflow does not declare an environment). The
+first substantive release, `0.2.0`, exercises this configuration end to end.
+
+`npm trust` is built into the npm CLI; no Cargo plugin is required. The
+configuration can be inspected with:
 
 ```sh
-gh release download vX.Y.Z --repo BrokkAi/dsh-acp --dir dist --pattern 'dsh-acp-*'
-npm login --registry=https://registry.npmjs.org/
-python3 scripts/npm_release.py pack
-npm publish ./npm-dist/brokkai-dsh-acp-X.Y.Z.tgz --access public --ignore-scripts
-npm trust github @brokkai/dsh-acp --repo BrokkAi/dsh-acp --file release.yml --allow-publish
 npm trust list @brokkai/dsh-acp --json
 ```
 
-Replace `X.Y.Z` with the Cargo version. Complete npm's browser/2FA prompts
-when requested. The trusted publisher must use owner `BrokkAi`, repository
-`dsh-acp`, and workflow filename `release.yml`, with direct publishing allowed
-and no environment restriction (the workflow does not declare an environment).
-
-Then rerun the tag workflow's failed publisher job. It verifies the completed
-GitHub release read-only and finds the npm version already published; it
-passes only if the registry tarball is identical to the one it packs, and
-otherwise fails without publishing. The next release tag is the end-to-end
-verification that the trust configuration works.
+If npm publication fails after GitHub succeeds, rerun the tag workflow's
+publisher job. It verifies the completed GitHub release read-only and either
+publishes a missing npm version or finds the published version; it passes only
+if the registry tarball is identical to the one it packs, and otherwise fails
+without publishing.
 
 The packager rejects missing platforms, corrupt archives, and release metadata
 that does not match the checked-out commit and Cargo version. It accepts the

@@ -132,8 +132,8 @@ That step uses `id-token: write` for npm OIDC, publishes stable versions to
 `latest` and prereleases to `next`, and verifies registry integrity. If npm
 publication fails after GitHub succeeds, follow the npm guide and rerun the
 same tag workflow; do not replace the completed GitHub assets or reuse the
-version for different package contents. The first npm publication is manual;
-see [npm publishing](docs/npm-publishing.md).
+version for different package contents. The npm package name was bootstrapped
+manually at `0.0.1`; see [npm publishing](docs/npm-publishing.md).
 
 ## Release draft lookups
 
