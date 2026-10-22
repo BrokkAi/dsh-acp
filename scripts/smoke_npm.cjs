@@ -37,6 +37,9 @@ async function initialize(launcher, dataDir) {
     assert.deepEqual([code, signal], [0, null], 'server should exit cleanly on stdin EOF');
   } finally {
     clearTimeout(timer);
+    // A failure before stdin closes (such as non-JSON output) leaves the
+    // server waiting for input; its pipes would keep this process alive.
+    if (child.exitCode === null && child.signalCode === null) child.kill();
   }
 }
 
