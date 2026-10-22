@@ -1,0 +1,225 @@
+import json
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import release
+
+
+class ArchiveValidation(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.directory = Path(self.temp.name)
+        self.addCleanup(self.temp.cleanup)
+
+    def build(self, target):
+        original = Path.read_bytes
+        def read(path):
+            if str(path).startswith('target/'):
+                return b'test binary bytes'
+            return original(path)
+        with patch.object(release, 'metadata'), patch.object(release, 'selftest'), patch.object(Path, 'read_bytes', read):
+            release.package(target, self.directory)
+
+    def test_all_platform_archives_and_permissions(self):
+        for target in release.TARGETS:
+            self.build(target)
+            entries = release.inspect_archive(self.directory, target)
+            manifest = json.loads(entries['release.json'][0])
+            self.assertEqual(manifest['commit'], release.SHA)
+            self.assertEqual(manifest['target'], target)
+            self.assertEqual(set(entries), {release.binary_name(target), 'release.json', 'README.md', 'LICENSE'})
+        release.validate(self.directory)
+
+    def test_unexpected_assets_are_rejected(self):
+        for target in release.TARGETS:
+            self.build(target)
+        (self.directory / 'install.sh').write_bytes(b'not a release asset')
+        with self.assertRaisesRegex(RuntimeError, 'unexpected'):
+            release.validate(self.directory)
+
+    def test_corrupt_archive_fails(self):
+        target = release.TARGETS[0]
+        self.build(target)
+        path = self.directory / release.archive_name(target)
+        path.write_bytes(path.read_bytes() + b'corrupt')
+        with self.assertRaisesRegex(RuntimeError, 'checksum'):
+            release.inspect_archive(self.directory, target)
+
+    def test_wrong_commit_fails(self):
+        target = release.TARGETS[0]
+        self.build(target)
+        with patch.object(release, 'SHA', '0' * 40):
+            with self.assertRaisesRegex(RuntimeError, 'metadata'):
+                release.inspect_archive(self.directory, target)
+
+    def test_missing_platform_fails(self):
+        self.build(release.TARGETS[0])
+        with self.assertRaisesRegex(RuntimeError, 'Missing'):
+            release.validate(self.directory)
+
+    def test_different_payloads_do_not_compare_equal(self):
+        target = release.TARGETS[0]
+        self.build(target)
+        first = release.inspect_archive(self.directory, target)
+        with patch.object(release, 'SHA', '1' * 40):
+            self.build(target)
+            second = release.inspect_archive(self.directory, target)
+        self.assertNotEqual(first, second)
+
+    def test_resume_archive_without_checksum_preserves_uploaded_compression(self):
+        target = release.TARGETS[0]
+        self.build(target)
+        name = release.archive_name(target)
+        raw = bytearray((self.directory / name).read_bytes())
+        raw[4:8] = (123456789).to_bytes(4, 'little')  # Different gzip timestamp.
+        remote = {'assets': [{'name': name, 'id': 42}]}
+        with patch.object(release, 'gh', return_value=bytes(raw)):
+            release.compare_remote(remote, self.directory, False, resume=True)
+        self.assertEqual((self.directory / name).read_bytes(), raw)
+        release.inspect_archive(self.directory, target)
+
+    def test_authorization_rejects_local_identity(self):
+        with patch.dict(release.os.environ, {'GITHUB_ACTIONS': 'false'}):
+            with self.assertRaisesRegex(RuntimeError, 'actual Actions'):
+                release.authorization()
+
+
+# `objdump -T` lines for a binary linked on glibc 2.39: a strong 2.34
+# reference, a weak 2.39 one (std's optional pidfd support), and an old one.
+OBJDUMP = '''
+0000000000000000      DF *UND*\t0000000000000000 (GLIBC_2.34) __libc_start_main
+0000000000000000  w   DF *UND*\t0000000000000000 (GLIBC_2.39) pidfd_spawnp
+0000000000000000      DF *UND*\t0000000000000000 (GLIBC_2.2.5) memcpy
+'''
+STRONG_238 = '0000000000000000      DF *UND*\t0000000000000000 (GLIBC_2.38) __isoc23_strtol\n'
+
+
+class Selftest(unittest.TestCase):
+    def test_binary_must_report_the_cargo_version(self):
+        with patch.object(release.subprocess, 'check_output', return_value=f'dsh-acp {release.VERSION}\n') as run:
+            release.selftest(Path('target/x/release/dsh-acp'), 'x86_64-apple-darwin')
+        self.assertEqual(run.call_args.args[0][1:], ['--version'])
+        with patch.object(release.subprocess, 'check_output', return_value='dsh-acp 0.0.0-other\n'):
+            with self.assertRaisesRegex(RuntimeError, 'wrong version'):
+                release.selftest(Path('target/x/release/dsh-acp'), 'x86_64-apple-darwin')
+
+    def test_a_different_program_fails(self):
+        with self.assertRaisesRegex(RuntimeError, 'wrong version'):
+            release.selftest(Path(sys.executable), 'x86_64-pc-windows-msvc')
+
+    def test_weak_glibc_references_do_not_raise_the_minimum(self):
+        with patch.object(release.subprocess, 'check_output', return_value=OBJDUMP) as run:
+            self.assertEqual(release.glibc_required(Path('dsh-acp')), (2, 34))
+        self.assertEqual(run.call_args.args[0], ['objdump', '-T', 'dsh-acp'])
+
+    def test_linux_binaries_must_not_need_a_newer_glibc_than_the_minimum(self):
+        version = f'dsh-acp {release.VERSION}\n'
+        for target in ['x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu']:
+            with patch.object(release.subprocess, 'check_output', side_effect=[version, OBJDUMP]):
+                release.selftest(Path('dsh-acp'), target)
+            with patch.object(release.subprocess, 'check_output', side_effect=[version, OBJDUMP + STRONG_238]):
+                with self.assertRaisesRegex(RuntimeError, 'requires glibc 2.38'):
+                    release.selftest(Path('dsh-acp'), target)
+
+
+class TagOnlyRelease(unittest.TestCase):
+    def test_master_push_with_released_version_is_a_no_op(self):
+        env = {'GITHUB_EVENT_NAME': 'push', 'GITHUB_REF': 'refs/heads/master'}
+        with patch.dict(release.os.environ, env), patch.object(release, 'tag_commit', return_value='0' * 40):
+            self.assertTrue(release.preflight_superseded())
+
+    def test_unreleased_version_on_master_is_still_checked(self):
+        env = {'GITHUB_EVENT_NAME': 'push', 'GITHUB_REF': 'refs/heads/master'}
+        with patch.dict(release.os.environ, env), patch.object(release, 'tag_commit', return_value=None):
+            self.assertFalse(release.preflight_superseded())
+
+    def test_release_branches_and_tags_keep_the_strict_check(self):
+        for ref in ['refs/heads/brb/release-9.9.9', 'refs/tags/' + release.TAG]:
+            env = {'GITHUB_EVENT_NAME': 'push', 'GITHUB_REF': ref}
+            with patch.dict(release.os.environ, env), patch.object(release, 'tag_commit', return_value='0' * 40):
+                self.assertFalse(release.preflight_superseded(), ref)
+        with patch.object(release, 'tag_commit', return_value='0' * 40):
+            with self.assertRaisesRegex(RuntimeError, 'another commit'):
+                release.tag_check()
+
+    def test_authorization_evidence_needs_only_push_runs(self):
+        push_runs = [{'databaseId': n, 'workflowName': w, 'headSha': release.SHA,
+                      'headBranch': 'master', 'event': 'push', 'status': 'completed',
+                      'conclusion': 'success'} for n, w in [(1, 'CI'), (2, 'release')]]
+        ci_detail = {'headSha': release.SHA, 'conclusion': 'success',
+                     'jobs': [{'name': 'check', 'conclusion': 'success'}]}
+        with patch.object(release, 'metadata'), patch.object(
+            release, 'gh', side_effect=[json.dumps(push_runs).encode(),
+                                        json.dumps(ci_detail).encode(), RuntimeError('release run read')]
+        ):
+            # Reaching the release push run's detail proves no manual
+            # workflow_dispatch run was demanded.
+            with self.assertRaisesRegex(RuntimeError, 'release run read'):
+                release.evidence('authorization')
+
+
+class DraftRecovery(unittest.TestCase):
+    def test_hidden_draft_found_on_later_page_and_read_by_id(self):
+        draft = {'id': 42, 'tag_name': release.TAG, 'draft': True}
+        first = [{'id': i, 'tag_name': f'other-{i}'} for i in range(100)]
+        with patch.object(release, 'optional', return_value=None), patch.object(
+            release, 'api', side_effect=[first, [draft], draft]
+        ) as api:
+            self.assertEqual(release.find_release(release.TAG), draft)
+        self.assertEqual(api.call_args_list[-1].args, ('releases/42',))
+
+    def test_rest_hidden_draft_resolves_via_graphql(self):
+        draft = {'id': 42, 'tag_name': release.TAG, 'draft': True}
+        response = {'data': {'repository': {'release': {'databaseId': 42}}}}
+        with patch.object(release, 'optional', return_value=None), patch.object(
+            release, 'api', side_effect=[[], draft]
+        ) as api, patch.object(release, 'gh', return_value=json.dumps(response).encode()) as gh:
+            self.assertEqual(release.find_release(release.TAG), draft)
+        self.assertEqual(api.call_args_list[-1].args, ('releases/42',))
+        self.assertIn('repository(owner:"BrokkAi", name:"dsh-acp")', ' '.join(gh.call_args.args))
+
+    def test_duplicate_drafts_fail_closed(self):
+        draft = {'id': 42, 'tag_name': release.TAG}
+        with patch.object(release, 'optional', return_value=None), patch.object(
+            release, 'api', return_value=[draft, draft]
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'Multiple releases'):
+                release.find_release(release.TAG)
+
+    def publish(self, version='1.2.3'):
+        name = release.archive_name(release.TARGETS[0]) + '.sha256'
+        draft = {'id': 42, 'draft': True, 'assets': []}
+        uploaded = dict(draft, assets=[{'name': name, 'id': 99}])
+        with tempfile.TemporaryDirectory() as temp, \
+             patch.object(release, 'VERSION', version), patch.object(release, 'TAG', 'v' + version):
+            staged = Path(temp)
+            (staged / name).write_bytes(b'checksum')
+            with patch.dict(release.os.environ, {'GITHUB_REF': 'refs/tags/v' + version}), \
+                 patch.object(release, 'metadata'), patch.object(release, 'validate'), \
+                 patch.object(release, 'release_state', return_value=draft), \
+                 patch.object(release, 'authorization'), patch.object(release, 'compare_remote') as compare, \
+                 patch.object(release, 'expected_names', return_value={name}), \
+                 patch.object(release, 'gh', return_value=b'checksum'), \
+                 patch.object(release, 'api', return_value=uploaded) as api:
+                release.publish(staged)
+        self.assertEqual([c.args[0] for c in api.call_args_list], ['releases/42'] * 4)
+        self.assertEqual(compare.call_count, 3)
+        finalization = api.call_args_list[2].args[2]
+        self.assertEqual(finalization['tag_name'], 'v' + version)
+        self.assertEqual(finalization['target_commitish'], release.SHA)
+        return finalization
+
+    def test_upload_readback_and_completion_use_release_id(self):
+        finalization = self.publish()
+        self.assertEqual((finalization['prerelease'], finalization['make_latest']), (False, 'true'))
+
+    def test_prerelease_versions_never_become_the_latest_release(self):
+        finalization = self.publish('1.3.0-rc.1')
+        self.assertEqual((finalization['prerelease'], finalization['make_latest']), (True, 'false'))
+
+
+if __name__ == '__main__':
+    unittest.main()

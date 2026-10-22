@@ -1,0 +1,26 @@
+{
+  "name": "@brokkai/dsh-acp",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Run a DeepSeek coding agent in Zed, JetBrains IDEs, and other ACP clients",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BrokkAi/dsh-acp.git"
+  },
+  "homepage": "https://github.com/BrokkAi/dsh-acp#readme",
+  "bugs": "https://github.com/BrokkAi/dsh-acp/issues",
+  "bin": {
+    "dsh-acp": "bin/dsh-acp.cjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "os": ["darwin", "linux", "win32"],
+  "cpu": ["x64", "arm64"],
+  "files": ["bin/", "native/", "LICENSE", "README.md"],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}

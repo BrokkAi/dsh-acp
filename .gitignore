@@ -37,3 +37,11 @@ Thumbs.db
 
 # Keep Cargo.lock: this repository builds an application binary.
 
+
+# Release and npm packaging output
+/dist/
+/npm-dist/
+/npm-smoke/
+/node_modules/
+__pycache__/
+*.py[cod]

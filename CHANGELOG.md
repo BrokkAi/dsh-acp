@@ -6,6 +6,15 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ## Unreleased
 
+### Added
+
+- npm package `@brokkai/dsh-acp`, which bundles the native binaries for
+  macOS, Linux (glibc 2.34 or newer), and Windows on x64 and arm64 behind a
+  small Node.js launcher, with no npm dependencies or install scripts.
+- Release workflow that builds and tests all six platforms, publishes verified
+  archives with SHA-256 checksums and `release.json` metadata to GitHub
+  Releases, then publishes to npm through trusted publishing with provenance.
+
 ### Changed
 
 - Raised the minimum supported Rust version to 1.89.

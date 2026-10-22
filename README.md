@@ -42,7 +42,28 @@ Detailed compatibility and extension notes live in
 
 ## Quick start
 
-Install from the repository:
+With Node.js 22 or later, install from npm:
+
+```bash
+npm install -g @brokkai/dsh-acp
+dsh-acp --version
+```
+
+Or run it without a global install:
+
+```bash
+npx --yes @brokkai/dsh-acp --version
+```
+
+The npm package bundles the native binaries for macOS, Linux, and Windows on
+x64 and arm64, so it needs no install scripts or separate downloads. Linux
+binaries need glibc 2.34 or newer (Ubuntu 22.04, Debian 12, RHEL 9, or later);
+musl distributions such as Alpine are not supported.
+
+> The package is the scoped `@brokkai/dsh-acp`. The unscoped `dsh-acp` package
+> on npm is a different, unrelated project.
+
+Or install from the repository with Cargo:
 
 ```bash
 cargo install --git https://github.com/BrokkAi/dsh-acp
@@ -66,6 +87,9 @@ Example client configuration:
   }
 }
 ```
+
+To launch through npx instead of a global install, use `"command": "npx"` and
+`"args": ["--yes", "@brokkai/dsh-acp"]`.
 
 ACP traffic uses stdout. Diagnostics and tracing use stderr, so the server is
 safe to launch as a client subprocess.
@@ -258,6 +282,9 @@ cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --release --locked
+node --test npm/test/launcher.test.cjs
+python3 -m unittest discover -s scripts -p 'test_*.py'
+node scripts/smoke_npm.cjs target/debug/dsh-acp
 ```
 
 The integration suite performs real ACP v1 and v2 stdio handshakes and runs
@@ -273,6 +300,7 @@ in heavily sandboxed environments.
 - [Contributing](CONTRIBUTING.md)
 - [Changelog](CHANGELOG.md)
 - [Release process](RELEASING.md)
+- [npm publishing](docs/npm-publishing.md)
 
 ## License
 

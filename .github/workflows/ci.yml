@@ -1,8 +1,11 @@
 name: CI
 
 on:
+  # Topic branches are covered by their pull_request run. Master, release
+  # topics, and tags keep push runs because RELEASING.md's preflight and tag
+  # checks need them.
   push:
-    branches: [master]
+    branches: [master, "brb/release-*"]
     tags: ["v*"]
   pull_request:
 
@@ -24,9 +27,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - run: node --test npm/test/launcher.test.cjs
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      - run: node scripts/smoke_npm.cjs target/debug/dsh-acp
       - run: cargo build --release --locked
 
   msrv:
@@ -40,3 +50,17 @@ jobs:
         with:
           toolchain: 1.89.0
       - run: cargo test --locked
+
+  npm-launcher:
+    # The release workflow runs the launcher tests on every platform with Node 24.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+      - run: node --test npm/test/launcher.test.cjs
