@@ -697,9 +697,17 @@ async fn v2_prompt_runs_local_tool_loop_and_permission_request() {
                 content.iter().any(|item| {
                     item["type"] == "diff"
                         && item["patch"]["format"] == "git_patch"
-                        && item["patch"]["text"]
-                            .as_str()
-                            .is_some_and(|patch| patch.starts_with("diff --git /"))
+                        && item["patch"]["text"].as_str().is_some_and(|patch| {
+                            // Absolute on every platform: `/…` on Unix, `C:\…` on Windows.
+                            patch.starts_with("diff --git ")
+                                && patch
+                                    .lines()
+                                    .find_map(|line| line.strip_prefix("+++ "))
+                                    .is_some_and(|path| {
+                                        std::path::Path::new(path).is_absolute()
+                                            && path.ends_with("sample.txt")
+                                    })
+                        })
                 })
             })
     }));
