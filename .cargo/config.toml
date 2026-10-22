@@ -1,0 +1,3 @@
+[target.'cfg(all(target_os = "windows", target_env = "msvc"))']
+# Use deterministic PE timestamps and identifiers in independently built assets.
+rustflags = ["-C", "link-arg=/Brepro"]
