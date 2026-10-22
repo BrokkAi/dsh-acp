@@ -6,6 +6,8 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ## Unreleased
 
+## 0.2.0 - 2026-10-22
+
 ### Added
 
 - npm package `@brokkai/dsh-acp`, which bundles the native binaries for
@@ -49,4 +51,5 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 - Integration coverage for v1/v2 handshakes, images, tools, failed-tool replay,
   terminal output, commands, cancellation, and steering.
 
-[Unreleased]: https://github.com/BrokkAi/dsh-acp/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/BrokkAi/dsh-acp/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/BrokkAi/dsh-acp/compare/v0.1.0...v0.2.0
