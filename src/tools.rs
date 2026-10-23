@@ -741,21 +741,7 @@ async fn edit_file(
     let original = tokio::fs::read_to_string(&path)
         .await
         .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let occurrences = original.matches(old_text).count();
-    if occurrences == 0 {
-        return Err(agent_client_protocol::Error::invalid_params()
-            .data("old_text was not found; read the current file before editing it"));
-    }
-    if occurrences > 1 && !replace_all {
-        return Err(agent_client_protocol::Error::invalid_params().data(format!(
-            "old_text occurs {occurrences} times; provide more context or set replace_all=true"
-        )));
-    }
-    let updated = if replace_all {
-        original.replace(old_text, new_text)
-    } else {
-        original.replacen(old_text, new_text, 1)
-    };
+    let (updated, occurrences) = replace_text(&original, old_text, new_text, replace_all)?;
     let write_args = json!({"path": path, "content": updated.clone(), "create_directories": false});
     let mut result = write_file(access, session, &write_args, cancellation).await?;
     result.text = format!(
@@ -771,6 +757,97 @@ async fn edit_file(
         "_new_text": updated
     });
     Ok(result)
+}
+
+/// The text `edit_file` writes: `old_text` must occur exactly once unless
+/// `replace_all` is set. Returns the new text and how often `old_text` occurs.
+fn replace_text(
+    original: &str,
+    old_text: &str,
+    new_text: &str,
+    replace_all: bool,
+) -> Result<(String, usize), agent_client_protocol::Error> {
+    let occurrences = original.matches(old_text).count();
+    if occurrences == 0 {
+        return Err(agent_client_protocol::Error::invalid_params()
+            .data("old_text was not found; read the current file before editing it"));
+    }
+    if occurrences > 1 && !replace_all {
+        return Err(agent_client_protocol::Error::invalid_params().data(format!(
+            "old_text occurs {occurrences} times; provide more context or set replace_all=true"
+        )));
+    }
+    let updated = if replace_all {
+        original.replace(old_text, new_text)
+    } else {
+        original.replacen(old_text, new_text, 1)
+    };
+    Ok((updated, occurrences))
+}
+
+/// The change a `write_file` or `edit_file` call would make, worked out
+/// without writing anything, so the tool call and its permission request can
+/// show it before the user approves. The path is resolved and confined as the
+/// tool resolves it, and only the file the tool itself would read is read.
+///
+/// `None` when the tool would fail (an edit of a missing file, `old_text` not
+/// found or ambiguous, a path outside the workspace roots) or the current file
+/// is not UTF-8 text. The tool then reports its own error when it runs.
+pub async fn preview_diff(
+    session: &SessionRecord,
+    tool: &str,
+    arguments: &Value,
+) -> Option<PersistedDiff> {
+    match tool {
+        "edit_file" => {
+            let path =
+                resolve_existing_path(session, required_string(arguments, "path").ok()?).ok()?;
+            let old_text = required_string(arguments, "old_text").ok()?;
+            let new_text = required_string(arguments, "new_text").ok()?;
+            let replace_all = arguments
+                .get("replace_all")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let original = tokio::fs::read_to_string(&path).await.ok()?;
+            let (updated, _) = replace_text(&original, old_text, new_text, replace_all).ok()?;
+            Some(PersistedDiff {
+                path: path.to_str()?.to_string(),
+                old_text: Some(original),
+                new_text: updated,
+            })
+        }
+        "write_file" => {
+            let path =
+                resolve_writable_path(session, required_string(arguments, "path").ok()?).ok()?;
+            let content = required_string(arguments, "content").ok()?;
+            let old_text = match tokio::fs::read_to_string(&path).await {
+                Ok(text) => Some(text),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                // Not text, a directory, or unreadable: showing it as a new
+                // file would hide that the write replaces something.
+                Err(_) => return None,
+            };
+            let create_directories = arguments
+                .get("create_directories")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if old_text.is_none() && !create_directories {
+                let parent = path.parent()?;
+                if !tokio::fs::metadata(parent)
+                    .await
+                    .is_ok_and(|metadata| metadata.is_dir())
+                {
+                    return None;
+                }
+            }
+            Some(PersistedDiff {
+                path: path.to_str()?.to_string(),
+                old_text,
+                new_text: content.to_string(),
+            })
+        }
+        _ => None,
+    }
 }
 
 async fn run_command(
@@ -1407,6 +1484,119 @@ mod tests {
         assert!(patch.contains("--- /workspace/src/lib.rs"));
         assert!(patch.contains("+++ /workspace/src/lib.rs"));
         assert!(patch.contains("-old\n+new\n"));
+    }
+
+    fn session_in(cwd: &Path) -> SessionRecord {
+        SessionRecord::new(
+            cwd.to_path_buf(),
+            Vec::new(),
+            "deepseek-flash".to_string(),
+            PermissionMode::Ask,
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn edit_preview_applies_the_edit_rules_without_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        std::fs::write(cwd.join("a.txt"), "one two two\n").unwrap();
+        let session = session_in(&cwd);
+        let edit = |old: &str, replace_all: bool| json!({"path": "a.txt", "old_text": old, "new_text": "2", "replace_all": replace_all});
+
+        let diff = preview_diff(&session, "edit_file", &edit("one", false))
+            .await
+            .unwrap();
+        assert_eq!(diff.path, cwd.join("a.txt").to_str().unwrap());
+        assert_eq!(diff.old_text.as_deref(), Some("one two two\n"));
+        assert_eq!(diff.new_text, "2 two two\n");
+        let all = preview_diff(&session, "edit_file", &edit("two", true))
+            .await
+            .unwrap();
+        assert_eq!(all.new_text, "one 2 2\n");
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+            "one two two\n"
+        );
+
+        // Ambiguous, missing text, missing file: the tool would fail.
+        assert!(
+            preview_diff(&session, "edit_file", &edit("two", false))
+                .await
+                .is_none()
+        );
+        assert!(
+            preview_diff(&session, "edit_file", &edit("three", false))
+                .await
+                .is_none()
+        );
+        let missing = json!({"path": "b.txt", "old_text": "x", "new_text": "y"});
+        assert!(
+            preview_diff(&session, "edit_file", &missing)
+                .await
+                .is_none()
+        );
+        std::fs::write(cwd.join("binary.bin"), [0xff, 0xfe, b'x']).unwrap();
+        let binary = json!({"path": "binary.bin", "old_text": "x", "new_text": "y"});
+        assert!(preview_diff(&session, "edit_file", &binary).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn write_preview_shows_the_current_file_or_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        std::fs::write(cwd.join("a.txt"), "old\n").unwrap();
+        let session = session_in(&cwd);
+        let write = |path: &str| json!({"path": path, "content": "new\n"});
+
+        let replaced = preview_diff(&session, "write_file", &write("a.txt"))
+            .await
+            .unwrap();
+        assert_eq!(replaced.old_text.as_deref(), Some("old\n"));
+        assert_eq!(replaced.new_text, "new\n");
+        let created = preview_diff(&session, "write_file", &write("sub/b.txt"))
+            .await
+            .unwrap();
+        assert_eq!(created.path, cwd.join("sub/b.txt").to_str().unwrap());
+        assert_eq!(created.old_text, None);
+        assert!(!cwd.join("sub").exists());
+        let no_parent = json!({"path": "sub/b.txt", "content": "x", "create_directories": false});
+        assert!(
+            preview_diff(&session, "write_file", &no_parent)
+                .await
+                .is_none()
+        );
+        std::fs::write(cwd.join("binary.bin"), [0xff, 0xfe]).unwrap();
+        assert!(
+            preview_diff(&session, "write_file", &write("binary.bin"))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_reads_nothing_outside_the_workspace_roots() {
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().canonicalize().unwrap().join("secret.txt");
+        std::fs::write(&secret, "secret\n").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let session = session_in(&cwd);
+        let secret_path = secret.to_str().unwrap();
+
+        let edit = json!({"path": secret_path, "old_text": "secret", "new_text": "x"});
+        assert!(preview_diff(&session, "edit_file", &edit).await.is_none());
+        let write = json!({"path": secret_path, "content": "x"});
+        assert!(preview_diff(&session, "write_file", &write).await.is_none());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&secret, cwd.join("link.txt")).unwrap();
+            let edit = json!({"path": "link.txt", "old_text": "secret", "new_text": "x"});
+            assert!(preview_diff(&session, "edit_file", &edit).await.is_none());
+            let write = json!({"path": "link.txt", "content": "x"});
+            assert!(preview_diff(&session, "write_file", &write).await.is_none());
+        }
     }
 
     #[test]

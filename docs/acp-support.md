@@ -79,6 +79,12 @@ The session `cwd` and additional roots define the filesystem boundary. Sensitive
 tools request permission unless the session policy or an explicit remembered
 decision allows them.
 
+A write or edit shows its change before it runs: the pending tool call and the
+permission request carry a diff of the whole file (old and new text in v1, a
+patch in v2). When the change cannot be worked out, for example because the
+text to replace is not in the file, they carry no diff and the tool reports
+the error when it runs.
+
 ACP v1 may delegate text file access and terminal execution to a capable client.
 ACP v2 has no client filesystem or terminal execution methods; use an MCP server
 for client-provided tools.

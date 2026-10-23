@@ -6,6 +6,17 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ## Unreleased
 
+### Changed
+
+- A write or edit now shows the change it will make before the user approves
+  it. Its pending tool call and permission request carry a diff of the whole
+  file, worked out without writing anything; they used to carry only a title
+  such as "edit file calc.py". When the change cannot be worked out (the file
+  is missing or is not text, the text to replace is not found or occurs more
+  than once, or the path is outside the workspace), the request carries no
+  diff, as before, and the tool reports its own error when it runs. ACP v1
+  sends the old and new text; ACP v2 sends a patch.
+
 ## 0.2.1 - 2026-10-23
 
 ### Fixed

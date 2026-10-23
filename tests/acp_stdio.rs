@@ -615,6 +615,110 @@ async fn command_permission_title_quotes_arguments_as_a_shell_would() {
     assert_eq!(server.await.unwrap().len(), 2);
 }
 
+/// One model turn that asks for a single tool call.
+fn tool_call_stream(id: &str, name: &str, arguments: Value) -> String {
+    encode_sse(&[
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":arguments.to_string()}}]}}]}),
+        json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+    ])
+}
+
+#[tokio::test]
+async fn edit_and_write_permission_requests_show_the_change() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().canonicalize().unwrap();
+    std::fs::write(cwd.join("sample.txt"), "sample file contents\n").unwrap();
+    let Some((base_url, server)) = mock_sequence_server(vec![
+        tool_call_stream(
+            "call-edit",
+            "edit_file",
+            json!({"path": "sample.txt", "old_text": "contents", "new_text": "changes"}),
+        ),
+        tool_call_stream(
+            "call-write",
+            "write_file",
+            json!({"path": "new.txt", "content": "fresh\n"}),
+        ),
+        tool_call_stream(
+            "call-missing",
+            "edit_file",
+            json!({"path": "sample.txt", "old_text": "absent", "new_text": "x"}),
+        ),
+        mock_text_stream(),
+    ])
+    .await
+    else {
+        eprintln!("skipping permission preview test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(&cwd, Some(&base_url)).await;
+    peer.request("initialize", json!({"protocolVersion": 1}))
+        .await;
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": cwd.to_string_lossy(), "mcpServers": []}),
+        )
+        .await;
+    let response = peer
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session["sessionId"],
+                "prompt": [{"type": "text", "text": "change the files"}]
+            }),
+        )
+        .await;
+    assert_eq!(response["stopReason"], "end_turn");
+
+    let edit_diff = json!([{
+        "type": "diff",
+        "path": cwd.join("sample.txt"),
+        "oldText": "sample file contents\n",
+        "newText": "sample file changes\n"
+    }]);
+    assert_eq!(peer.permission_requests.len(), 3);
+    let tool_call = |index: usize| &peer.permission_requests[index]["params"]["toolCall"];
+    assert_eq!(tool_call(0)["toolCallId"], "call-edit");
+    assert_eq!(tool_call(0)["content"], edit_diff);
+    assert_eq!(tool_call(1)["toolCallId"], "call-write");
+    let write_diff = tool_call(1)["content"].as_array().unwrap();
+    assert_eq!(write_diff.len(), 1);
+    assert_eq!(write_diff[0]["type"], "diff");
+    assert_eq!(write_diff[0]["path"], json!(cwd.join("new.txt")));
+    assert!(write_diff[0]["oldText"].is_null(), "{write_diff:?}");
+    assert_eq!(write_diff[0]["newText"], "fresh\n");
+    // The edit cannot be applied, so the request stays as it was: no diff.
+    assert_eq!(tool_call(2)["toolCallId"], "call-missing");
+    assert!(tool_call(2).get("content").is_none(), "{}", tool_call(2));
+
+    let pending = |id: &str| {
+        peer.updates
+            .iter()
+            .map(|update| &update["params"]["update"])
+            .find(|update| update["sessionUpdate"] == "tool_call" && update["toolCallId"] == id)
+            .unwrap()
+    };
+    assert_eq!(pending("call-edit")["content"], edit_diff);
+    assert!(pending("call-missing").get("content").is_none());
+    assert!(peer.updates.iter().any(|update| {
+        let update = &update["params"]["update"];
+        update["toolCallId"] == "call-missing" && update["status"] == "failed"
+    }));
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("sample.txt")).unwrap(),
+        "sample file changes\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("new.txt")).unwrap(),
+        "fresh\n"
+    );
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    assert_eq!(server.await.unwrap().len(), 4);
+}
+
 #[tokio::test]
 async fn a_session_whose_agent_died_during_a_tool_call_still_takes_prompts() {
     let temp = tempfile::tempdir().unwrap();
@@ -975,6 +1079,15 @@ async fn v2_prompt_runs_local_tool_loop_and_permission_request() {
         22
     );
     assert_eq!(peer.permission_requests.len(), 1);
+    // The request shows the change before it is approved.
+    let subject = &peer.permission_requests[0]["params"]["subject"];
+    let preview = subject.to_string();
+    assert!(
+        preview.contains(r#""type":"diff""#)
+            && preview.contains("-old contents")
+            && preview.contains("+written by tool"),
+        "{subject}"
+    );
     assert!(peer.updates.iter().any(|update| {
         update["params"]["update"]["sessionUpdate"] == "tool_call_update"
             && update["params"]["update"]["name"] == "write_file"

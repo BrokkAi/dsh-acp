@@ -34,8 +34,8 @@ use crate::{
     deepseek::{Completion, StreamEvent},
     model::{
         ChatMessage, ContentPart, ImageUrl, MessageContent, PendingUserMessage,
-        PersistedCompaction, Role, SessionRecord, SessionRuntime, TokenUsage, ToolOutcomeStatus,
-        ensure_session_unique_tool_call_ids,
+        PersistedCompaction, PersistedDiff, Role, SessionRecord, SessionRuntime, TokenUsage,
+        ToolOutcomeStatus, ensure_session_unique_tool_call_ids,
     },
     session::session_title,
     tools::{
@@ -1623,11 +1623,21 @@ impl V2Harness {
         };
         let record = runtime.snapshot().await;
         let title = tool_title(&call.function.name, &arguments);
+        let refused_in_plan_mode =
+            record.config.mode == "plan" && crate::tools::refused_in_plan_mode(&call.function.name);
+        // Show what a write or edit will change before the user approves it.
+        // Plan mode refuses the call below, so there is nothing to show.
+        let preview = if refused_in_plan_mode {
+            None
+        } else {
+            crate::tools::preview_diff(&record, &call.function.name, &arguments).await
+        };
         let update = ToolCallUpdate::new(call.id.clone())
             .name(call.function.name.clone())
             .title(title.clone())
             .kind(tool_kind(&call.function.name))
             .status(ToolCallStatus::Pending)
+            .content(preview.as_ref().map(|diff| vec![diff_content(diff)]))
             .raw_input(arguments.clone());
         send_update(
             connection,
@@ -1694,7 +1704,7 @@ impl V2Harness {
         }
         // Refuse before asking permission: approving a call plan mode then
         // refuses would only mislead the user.
-        if record.config.mode == "plan" && crate::tools::refused_in_plan_mode(&call.function.name) {
+        if refused_in_plan_mode {
             let result = ToolResult {
                 text: crate::tools::PLAN_MODE_REFUSAL.to_string(),
                 raw: json!({"denied": true, "reason": "plan_mode"}),
@@ -2198,16 +2208,7 @@ fn send_tool_result(
         content.push(ToolCallContent::Terminal(Terminal::new(terminal_id)));
     }
     if let Some(diff) = persisted_diff(&call.function.name, &result.raw) {
-        let operation = if diff.old_text.is_some() {
-            DiffChange::modify(&diff.path)
-        } else {
-            DiffChange::add(&diff.path)
-        }
-        .file_type(Some(DiffFileType::Text));
-        content.push(ToolCallContent::Diff(Diff::patch(
-            git_patch(&diff),
-            vec![operation],
-        )));
+        content.push(diff_content(&diff));
     }
     send_update(
         connection,
@@ -2223,6 +2224,18 @@ fn send_tool_result(
                 .raw_output(Some(result.raw.clone())),
         ),
     )
+}
+
+/// A file change as ACP v2 tool call content: a git-style patch of the whole
+/// file.
+fn diff_content(diff: &PersistedDiff) -> ToolCallContent {
+    let operation = if diff.old_text.is_some() {
+        DiffChange::modify(&diff.path)
+    } else {
+        DiffChange::add(&diff.path)
+    }
+    .file_type(Some(DiffFileType::Text));
+    ToolCallContent::Diff(Diff::patch(git_patch(diff), vec![operation]))
 }
 
 enum PermissionDecision {
@@ -2384,16 +2397,7 @@ fn replay_history(
                             }
                         }
                         if let Some(diff) = &outcome.diff {
-                            let operation = if diff.old_text.is_some() {
-                                DiffChange::modify(&diff.path)
-                            } else {
-                                DiffChange::add(&diff.path)
-                            }
-                            .file_type(Some(DiffFileType::Text));
-                            content.push(ToolCallContent::Diff(Diff::patch(
-                                git_patch(diff),
-                                vec![operation],
-                            )));
+                            content.push(diff_content(diff));
                         }
                         if let Some(terminal) = &outcome.terminal {
                             content.push(ToolCallContent::Terminal(Terminal::new(

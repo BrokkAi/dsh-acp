@@ -45,8 +45,8 @@ use crate::{
     mcp::{McpSession, mcp_result_text},
     model::{
         ChatMessage, ContentPart, ImageUrl, MessageContent, PendingUserMessage,
-        PersistedCompaction, Role, SessionRecord, SessionRuntime, TokenUsage, ToolOutcomeStatus,
-        ensure_session_unique_tool_call_ids,
+        PersistedCompaction, PersistedDiff, Role, SessionRecord, SessionRuntime, TokenUsage,
+        ToolOutcomeStatus, ensure_session_unique_tool_call_ids,
     },
     session::{self, SessionStore, session_title},
     tools::{
@@ -1562,6 +1562,15 @@ impl Harness {
         let title = tool_title(&call.function.name, &arguments);
         let record = runtime.snapshot().await;
         let locations = tool_locations(&call.function.name, &arguments, &record);
+        let refused_in_plan_mode =
+            record.config.mode == "plan" && crate::tools::refused_in_plan_mode(&call.function.name);
+        // Show what a write or edit will change before the user approves it.
+        // Plan mode refuses the call below, so there is nothing to show.
+        let preview = if refused_in_plan_mode {
+            None
+        } else {
+            crate::tools::preview_diff(&record, &call.function.name, &arguments).await
+        };
         access
             .connection
             .as_ref()
@@ -1574,13 +1583,14 @@ impl Harness {
                         .kind(kind)
                         .status(ToolCallStatus::Pending)
                         .locations(locations)
+                        .content(preview.iter().map(diff_content).collect())
                         .raw_input(arguments.clone()),
                 ),
             ))?;
 
         // Refuse before asking permission: approving a call plan mode then
         // refuses would only mislead the user.
-        if record.config.mode == "plan" && crate::tools::refused_in_plan_mode(&call.function.name) {
+        if refused_in_plan_mode {
             let result = ToolResult {
                 text: crate::tools::PLAN_MODE_REFUSAL.to_string(),
                 raw: json!({"denied": true, "reason": "plan_mode"}),
@@ -1669,8 +1679,16 @@ impl Harness {
                     send_tool_finished(access, session_id, call, &title, &denied, false)?;
                     return Ok(denied);
                 }
-                match request_permission(access, session_id, call, &title, &arguments, cancellation)
-                    .await?
+                match request_permission(
+                    access,
+                    session_id,
+                    call,
+                    &title,
+                    &arguments,
+                    preview.as_ref(),
+                    cancellation,
+                )
+                .await?
                 {
                     PermissionDecision::AllowOnce => {}
                     PermissionDecision::AllowAlways => {
@@ -2089,10 +2107,7 @@ fn send_tool_finished(
         }
     }
     if let Some(diff) = crate::tools::persisted_diff(&call.function.name, &result.raw) {
-        content.push(ToolCallContent::Diff(
-            agent_client_protocol::schema::v1::Diff::new(diff.path.clone(), diff.new_text.clone())
-                .old_text(diff.old_text.clone()),
-        ));
+        content.push(diff_content(&diff));
     }
     let fields = ToolCallUpdateFields::new()
         .title(Some(title.to_string()))
@@ -2114,6 +2129,14 @@ fn send_tool_finished(
                 fields,
             )),
         ))
+}
+
+/// A file change as ACP v1 tool call content: the whole file before and after.
+fn diff_content(diff: &PersistedDiff) -> ToolCallContent {
+    ToolCallContent::Diff(
+        agent_client_protocol::schema::v1::Diff::new(diff.path.clone(), diff.new_text.clone())
+            .old_text(diff.old_text.clone()),
+    )
 }
 
 enum PermissionDecision {
@@ -2244,6 +2267,7 @@ async fn request_permission(
     call: &crate::model::ToolCall,
     title: &str,
     arguments: &Value,
+    preview: Option<&PersistedDiff>,
     cancellation: &CancellationToken,
 ) -> Result<PermissionDecision, Error> {
     let options = vec![
@@ -2267,6 +2291,7 @@ async fn request_permission(
         .title(Some(title.to_string()))
         .kind(Some(tool_kind(&call.function.name)))
         .status(Some(ToolCallStatus::Pending))
+        .content(preview.map(|diff| vec![diff_content(diff)]))
         .raw_input(Some(arguments.clone()));
     let request = RequestPermissionRequest::new(
         session_id.clone(),
@@ -2654,13 +2679,7 @@ fn replay_history(
                             }
                         }
                         if let Some(diff) = &outcome.diff {
-                            content.push(ToolCallContent::Diff(
-                                agent_client_protocol::schema::v1::Diff::new(
-                                    diff.path.clone(),
-                                    diff.new_text.clone(),
-                                )
-                                .old_text(diff.old_text.clone()),
-                            ));
+                            content.push(diff_content(diff));
                         }
                     }
                     let fields = ToolCallUpdateFields::new()
