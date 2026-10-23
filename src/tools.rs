@@ -21,8 +21,8 @@ use walkdir::WalkDir;
 use crate::{
     config::{Config, PermissionMode},
     model::{
-        PersistedDiff, PersistedTerminal, PersistedToolOutcome, SessionRecord, ToolCall,
-        ToolOutcomeStatus,
+        ChatMessage, MessageContent, PersistedDiff, PersistedTerminal, PersistedToolOutcome, Role,
+        SessionRecord, ToolCall, ToolOutcomeStatus,
     },
 };
 
@@ -383,6 +383,42 @@ pub fn permission_required(name: &str) -> bool {
     )
 }
 
+/// What the model is told while a session is in plan mode. Without it the
+/// model is not told it is planning, tries to make the change, and the user is
+/// asked to approve edits that plan mode then refuses.
+pub const PLAN_MODE_INSTRUCTIONS: &str = "The session is in plan mode. You can read, list, and search files and fetch web pages, but you cannot write or edit files, run commands, or call MCP tools. Investigate as needed, then reply with a concrete plan for the user to review. Do not say you made changes.";
+
+/// The reply to a tool call that plan mode refuses before any permission is
+/// requested.
+pub const PLAN_MODE_REFUSAL: &str = "The session is in plan mode. Switch to agent mode before modifying files, running commands, or calling MCP tools.";
+
+/// Whether plan mode refuses this tool: built-in tools that change the
+/// workspace, and every MCP tool, whose mutation safety cannot be determined.
+pub fn refused_in_plan_mode(name: &str) -> bool {
+    matches!(name, "write_file" | "edit_file" | "run_command") || name.starts_with("mcp__")
+}
+
+/// Restrict a model request to plan mode: drop the tools plan mode refuses and
+/// add [`PLAN_MODE_INSTRUCTIONS`] to the system prompt.
+pub fn restrict_to_plan_mode(tools: &mut Vec<Value>, context: &mut Vec<ChatMessage>) {
+    tools.retain(|tool| {
+        !tool["function"]["name"]
+            .as_str()
+            .is_some_and(refused_in_plan_mode)
+    });
+    match context.first_mut() {
+        Some(ChatMessage {
+            role: Role::System,
+            content: Some(MessageContent::Text(prompt)),
+            ..
+        }) => {
+            prompt.push_str("\n\n");
+            prompt.push_str(PLAN_MODE_INSTRUCTIONS);
+        }
+        _ => context.insert(0, ChatMessage::system(PLAN_MODE_INSTRUCTIONS)),
+    }
+}
+
 pub async fn execute(
     access: &ToolAccess,
     session: &SessionRecord,
@@ -393,11 +429,8 @@ pub async fn execute(
     if cancellation.is_cancelled() {
         return Err(agent_client_protocol::Error::request_cancelled());
     }
-    let mutating = matches!(name, "write_file" | "edit_file" | "run_command");
-    if mutating && session.config.mode == "plan" {
-        return Err(agent_client_protocol::Error::invalid_request().data(
-            "The session is in plan mode. Switch to agent mode before modifying files or running commands.",
-        ));
+    if session.config.mode == "plan" && refused_in_plan_mode(name) {
+        return Err(agent_client_protocol::Error::invalid_request().data(PLAN_MODE_REFUSAL));
     }
 
     match name {

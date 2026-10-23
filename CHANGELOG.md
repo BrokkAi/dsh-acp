@@ -6,6 +6,13 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ## Unreleased
 
+### Fixed
+
+- Plan mode now tells the model it is planning and offers it only tools that
+  cannot change the workspace. A write, edit, command, or MCP call the model
+  asks for anyway is refused before any permission request, so the user is no
+  longer asked to approve a change that plan mode then rejects.
+
 ## 0.2.0 - 2026-10-22
 
 ### Added

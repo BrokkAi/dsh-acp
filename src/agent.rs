@@ -1279,7 +1279,10 @@ impl Harness {
                 }
             }
             tools.truncate(MAX_MODEL_TOOLS);
-            let context = record.context_messages(self.config.context_chars);
+            let mut context = record.context_messages(self.config.context_chars);
+            if record.config.mode == "plan" {
+                crate::tools::restrict_to_plan_mode(&mut tools, &mut context);
+            }
             let retained_non_system = context
                 .iter()
                 .filter(|message| message.role != Role::System)
@@ -1568,10 +1571,11 @@ impl Harness {
                 ),
             ))?;
 
-        if record.config.mode == "plan" && call.function.name.starts_with("mcp__") {
+        // Refuse before asking permission: approving a call plan mode then
+        // refuses would only mislead the user.
+        if record.config.mode == "plan" && crate::tools::refused_in_plan_mode(&call.function.name) {
             let result = ToolResult {
-                text: "MCP tools are disabled in plan mode because their mutation safety cannot be determined."
-                    .to_string(),
+                text: crate::tools::PLAN_MODE_REFUSAL.to_string(),
                 raw: json!({"denied": true, "reason": "plan_mode"}),
             };
             send_tool_finished(access, session_id, call, &title, &result, false)?;

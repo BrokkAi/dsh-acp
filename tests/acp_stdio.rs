@@ -577,6 +577,74 @@ async fn streams_text_and_executes_a_client_filesystem_tool() {
 }
 
 #[tokio::test]
+async fn plan_mode_tells_the_model_and_refuses_writes_without_asking() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("sample.txt"), "sample file contents\n").unwrap();
+    let Some((base_url, server)) = mock_deepseek_server().await else {
+        eprintln!("skipping plan mode test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request("initialize", json!({"protocolVersion": 1}))
+        .await;
+    let cwd = temp.path().to_string_lossy().to_string();
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": cwd, "mcpServers": [], "additionalDirectories": []}),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    peer.request(
+        "session/set_mode",
+        json!({"sessionId": session_id, "modeId": "plan"}),
+    )
+    .await;
+    // The mock model asks for write_file anyway, as a model that ignores its
+    // instructions would.
+    let response = peer
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "Plan a change to sample.txt"}]
+            }),
+        )
+        .await;
+    assert_eq!(response["stopReason"], "end_turn");
+    assert!(peer.permission_requests.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("sample.txt")).unwrap(),
+        "sample file contents\n"
+    );
+    assert!(peer.updates.iter().any(|update| {
+        update["params"]["update"]["sessionUpdate"] == "tool_call_update"
+            && update["params"]["update"]["status"] == "failed"
+            && update["params"]["update"]["rawOutput"]["reason"] == "plan_mode"
+    }));
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    let requests = server.await.unwrap();
+    let offered: Vec<&str> = requests[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect();
+    assert!(offered.contains(&"read_file"), "{offered:?}");
+    for refused in ["write_file", "edit_file", "run_command"] {
+        assert!(!offered.contains(&refused), "{offered:?}");
+    }
+    assert!(
+        requests[0]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("The session is in plan mode.")
+    );
+}
+
+#[tokio::test]
 async fn v2_prompt_runs_local_tool_loop_and_permission_request() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("sample.txt"), "old contents").unwrap();
