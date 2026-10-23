@@ -86,5 +86,9 @@ text to replace is not in the file, they carry no diff and the tool reports
 the error when it runs.
 
 ACP v1 may delegate text file access and terminal execution to a capable client.
+A command that runs in the client's terminal puts that terminal in its tool
+call as soon as the client creates it. The final update keeps the terminal and
+adds the result text only if the command failed; replay after `session/load`
+shows the result text, because the terminal has been released.
 ACP v2 has no client filesystem or terminal execution methods; use an MCP server
 for client-provided tools.

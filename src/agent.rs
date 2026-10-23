@@ -31,8 +31,9 @@ use agent_client_protocol::{
         SessionNotification, SessionResumeCapabilities, SessionSystemPromptCapabilities,
         SetProviderRequest, SetProviderResponse, SetSessionConfigOptionRequest,
         SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-        SystemPromptMode, TextContent, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
-        ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, Usage, UsageUpdate,
+        SystemPromptMode, Terminal, TerminalId, TextContent, ToolCall, ToolCallContent, ToolCallId,
+        ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, Usage,
+        UsageUpdate,
     },
 };
 use chrono::SecondsFormat;
@@ -50,7 +51,7 @@ use crate::{
     },
     session::{self, SessionStore, session_title},
     tools::{
-        ToolAccess, ToolResult, built_in_definitions, execute as execute_tool,
+        TerminalToolCall, ToolAccess, ToolResult, built_in_definitions, execute as execute_tool,
         persisted_tool_outcome, result_status, structured_content,
     },
 };
@@ -1595,7 +1596,7 @@ impl Harness {
                 text: crate::tools::PLAN_MODE_REFUSAL.to_string(),
                 raw: json!({"denied": true, "reason": "plan_mode"}),
             };
-            send_tool_finished(access, session_id, call, &title, &result, false)?;
+            send_tool_finished(access, session_id, call, &title, &result, false, None)?;
             return Ok(result);
         }
 
@@ -1607,7 +1608,7 @@ impl Harness {
                         text: format!("Unable to update plan: {}", error.message),
                         raw: json!({"error": error.message}),
                     };
-                    send_tool_finished(access, session_id, call, &title, &result, false)?;
+                    send_tool_finished(access, session_id, call, &title, &result, false, None)?;
                     return Ok(result);
                 }
             };
@@ -1627,7 +1628,7 @@ impl Harness {
                 ),
                 raw: json!({"entries": plan.entries.len()}),
             };
-            send_tool_finished(access, session_id, call, &title, &result, true)?;
+            send_tool_finished(access, session_id, call, &title, &result, true, None)?;
             return Ok(result);
         }
 
@@ -1639,7 +1640,7 @@ impl Harness {
                         text: "ask_user requires a message.".to_string(),
                         raw: json!({"error": "missing message"}),
                     };
-                    send_tool_finished(access, session_id, call, &title, &result, false)?;
+                    send_tool_finished(access, session_id, call, &title, &result, false, None)?;
                     return Ok(result);
                 }
             };
@@ -1659,7 +1660,7 @@ impl Harness {
                         false,
                     ),
                 };
-            send_tool_finished(access, session_id, call, &title, &result, success)?;
+            send_tool_finished(access, session_id, call, &title, &result, success, None)?;
             return Ok(result);
         }
 
@@ -1676,7 +1677,7 @@ impl Harness {
                         text: "Permission denied by the configured permission policy.".to_string(),
                         raw: json!({"denied": true}),
                     };
-                    send_tool_finished(access, session_id, call, &title, &denied, false)?;
+                    send_tool_finished(access, session_id, call, &title, &denied, false, None)?;
                     return Ok(denied);
                 }
                 match request_permission(
@@ -1704,7 +1705,7 @@ impl Harness {
                             text: "The user denied permission for this tool call.".to_string(),
                             raw: json!({"denied": true}),
                         };
-                        send_tool_finished(access, session_id, call, &title, &denied, false)?;
+                        send_tool_finished(access, session_id, call, &title, &denied, false, None)?;
                         return Ok(denied);
                     }
                     PermissionDecision::Cancelled => {
@@ -1728,6 +1729,7 @@ impl Harness {
                 ),
             ))?;
 
+        let terminal_call = TerminalToolCall::new(call.id.clone());
         let result = if call.function.name.starts_with("mcp__") {
             let mcp_result = {
                 let state = runtime.state.lock().await;
@@ -1761,6 +1763,7 @@ impl Harness {
                 &runtime.snapshot().await,
                 &call.function.name,
                 arguments,
+                Some(&terminal_call),
                 cancellation,
             )
             .await
@@ -1787,7 +1790,15 @@ impl Harness {
                 .get("isError")
                 .and_then(Value::as_bool)
                 .is_none_or(|is_error| !is_error);
-        send_tool_finished(access, session_id, call, &title, &result, success)?;
+        send_tool_finished(
+            access,
+            session_id,
+            call,
+            &title,
+            &result,
+            success,
+            terminal_call.terminal_id(),
+        )?;
         Ok(result)
     }
 
@@ -2087,6 +2098,13 @@ fn send_available_commands(
     ))
 }
 
+/// Send a tool call's final update. `terminal` is the client terminal a
+/// command ran in. The update keeps it, so a client that keeps showing a
+/// released terminal's output still shows it. The update adds the result text
+/// only if the tool failed, because after a completed command that text
+/// repeats the terminal's output; `rawOutput` still carries the exit status
+/// and output. Replay after `session/load` shows the result text instead,
+/// because a released terminal cannot be shown again.
 fn send_tool_finished(
     access: &ToolAccess,
     session_id: &SessionId,
@@ -2094,11 +2112,22 @@ fn send_tool_finished(
     title: &str,
     result: &ToolResult,
     success: bool,
+    terminal: Option<&TerminalId>,
 ) -> Result<(), Error> {
-    let text = truncate_text(&result.text, access.config.tool_output_bytes);
-    let mut content = vec![ToolCallContent::Content(
-        agent_client_protocol::schema::v1::Content::new(ContentBlock::Text(TextContent::new(text))),
-    )];
+    let mut content = Vec::new();
+    if let Some(terminal_id) = terminal {
+        content.push(ToolCallContent::Terminal(Terminal::new(
+            terminal_id.clone(),
+        )));
+    }
+    if terminal.is_none() || !success {
+        let text = truncate_text(&result.text, access.config.tool_output_bytes);
+        content.push(ToolCallContent::Content(
+            agent_client_protocol::schema::v1::Content::new(ContentBlock::Text(TextContent::new(
+                text,
+            ))),
+        ));
+    }
     for item in structured_content(&result.raw) {
         if let Ok(block) = serde_json::from_value::<ContentBlock>(item) {
             content.push(ToolCallContent::Content(

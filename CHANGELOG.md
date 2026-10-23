@@ -17,6 +17,17 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   diff, as before, and the tool reports its own error when it runs. ACP v1
   sends the old and new text; ACP v2 sends a patch.
 
+### Fixed
+
+- Under ACP v1, a command that runs in the client's terminal now puts that
+  terminal in its own tool call, so the client shows the live output there.
+  No tool call used to contain the terminal, and a client that gives such a
+  terminal a tool call of its own, as Mjolnir does, showed every command
+  twice. The final update keeps the terminal and no longer repeats the output
+  as text, except when the command failed; `rawOutput` still carries the exit
+  status and output. Replay after `session/load` shows the output as text,
+  because a released terminal cannot be shown again.
+
 ## 0.2.1 - 2026-10-23
 
 ### Fixed

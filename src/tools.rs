@@ -8,8 +8,9 @@ use agent_client_protocol::{
     Client, ConnectionTo,
     schema::v1::{
         ClientCapabilities, CreateTerminalRequest, EnvVariable, KillTerminalRequest,
-        ReleaseTerminalRequest, TerminalOutputRequest, WaitForTerminalExitRequest,
-        WriteTextFileRequest,
+        ReleaseTerminalRequest, SessionNotification, SessionUpdate, Terminal, TerminalId,
+        TerminalOutputRequest, ToolCallContent, ToolCallStatus, ToolCallUpdate,
+        ToolCallUpdateFields, WaitForTerminalExitRequest, WriteTextFileRequest,
     },
 };
 use futures_util::StreamExt;
@@ -31,6 +32,30 @@ pub struct ToolAccess {
     pub connection: Option<ConnectionTo<Client>>,
     pub client: ClientCapabilities,
     pub config: Config,
+}
+
+/// The ACP v1 tool call a command runs for. When the command runs in the
+/// client's terminal, `run_command` puts that terminal in this tool call, so
+/// the client shows the output there rather than in a tool call of its own,
+/// and records the terminal so the final update can keep showing it.
+pub struct TerminalToolCall {
+    id: String,
+    terminal_id: std::sync::OnceLock<TerminalId>,
+}
+
+impl TerminalToolCall {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            terminal_id: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The client terminal the command ran in, if the client created one. It
+    /// is set even when the command then failed or timed out.
+    pub fn terminal_id(&self) -> Option<&TerminalId> {
+        self.terminal_id.get()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -429,11 +454,14 @@ pub fn restrict_to_plan_mode(tools: &mut Vec<Value>, context: &mut Vec<ChatMessa
     }
 }
 
+/// Run a built-in tool. `terminal_call` is the ACP v1 tool call that shows a
+/// client terminal; it is `None` where the client runs no terminals (ACP v2).
 pub async fn execute(
     access: &ToolAccess,
     session: &SessionRecord,
     name: &str,
     arguments: Value,
+    terminal_call: Option<&TerminalToolCall>,
     cancellation: &CancellationToken,
 ) -> Result<ToolResult, agent_client_protocol::Error> {
     if cancellation.is_cancelled() {
@@ -449,7 +477,9 @@ pub async fn execute(
         "search_files" => search_files(session, &arguments, cancellation),
         "write_file" => write_file(access, session, &arguments, cancellation).await,
         "edit_file" => edit_file(access, session, &arguments, cancellation).await,
-        "run_command" => run_command(access, session, &arguments, cancellation).await,
+        "run_command" => {
+            run_command(access, session, &arguments, terminal_call, cancellation).await
+        }
         "web_fetch" => web_fetch(access, session, &arguments, cancellation).await,
         _ => Err(agent_client_protocol::Error::invalid_params()
             .data(format!("unknown built-in tool: {name}"))),
@@ -854,6 +884,7 @@ async fn run_command(
     access: &ToolAccess,
     session: &SessionRecord,
     arguments: &Value,
+    terminal_call: Option<&TerminalToolCall>,
     cancellation: &CancellationToken,
 ) -> Result<ToolResult, agent_client_protocol::Error> {
     let command = required_string(arguments, "command")?;
@@ -891,6 +922,7 @@ async fn run_command(
             &args,
             cwd,
             timeout,
+            terminal_call,
             cancellation,
         )
         .await;
@@ -968,6 +1000,7 @@ async fn run_command_via_client(
     args: &[String],
     cwd: PathBuf,
     timeout: Duration,
+    terminal_call: Option<&TerminalToolCall>,
     cancellation: &CancellationToken,
 ) -> Result<ToolResult, agent_client_protocol::Error> {
     let env = Vec::<EnvVariable>::new();
@@ -981,6 +1014,29 @@ async fn run_command_via_client(
         response = connection.send_request(request).block_task() => response?,
     };
     let terminal_id = created.terminal_id;
+    if let Some(tool_call) = terminal_call {
+        let _ = tool_call.terminal_id.set(terminal_id.clone());
+        // ACP clients show a terminal's live output in the tool call that
+        // embeds it. A terminal that no tool call embeds may get a tool call
+        // of its own, which shows the command twice.
+        let update = ToolCallUpdate::new(
+            tool_call.id.clone(),
+            ToolCallUpdateFields::new()
+                .status(ToolCallStatus::InProgress)
+                .content(vec![ToolCallContent::Terminal(Terminal::new(
+                    terminal_id.clone(),
+                ))]),
+        );
+        if let Err(error) = connection.send_notification(SessionNotification::new(
+            session.id.clone(),
+            SessionUpdate::ToolCallUpdate(update),
+        )) {
+            tracing::warn!(
+                ?error,
+                "failed to show a command's terminal in its tool call"
+            );
+        }
+    }
 
     let wait = tokio::time::timeout(timeout, async {
         tokio::select! {

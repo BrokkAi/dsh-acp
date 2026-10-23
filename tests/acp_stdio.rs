@@ -15,7 +15,16 @@ struct Peer {
     updates: Vec<Value>,
     permission_requests: Vec<Value>,
     permission_answer: &'static str,
+    /// Each `terminal/*` request the agent sent, with how many updates the
+    /// peer had received by then.
+    terminal_requests: Vec<(String, usize)>,
+    /// Answer `terminal/wait_for_exit` with an error.
+    fail_terminal_wait: bool,
 }
+
+/// The id and output of the terminal the peer pretends to run.
+const CLIENT_TERMINAL_ID: &str = "client-term-1";
+const CLIENT_TERMINAL_OUTPUT: &str = "client terminal output\n";
 
 impl Peer {
     async fn request(&mut self, method: &str, params: Value) -> Value {
@@ -93,6 +102,30 @@ impl Peer {
                     "result": {}
                 }))
                 .await;
+                continue;
+            }
+            if let Some(method) = value.get("method").and_then(Value::as_str)
+                && method.starts_with("terminal/")
+            {
+                self.terminal_requests
+                    .push((method.to_string(), self.updates.len()));
+                let reply = match method {
+                    "terminal/create" => json!({"result": {"terminalId": CLIENT_TERMINAL_ID}}),
+                    "terminal/wait_for_exit" if self.fail_terminal_wait => {
+                        json!({"error": {"code": -32603, "message": "terminal lost"}})
+                    }
+                    "terminal/wait_for_exit" => json!({"result": {"exitCode": 0}}),
+                    "terminal/output" => json!({"result": {
+                        "output": CLIENT_TERMINAL_OUTPUT,
+                        "truncated": false,
+                        "exitStatus": {"exitCode": 0}
+                    }}),
+                    _ => json!({"result": {}}),
+                };
+                let mut reply = reply.as_object().unwrap().clone();
+                reply.insert("jsonrpc".to_string(), json!("2.0"));
+                reply.insert("id".to_string(), value["id"].clone());
+                self.write(Value::Object(reply)).await;
                 continue;
             }
             if value.get("method").and_then(Value::as_str) == Some("session/request_permission") {
@@ -511,6 +544,8 @@ async fn spawn_peer(data_dir: &std::path::Path, base_url: Option<&str>) -> Peer 
         updates: Vec::new(),
         permission_requests: Vec::new(),
         permission_answer: "allow_once",
+        terminal_requests: Vec::new(),
+        fail_terminal_wait: false,
     }
 }
 
@@ -609,6 +644,24 @@ async fn command_permission_title_quotes_arguments_as_a_shell_would() {
         peer.permission_requests[0]["params"]["toolCall"]["title"],
         "Run sh -c 'printf terminal-output'"
     );
+    // Without a client terminal the command runs locally, and its result is
+    // text as before.
+    let finished = peer
+        .updates
+        .iter()
+        .map(|update| &update["params"]["update"])
+        .rfind(|update| update["toolCallId"] == "call-command")
+        .unwrap();
+    assert_eq!(finished["status"], "completed");
+    assert_eq!(finished["content"].as_array().unwrap().len(), 1);
+    assert_eq!(finished["content"][0]["type"], "content");
+    assert!(
+        finished["content"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("terminal-output")
+    );
+    assert!(peer.terminal_requests.is_empty());
 
     drop(peer.stdin);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
@@ -717,6 +770,155 @@ async fn edit_and_write_permission_requests_show_the_change() {
     drop(peer.stdin);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
     assert_eq!(server.await.unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn a_command_in_the_client_terminal_shows_that_terminal_in_its_tool_call() {
+    let temp = tempfile::tempdir().unwrap();
+    let command = json!({"command": "sh", "args": ["-c", "printf terminal-output"]});
+    let Some((base_url, server)) = mock_sequence_server(vec![
+        tool_call_stream("call-ok", "run_command", command.clone()),
+        mock_text_stream(),
+        tool_call_stream("call-broken", "run_command", command),
+        mock_text_stream(),
+    ])
+    .await
+    else {
+        eprintln!("skipping client terminal test: loopback networking is unavailable");
+        return;
+    };
+    let cwd = temp.path().to_string_lossy().to_string();
+    let initialize = json!({"protocolVersion": 1, "clientCapabilities": {"terminal": true}});
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request("initialize", initialize.clone()).await;
+    let session = peer
+        .request("session/new", json!({"cwd": cwd, "mcpServers": []}))
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+    let prompt = json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "run it"}]});
+    let response = peer.request("session/prompt", prompt.clone()).await;
+    assert_eq!(response["stopReason"], "end_turn");
+
+    let terminal = json!([{"type": "terminal", "terminalId": CLIENT_TERMINAL_ID}]);
+    let updates_for = |updates: &[Value], id: &str| -> Vec<Value> {
+        updates
+            .iter()
+            .map(|update| update["params"]["update"].clone())
+            .filter(|update| update["toolCallId"] == id)
+            .collect()
+    };
+    // The terminal joins the command's tool call once the client creates it,
+    // before the agent releases it.
+    let shown = peer
+        .updates
+        .iter()
+        .position(|update| {
+            let update = &update["params"]["update"];
+            update["toolCallId"] == "call-ok"
+                && update["status"] == "in_progress"
+                && update["content"] == terminal
+        })
+        .expect("an update shows the terminal in the tool call");
+    let methods: Vec<&str> = peer
+        .terminal_requests
+        .iter()
+        .map(|(method, _)| method.as_str())
+        .collect();
+    assert_eq!(
+        methods,
+        [
+            "terminal/create",
+            "terminal/wait_for_exit",
+            "terminal/output",
+            "terminal/release"
+        ]
+    );
+    assert!(shown < peer.terminal_requests[3].1, "shown after release");
+    // The final update keeps the terminal and does not repeat its output as
+    // text; rawOutput still carries the result.
+    let ok = updates_for(&peer.updates, "call-ok");
+    let finished = ok.last().unwrap();
+    assert_eq!(finished["status"], "completed");
+    assert_eq!(finished["content"], terminal);
+    assert_eq!(finished["rawOutput"]["output"], CLIENT_TERMINAL_OUTPUT);
+    assert_eq!(finished["rawOutput"]["exit_code"], 0);
+
+    // A command that fails after the terminal exists keeps the terminal and
+    // adds the error.
+    peer.fail_terminal_wait = true;
+    peer.terminal_requests.clear();
+    let response = peer.request("session/prompt", prompt).await;
+    assert_eq!(response["stopReason"], "end_turn");
+    let methods: Vec<&str> = peer
+        .terminal_requests
+        .iter()
+        .map(|(method, _)| method.as_str())
+        .collect();
+    assert_eq!(
+        methods,
+        [
+            "terminal/create",
+            "terminal/wait_for_exit",
+            "terminal/kill",
+            "terminal/release"
+        ]
+    );
+    let broken = updates_for(&peer.updates, "call-broken");
+    let finished = broken.last().unwrap();
+    assert_eq!(finished["status"], "failed");
+    let content = finished["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2, "{content:?}");
+    assert_eq!(content[0], terminal[0]);
+    assert!(
+        content[1]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("Tool failed:"),
+        "{content:?}"
+    );
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    let requests = server.await.unwrap();
+    let tool_reply = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["tool_call_id"] == "call-ok")
+        .unwrap()
+        .clone();
+    let output_text = format!("exit_code: 0\noutput:\n{CLIENT_TERMINAL_OUTPUT}");
+    assert_eq!(tool_reply["content"], output_text.as_str());
+
+    // A released terminal cannot be shown again, so replay shows the
+    // command's output as text.
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request("initialize", initialize).await;
+    peer.request(
+        "session/load",
+        json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []}),
+    )
+    .await;
+    let replayed = updates_for(&peer.updates, "call-ok");
+    let finished = replayed.last().unwrap();
+    assert_eq!(finished["status"], "completed");
+    assert_eq!(
+        finished["content"],
+        json!([{"type": "content", "content": {"type": "text", "text": output_text}}])
+    );
+    assert_eq!(finished["rawOutput"]["output"], CLIENT_TERMINAL_OUTPUT);
+    let replayed = updates_for(&peer.updates, "call-broken");
+    let finished = replayed.last().unwrap();
+    assert_eq!(finished["status"], "failed");
+    assert!(
+        finished.to_string().contains("Tool failed:")
+            && !finished.to_string().contains(CLIENT_TERMINAL_ID),
+        "{finished}"
+    );
+    assert!(peer.terminal_requests.is_empty());
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
 }
 
 #[tokio::test]

@@ -1828,6 +1828,7 @@ impl V2Harness {
                 &record,
                 &call.function.name,
                 arguments,
+                None,
                 cancellation,
             )
             .await
