@@ -6,6 +6,8 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ## Unreleased
 
+## 0.2.1 - 2026-10-23
+
 ### Fixed
 
 - Plan mode now tells the model it is planning and offers it only tools that
