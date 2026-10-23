@@ -20,6 +20,11 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   edit by its file, and an MCP call by its tool. It used to approve the whole
   tool, so approving one `ls` allowed every later command. The option's label
   now says what it covers.
+- A session whose agent process died while a tool ran takes prompts again.
+  The stored history ended with a tool call that had no result, and the
+  DeepSeek API rejected every later request with HTTP 400. Loading such a
+  session now records the call as interrupted, and each model request answers
+  any tool call that still has no result.
 
 ## 0.2.0 - 2026-10-22
 

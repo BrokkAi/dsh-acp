@@ -390,6 +390,46 @@ impl SessionRecord {
         self.updated_at = chrono::Utc::now();
     }
 
+    /// Record a failed result for each tool call of the last assistant message
+    /// that has none, when nothing but tool results follows it. That is the
+    /// state a process that died while running a tool leaves behind; without
+    /// the results, every later model request is rejected and replay shows the
+    /// calls as still running. Returns whether anything changed.
+    pub fn close_interrupted_tool_calls(&mut self) -> bool {
+        let Some(assistant) = self
+            .messages
+            .iter()
+            .rposition(|message| message.role != Role::Tool)
+        else {
+            return false;
+        };
+        let answered: Vec<String> = self.messages[assistant + 1..]
+            .iter()
+            .filter_map(|message| message.tool_call_id.clone())
+            .collect();
+        let interrupted: Vec<String> = self.messages[assistant]
+            .tool_calls
+            .iter()
+            .map(|call| call.id.clone())
+            .filter(|id| !answered.contains(id))
+            .collect();
+        for id in &interrupted {
+            self.messages
+                .push(ChatMessage::tool(id.clone(), INTERRUPTED_TOOL_CALL));
+            self.tool_outcomes
+                .entry(id.clone())
+                .or_insert_with(|| PersistedToolOutcome {
+                    status: ToolOutcomeStatus::Failed,
+                    text: INTERRUPTED_TOOL_CALL.to_string(),
+                    raw_output: serde_json::json!({"status": "failed"}),
+                    structured_content: Vec::new(),
+                    diff: None,
+                    terminal: None,
+                });
+        }
+        !interrupted.is_empty()
+    }
+
     pub fn flush_pending_steering(&mut self) {
         let pending = std::mem::take(&mut self.pending_steering);
         for message in pending {
@@ -446,14 +486,38 @@ impl SessionRecord {
                 .unwrap_or(rest.len());
         }
 
-        system.extend(rest.into_iter().skip(start).map(|mut message| {
+        // The API rejects an assistant tool call that no tool message answers.
+        // A record a crash left that way before a later prompt was added
+        // cannot be repaired in place, so answer such calls in the request.
+        let mut unanswered: Vec<String> = Vec::new();
+        for mut message in rest.into_iter().skip(start) {
             // reasoning_content is a response-only DeepSeek field. Keep it in
             // the persisted transcript for replay and thought rendering, but
             // do not send it back in the next completion request.
             message.reasoning_content = None;
-            message
-        }));
+            if message.role == Role::Tool {
+                unanswered.retain(|id| message.tool_call_id.as_ref() != Some(id));
+            } else {
+                answer_interrupted(&mut system, &mut unanswered);
+                unanswered = message
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.id.clone())
+                    .collect();
+            }
+            system.push(message);
+        }
+        answer_interrupted(&mut system, &mut unanswered);
         system
+    }
+}
+
+/// The result recorded for a tool call that never finished.
+pub const INTERRUPTED_TOOL_CALL: &str = "Tool call was interrupted.";
+
+fn answer_interrupted(messages: &mut Vec<ChatMessage>, unanswered: &mut Vec<String>) {
+    for id in unanswered.drain(..) {
+        messages.push(ChatMessage::tool(id, INTERRUPTED_TOOL_CALL));
     }
 }
 
@@ -554,6 +618,30 @@ mod tests {
         let context = record.context_messages(10_000);
         assert_eq!(context[0].reasoning_content, None);
         assert_eq!(context[0].tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn api_context_answers_a_tool_call_a_crash_left_before_later_prompts() {
+        let mut record = record();
+        let mut assistant = ChatMessage::assistant(None, None);
+        assistant.tool_calls.push(ToolCall {
+            id: "call-1".to_string(),
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: "run_command".to_string(),
+                arguments: "{}".to_string(),
+            },
+        });
+        record.messages.push(ChatMessage::user("run it"));
+        record.messages.push(assistant);
+        record.messages.push(ChatMessage::user("are you there?"));
+        let context = record.context_messages(10_000);
+        let roles: Vec<&str> = context
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "user"]);
+        assert_eq!(context[2].tool_call_id.as_deref(), Some("call-1"));
     }
 
     #[test]

@@ -1417,7 +1417,7 @@ impl Harness {
                             &session_id,
                             &completion.tool_calls,
                             index,
-                            "Tool call was interrupted.",
+                            crate::model::INTERRUPTED_TOOL_CALL,
                         )
                         .await?;
                         if error.code == agent_client_protocol::ErrorCode::RequestCancelled {

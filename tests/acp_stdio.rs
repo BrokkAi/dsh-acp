@@ -616,6 +616,82 @@ async fn command_permission_title_quotes_arguments_as_a_shell_would() {
 }
 
 #[tokio::test]
+async fn a_session_whose_agent_died_during_a_tool_call_still_takes_prompts() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, server)) = mock_sequence_server(vec![
+        encode_sse(&[
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-sleep","type":"function","function":{"name":"run_command","arguments":"{\"command\":\"sleep\",\"args\":[\"5\"]}"}}]}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        ]),
+        mock_text_stream(),
+    ])
+    .await
+    else {
+        eprintln!("skipping interrupted tool test: loopback networking is unavailable");
+        return;
+    };
+    let cwd = temp.path().to_string_lossy().to_string();
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request("initialize", json!({"protocolVersion": 1}))
+        .await;
+    let session = peer
+        .request("session/new", json!({"cwd": cwd, "mcpServers": []}))
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+    peer.write(json!({
+        "jsonrpc": "2.0",
+        "id": 999,
+        "method": "session/prompt",
+        "params": {"sessionId": session_id, "prompt": [{"type": "text", "text": "wait"}]}
+    }))
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let message = peer.next_message().await;
+            if message["params"]["update"]["toolCallId"] == "call-sleep"
+                && message["params"]["update"]["status"] == "in_progress"
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the command should start");
+    peer.child.kill().await.unwrap();
+
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request("initialize", json!({"protocolVersion": 1}))
+        .await;
+    peer.request(
+        "session/load",
+        json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []}),
+    )
+    .await;
+    assert!(peer.updates.iter().any(|update| {
+        update["params"]["update"]["toolCallId"] == "call-sleep"
+            && update["params"]["update"]["status"] == "failed"
+    }));
+    let response = peer
+        .request(
+            "session/prompt",
+            json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "again"}]}),
+        )
+        .await;
+    assert_eq!(response["stopReason"], "end_turn");
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    let requests = server.await.unwrap();
+    let messages = requests[1]["messages"].as_array().unwrap();
+    let call = messages
+        .iter()
+        .position(|message| !message["tool_calls"].is_null())
+        .unwrap();
+    assert_eq!(messages[call + 1]["role"], "tool");
+    assert_eq!(messages[call + 1]["tool_call_id"], "call-sleep");
+}
+
+#[tokio::test]
 async fn allowing_a_command_for_the_session_allows_only_that_command() {
     let temp = tempfile::tempdir().unwrap();
     let command = |id: &str, text: &str| {

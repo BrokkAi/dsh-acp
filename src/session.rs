@@ -79,6 +79,8 @@ impl SessionStore {
         }
         let record = self.read_record(id).await?;
         let mut record = record;
+        // Before pending steering is appended after the interrupted calls.
+        record.close_interrupted_tool_calls();
         record.flush_pending_steering();
         record.install_system_prompt(self.effective_system_prompt(&record));
         let runtime = SessionRuntime::new(record);
