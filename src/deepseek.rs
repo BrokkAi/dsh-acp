@@ -171,6 +171,9 @@ impl DeepSeekClient {
                 if status == reqwest::StatusCode::UNAUTHORIZED
                     || status == reqwest::StatusCode::FORBIDDEN
                 {
+                    let message = format!(
+                        "{message}. Check DEEPSEEK_API_KEY (or --api-key, or the provider's Authorization header)."
+                    );
                     Error::auth_required()
                         .data(json!({"status": status.as_u16(), "message": message}))
                 } else {
@@ -257,8 +260,26 @@ impl DeepSeekClient {
     }
 }
 
+/// A transport failure with its causes, which reqwest's own message omits
+/// ("error sending request for url (...)" without "Connection refused"), and
+/// the setting to check when the endpoint could not be reached.
 fn http_error(error: reqwest::Error) -> Error {
-    Error::internal_error().data(json!({"message": error.to_string()}))
+    let mut message = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !message.contains(&cause_text) {
+            message.push_str(": ");
+            message.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    if error.is_connect() {
+        message.push_str(". Check DEEPSEEK_BASE_URL (or --base-url) and the network connection.");
+    } else if error.is_timeout() {
+        message.push_str(". The DeepSeek API did not answer in time.");
+    }
+    Error::internal_error().data(json!({"message": message}))
 }
 
 fn extract_api_error(body: &str) -> Option<String> {

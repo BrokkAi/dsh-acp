@@ -29,6 +29,8 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   defines it, instead of the session's running total, and declares it with
   `_meta["mjolnir.dev/usage-scope"] = "turn"`. A local command reports zero.
   `usage_update` still carries the session total.
+- A rejected API key names `DEEPSEEK_API_KEY`, and a failed connection gives its
+  cause (such as "Connection refused") and names `DEEPSEEK_BASE_URL`.
 
 ## 0.2.0 - 2026-10-22
 

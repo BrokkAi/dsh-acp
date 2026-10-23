@@ -732,6 +732,58 @@ async fn prompt_usage_counts_only_its_own_turn_and_says_so() {
 }
 
 #[tokio::test]
+async fn model_request_failures_name_the_setting_to_check() {
+    let Some(closed) = loopback_listener().await else {
+        eprintln!("skipping request failure test: loopback networking is unavailable");
+        return;
+    };
+    let refused = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    let unauthorized = loopback_listener().await.unwrap();
+    let rejecting = format!("http://{}", unauthorized.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = unauthorized.accept().await.unwrap();
+        let _ = read_http_json_body(&mut socket).await;
+        let body = r#"{"error":{"message":"Authentication Fails"}}"#;
+        let response = format!(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+        socket.shutdown().await.unwrap();
+    });
+    for (base_url, expected) in [
+        (refused, "DEEPSEEK_BASE_URL"),
+        (rejecting, "DEEPSEEK_API_KEY"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+        peer.request("initialize", json!({"protocolVersion": 1}))
+            .await;
+        let session = peer
+            .request(
+                "session/new",
+                json!({"cwd": temp.path().to_string_lossy(), "mcpServers": []}),
+            )
+            .await;
+        let error = peer
+            .request_error(
+                "session/prompt",
+                json!({
+                    "sessionId": session["sessionId"],
+                    "prompt": [{"type": "text", "text": "hello"}]
+                }),
+            )
+            .await;
+        let message = error["data"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains(expected), "{error}");
+        drop(peer.stdin);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    }
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn allowing_a_command_for_the_session_allows_only_that_command() {
     let temp = tempfile::tempdir().unwrap();
     let command = |id: &str, text: &str| {
