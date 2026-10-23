@@ -14,6 +14,7 @@ struct Peer {
     next_id: u64,
     updates: Vec<Value>,
     permission_requests: Vec<Value>,
+    permission_answer: &'static str,
 }
 
 impl Peer {
@@ -102,7 +103,7 @@ impl Peer {
                     "result": {
                         "outcome": {
                             "outcome": "selected",
-                            "optionId": "allow_once"
+                            "optionId": self.permission_answer
                         }
                     }
                 }))
@@ -509,6 +510,7 @@ async fn spawn_peer(data_dir: &std::path::Path, base_url: Option<&str>) -> Peer 
         next_id: 1,
         updates: Vec::new(),
         permission_requests: Vec::new(),
+        permission_answer: "allow_once",
     }
 }
 
@@ -611,6 +613,62 @@ async fn command_permission_title_quotes_arguments_as_a_shell_would() {
     drop(peer.stdin);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
     assert_eq!(server.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn allowing_a_command_for_the_session_allows_only_that_command() {
+    let temp = tempfile::tempdir().unwrap();
+    let command = |id: &str, text: &str| {
+        encode_sse(&[
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":"run_command","arguments":json!({"command":"sh","args":["-c",format!("printf {text}")]}).to_string()}}]}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        ])
+    };
+    let Some((base_url, server)) = mock_sequence_server(vec![
+        command("call-a", "a"),
+        command("call-a-again", "a"),
+        command("call-b", "b"),
+        mock_text_stream(),
+    ])
+    .await
+    else {
+        eprintln!("skipping session approval test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.permission_answer = "allow_always";
+    peer.request("initialize", json!({"protocolVersion": 1}))
+        .await;
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": temp.path().to_string_lossy(), "mcpServers": []}),
+        )
+        .await;
+    let response = peer
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session["sessionId"],
+                "prompt": [{"type": "text", "text": "run commands"}]
+            }),
+        )
+        .await;
+    assert_eq!(response["stopReason"], "end_turn");
+    let titles: Vec<&str> = peer
+        .permission_requests
+        .iter()
+        .filter_map(|request| request["params"]["toolCall"]["title"].as_str())
+        .collect();
+    assert_eq!(titles, ["Run sh -c 'printf a'", "Run sh -c 'printf b'"]);
+    assert_eq!(
+        peer.permission_requests[0]["params"]["options"][1]["name"],
+        "Yes, and don't ask again for this command in this session"
+    );
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    assert_eq!(server.await.unwrap().len(), 4);
 }
 
 #[tokio::test]
@@ -1625,6 +1683,30 @@ async fn mock_single_text_server() -> Option<(String, tokio::task::JoinHandle<Va
         socket.write_all(response.as_bytes()).await.unwrap();
         socket.shutdown().await.unwrap();
         request
+    });
+    Some((format!("http://{address}"), task))
+}
+
+/// A mock model that answers each request with the next response in order.
+async fn mock_sequence_server(
+    responses: Vec<String>,
+) -> Option<(String, tokio::task::JoinHandle<Vec<Value>>)> {
+    let listener = loopback_listener().await?;
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for response in responses {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            requests.push(read_http_json_body(&mut socket).await);
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                response.len()
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        }
+        requests
     });
     Some((format!("http://{address}"), task))
 }

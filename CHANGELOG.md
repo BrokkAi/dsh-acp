@@ -15,6 +15,11 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 - A command's tool title and permission request quote its arguments as a
   shell would, so `sh -c 'ls && rm x'` no longer reads as `sh -c ls` followed
   by a second command. ACP v2 titles now include the arguments.
+- "Allow for this session" is scoped as Codex scopes it: a command is
+  remembered by its exact program, arguments and working directory, a write or
+  edit by its file, and an MCP call by its tool. It used to approve the whole
+  tool, so approving one `ls` allowed every later command. The option's label
+  now says what it covers.
 
 ## 0.2.0 - 2026-10-22
 

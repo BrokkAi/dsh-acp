@@ -1704,11 +1704,10 @@ impl V2Harness {
         }
         let needs_permission = crate::tools::permission_required(&call.function.name)
             || call.function.name.starts_with("mcp__");
-        let approved = runtime.state.lock().await.approved_tools.clone();
-        if needs_permission
-            && record.config.permission_mode != crate::config::PermissionMode::Allow
-            && !approved.contains(&call.function.name)
-        {
+        let approval_key =
+            crate::tools::session_approval_key(&record, &call.function.name, &arguments);
+        let approved = runtime.state.lock().await.session_approvals.clone();
+        if needs_permission && !crate::tools::is_auto_approved(&record, &approved, &approval_key) {
             if record.config.permission_mode == crate::config::PermissionMode::Deny {
                 let result = ToolResult {
                     text: "Permission denied by policy.".to_string(),
@@ -1728,7 +1727,14 @@ impl V2Harness {
                     )),
                 )?;
             }
-            let decision = request_permission(connection, session_id, update, cancellation).await;
+            let decision = request_permission(
+                connection,
+                session_id,
+                update,
+                crate::tools::session_approval_label(&call.function.name),
+                cancellation,
+            )
+            .await;
             runtime
                 .state
                 .lock()
@@ -1742,8 +1748,8 @@ impl V2Harness {
                         .state
                         .lock()
                         .await
-                        .approved_tools
-                        .insert(call.function.name.clone());
+                        .session_approvals
+                        .insert(approval_key);
                 }
                 PermissionDecision::Deny => {
                     {
@@ -2230,6 +2236,7 @@ async fn request_permission(
     connection: &V2ConnectionTo<Client>,
     session_id: &v2::SessionId,
     tool_call: ToolCallUpdate,
+    session_approval_label: &str,
     cancellation: &CancellationToken,
 ) -> Result<PermissionDecision, Error> {
     let options = vec![
@@ -2240,7 +2247,7 @@ async fn request_permission(
         ),
         PermissionOption::new(
             v2::PermissionOptionId::new("allow_always"),
-            "Allow",
+            session_approval_label,
             PermissionOptionKind::AllowAlways,
         ),
         PermissionOption::new(

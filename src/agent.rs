@@ -1650,8 +1650,10 @@ impl Harness {
             || call.function.name.starts_with("mcp__");
         if needs_permission && !cancellation.is_cancelled() {
             let record = runtime.snapshot().await;
-            let approved = runtime.state.lock().await.approved_tools.clone();
-            if !crate::tools::is_auto_approved(&record, &approved, &call.function.name) {
+            let approval_key =
+                crate::tools::session_approval_key(&record, &call.function.name, &arguments);
+            let approved = runtime.state.lock().await.session_approvals.clone();
+            if !crate::tools::is_auto_approved(&record, &approved, &approval_key) {
                 if record.config.permission_mode == PermissionMode::Deny {
                     let denied = ToolResult {
                         text: "Permission denied by the configured permission policy.".to_string(),
@@ -1669,8 +1671,8 @@ impl Harness {
                             .state
                             .lock()
                             .await
-                            .approved_tools
-                            .insert(call.function.name.clone());
+                            .session_approvals
+                            .insert(approval_key);
                     }
                     PermissionDecision::Deny => {
                         let denied = ToolResult {
@@ -2244,7 +2246,7 @@ async fn request_permission(
         ),
         PermissionOption::new(
             PermissionOptionId::new("allow_always"),
-            "Allow for this session",
+            crate::tools::session_approval_label(&call.function.name),
             PermissionOptionKind::AllowAlways,
         ),
         PermissionOption::new(

@@ -1301,12 +1301,62 @@ fn html_to_text(html: &str) -> String {
         .to_string()
 }
 
+/// What an "allow for this session" answer remembers, scoped as Codex scopes
+/// it: a command by its exact program, arguments and working directory; a
+/// write or edit by the file; an MCP call by the tool. Approving `ls` must not
+/// approve every later command.
+pub fn session_approval_key(session: &SessionRecord, tool: &str, arguments: &Value) -> String {
+    match tool {
+        "run_command" => json!({
+            "tool": tool,
+            "command": arguments.get("command"),
+            "args": arguments.get("args"),
+            "cwd": arguments.get("cwd"),
+        }),
+        "write_file" | "edit_file" => json!({
+            "tool": "file",
+            "path": arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .map(|path| lexical_path(&session.cwd, path)),
+        }),
+        _ => json!({"tool": tool}),
+    }
+    .to_string()
+}
+
+/// The label of the "allow for this session" option, naming what it covers.
+pub fn session_approval_label(tool: &str) -> &'static str {
+    match tool {
+        "run_command" => "Yes, and don't ask again for this command in this session",
+        "write_file" | "edit_file" => "Yes, and don't ask again for this file in this session",
+        _ => "Allow for this session",
+    }
+}
+
 pub fn is_auto_approved(
     session: &SessionRecord,
     approved: &std::collections::HashSet<String>,
-    tool: &str,
+    key: &str,
 ) -> bool {
-    session.config.permission_mode == PermissionMode::Allow || approved.contains(tool)
+    session.config.permission_mode == PermissionMode::Allow || approved.contains(key)
+}
+
+/// `path` relative to `cwd` with `.` and `..` removed, without touching the
+/// filesystem, so a file approved for the session keeps one key whether it
+/// exists yet or not.
+fn lexical_path(cwd: &Path, path: &str) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for component in cwd.join(path).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normal.pop();
+            }
+            other => normal.push(other),
+        }
+    }
+    normal
 }
 
 #[cfg(test)]

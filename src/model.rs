@@ -473,7 +473,9 @@ pub struct SessionState {
     pub requires_action: Arc<std::sync::atomic::AtomicBool>,
     pub activity_notify: Arc<tokio::sync::Notify>,
     pub prompt_seq: u64,
-    pub approved_tools: std::collections::HashSet<String>,
+    /// Keys of the tool calls allowed for this session
+    /// (`crate::tools::session_approval_key`).
+    pub session_approvals: std::collections::HashSet<String>,
     pub mcp: Option<crate::mcp::McpSession>,
 }
 
@@ -487,7 +489,7 @@ impl SessionRuntime {
                 requires_action: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 activity_notify: Arc::new(tokio::sync::Notify::new()),
                 prompt_seq: 0,
-                approved_tools: std::collections::HashSet::new(),
+                session_approvals: std::collections::HashSet::new(),
                 mcp: None,
             })),
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
