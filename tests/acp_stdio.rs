@@ -577,6 +577,43 @@ async fn streams_text_and_executes_a_client_filesystem_tool() {
 }
 
 #[tokio::test]
+async fn command_permission_title_quotes_arguments_as_a_shell_would() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, server)) = mock_command_server().await else {
+        eprintln!("skipping command title test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request("initialize", json!({"protocolVersion": 1}))
+        .await;
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": temp.path().to_string_lossy(), "mcpServers": []}),
+        )
+        .await;
+    let response = peer
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session["sessionId"],
+                "prompt": [{"type": "text", "text": "run a command"}]
+            }),
+        )
+        .await;
+    assert_eq!(response["stopReason"], "end_turn");
+    assert_eq!(peer.permission_requests.len(), 1);
+    assert_eq!(
+        peer.permission_requests[0]["params"]["toolCall"]["title"],
+        "Run sh -c 'printf terminal-output'"
+    );
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    assert_eq!(server.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn plan_mode_tells_the_model_and_refuses_writes_without_asking() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("sample.txt"), "sample file contents\n").unwrap();

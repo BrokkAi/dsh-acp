@@ -2339,24 +2339,7 @@ fn parse_plan(arguments: &Value) -> Result<Plan, Error> {
 
 fn tool_title(name: &str, arguments: &Value) -> String {
     match name {
-        "run_command" => {
-            let command = arguments
-                .get("command")
-                .and_then(Value::as_str)
-                .unwrap_or("command");
-            let args = arguments
-                .get("args")
-                .and_then(Value::as_array)
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
-                .unwrap_or_default();
-            format!("Run {command} {args}").trim().to_string()
-        }
+        "run_command" => format!("Run {}", crate::tools::command_display(arguments)),
         "web_fetch" => format!(
             "Fetch {}",
             arguments

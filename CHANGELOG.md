@@ -12,6 +12,9 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   cannot change the workspace. A write, edit, command, or MCP call the model
   asks for anyway is refused before any permission request, so the user is no
   longer asked to approve a change that plan mode then rejects.
+- A command's tool title and permission request quote its arguments as a
+  shell would, so `sh -c 'ls && rm x'` no longer reads as `sh -c ls` followed
+  by a second command. ACP v2 titles now include the arguments.
 
 ## 0.2.0 - 2026-10-22
 

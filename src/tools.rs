@@ -143,26 +143,36 @@ pub fn persisted_terminal(tool: &str, raw: &Value) -> Option<PersistedTerminal> 
     })
 }
 
+/// A command and its arguments as a shell would read them. A permission
+/// request shows this, so `sh -c 'ls && rm x'` must not read as `sh -c ls`
+/// followed by a second command.
 pub fn command_display(raw: &Value) -> String {
     let command = raw
         .get("command")
         .and_then(Value::as_str)
         .unwrap_or("command");
-    let args = raw
-        .get("args")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .unwrap_or_default();
-    if args.is_empty() {
-        command.to_string()
+    std::iter::once(command)
+        .chain(
+            raw.get("args")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str),
+        )
+        .map(shell_quote)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./=:,@%+".contains(c));
+    if plain {
+        word.to_string()
     } else {
-        format!("{command} {args}")
+        format!("'{}'", word.replace('\'', r"'\''"))
     }
 }
 

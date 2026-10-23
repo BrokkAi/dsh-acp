@@ -2742,6 +2742,9 @@ fn tool_kind(name: &str) -> v2::ToolKind {
 }
 
 fn tool_title(name: &str, arguments: &Value) -> String {
+    if name == "run_command" {
+        return format!("run command {}", crate::tools::command_display(arguments));
+    }
     arguments
         .get("path")
         .or_else(|| arguments.get("url"))
