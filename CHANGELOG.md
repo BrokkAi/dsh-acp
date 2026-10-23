@@ -6,6 +6,8 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ## Unreleased
 
+## 0.2.2 - 2026-10-23
+
 ### Changed
 
 - A write or edit now shows the change it will make before the user approves
