@@ -692,6 +692,46 @@ async fn a_session_whose_agent_died_during_a_tool_call_still_takes_prompts() {
 }
 
 #[tokio::test]
+async fn prompt_usage_counts_only_its_own_turn_and_says_so() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, server)) =
+        mock_sequence_server(vec![mock_text_stream(), mock_text_stream()]).await
+    else {
+        eprintln!("skipping turn usage test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request("initialize", json!({"protocolVersion": 1}))
+        .await;
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": temp.path().to_string_lossy(), "mcpServers": []}),
+        )
+        .await;
+    for text in ["first", "second"] {
+        let response = peer
+            .request(
+                "session/prompt",
+                json!({
+                    "sessionId": session["sessionId"],
+                    "prompt": [{"type": "text", "text": text}]
+                }),
+            )
+            .await;
+        assert_eq!(response["usage"]["totalTokens"], 22, "{text}: {response}");
+        assert_eq!(
+            response["usage"]["_meta"]["mjolnir.dev/usage-scope"],
+            "turn"
+        );
+    }
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    assert_eq!(server.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn allowing_a_command_for_the_session_allows_only_that_command() {
     let temp = tempfile::tempdir().unwrap();
     let command = |id: &str, text: &str| {

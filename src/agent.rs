@@ -1218,6 +1218,9 @@ impl Harness {
             config: self.config.clone(),
         };
         let mut final_usage = initial_record.usage;
+        // ACP v1 defines the prompt response's usage as this turn's; the record
+        // keeps the session total for usage_update.
+        let mut turn_usage = TokenUsage::default();
         let supports_compaction = self
             .client_capabilities
             .read()
@@ -1345,6 +1348,7 @@ impl Harness {
                 &mut completion.tool_calls,
             );
             final_usage.saturating_add(&completion.usage);
+            turn_usage.saturating_add(&completion.usage);
             self.persist_completion(&runtime, &completion, final_usage.clone())
                 .await?;
             send_usage_update(&connection, &runtime.snapshot().await)?;
@@ -1369,7 +1373,7 @@ impl Harness {
                     Some("content_filter") => StopReason::Refusal,
                     _ => StopReason::EndTurn,
                 };
-                return Ok(PromptResponse::new(stop_reason).usage(Some(acp_usage(final_usage))));
+                return Ok(PromptResponse::new(stop_reason).usage(Some(turn_acp_usage(turn_usage))));
             }
 
             if round + 1 == self.config.max_tool_rounds {
@@ -1389,7 +1393,7 @@ impl Harness {
                 )
                 .await?;
                 return Ok(PromptResponse::new(StopReason::MaxTurnRequests)
-                    .usage(Some(acp_usage(final_usage))));
+                    .usage(Some(turn_acp_usage(turn_usage))));
             }
 
             for (index, tool_call) in completion.tool_calls.iter().enumerate() {
@@ -1442,7 +1446,10 @@ impl Harness {
             }
         }
 
-        Ok(PromptResponse::new(StopReason::MaxTurnRequests).usage(Some(acp_usage(final_usage))))
+        Ok(
+            PromptResponse::new(StopReason::MaxTurnRequests)
+                .usage(Some(turn_acp_usage(turn_usage))),
+        )
     }
 
     async fn append_unfinished_tool_results(
@@ -1855,8 +1862,9 @@ impl Harness {
             ),
         ))?;
         Ok(Some(
+            // A local command makes no model request.
             PromptResponse::new(StopReason::EndTurn)
-                .usage(Some(acp_usage(runtime.snapshot().await.usage))),
+                .usage(Some(turn_acp_usage(TokenUsage::default()))),
         ))
     }
 
@@ -2734,6 +2742,15 @@ fn send_replay_thought(
         session_id.clone(),
         agent_client_protocol::schema::v1::SessionUpdate::AgentThoughtChunk(content),
     ))
+}
+
+/// A whole turn's usage, declared as such so a client that cannot otherwise
+/// tell a turn's usage from a session total (Mjolnir) counts it.
+fn turn_acp_usage(usage: TokenUsage) -> Usage {
+    acp_usage(usage).meta(Some(serde_json::Map::from_iter([(
+        "mjolnir.dev/usage-scope".to_string(),
+        json!("turn"),
+    )])))
 }
 
 fn acp_usage(usage: TokenUsage) -> Usage {
