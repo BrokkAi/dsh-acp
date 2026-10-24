@@ -45,8 +45,12 @@ struct Cli {
     system_prompt: Option<String>,
 
     /// Maximum response tokens per model completion.
-    #[arg(long, env = "DSH_ACP_MAX_TOKENS", default_value_t = 8192)]
-    max_tokens: u32,
+    ///
+    /// Omitted by default, so DeepSeek uses its maximum (384000 for both
+    /// models). Thinking tokens count toward this cap. Set it only to bound
+    /// cost.
+    #[arg(long, env = "DSH_ACP_MAX_TOKENS")]
+    max_tokens: Option<u32>,
 
     /// Sampling temperature. Ignored by some DeepSeek models.
     #[arg(long, env = "DSH_ACP_TEMPERATURE", default_value_t = 0.2)]
@@ -61,8 +65,9 @@ struct Cli {
     )]
     reasoning_effort: String,
 
-    /// Approximate character budget for conversation context.
-    #[arg(long, env = "DSH_ACP_CONTEXT_CHARS", default_value_t = 400_000)]
+    /// Approximate character budget for conversation context. DeepSeek accepts
+    /// 1M tokens (~3.3M characters) of context.
+    #[arg(long, env = "DSH_ACP_CONTEXT_CHARS", default_value_t = 2_000_000)]
     context_chars: usize,
 
     /// Maximum bytes retained from a single tool result.

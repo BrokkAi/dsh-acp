@@ -21,7 +21,10 @@ pub struct ChatRequest {
     /// DeepSeek thinking effort. `none` turns thinking mode off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<&'static str>,
-    pub max_tokens: u32,
+    /// Omitted by default so the API uses its own maximum. DeepSeek's examples
+    /// do not send it either.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -57,7 +60,7 @@ pub struct DeepSeekClient {
     api_key: Option<String>,
     headers: reqwest::header::HeaderMap,
     temperature: f64,
-    max_tokens: u32,
+    max_tokens: Option<u32>,
 }
 
 impl DeepSeekClient {
@@ -687,7 +690,7 @@ mod tests {
             data_dir: std::path::PathBuf::from(".dsh-acp"),
             permission_mode: crate::config::PermissionMode::Ask,
             system_prompt: None,
-            max_tokens: 100,
+            max_tokens: Some(100),
             temperature: 0.2,
             reasoning_effort: ReasoningEffort::High,
             context_chars: 1000,
