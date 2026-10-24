@@ -233,7 +233,10 @@ DeepSeek counts the chain of thought inside `max_tokens`. The harness does not
 send `max_tokens` at all, the same as DeepSeek's own examples, so the API uses
 its maximum: 384000 output tokens and a 1M-token context on both models. Pass
 `--max-tokens` only to bound cost, and keep it well above the expected
-reasoning length, because reasoning spends the same budget as the answer.
+reasoning length, because reasoning spends the same budget as the answer. When
+a response does hit the cap it ends the turn with `max_tokens`, any tool call it
+carried is marked failed rather than run with truncated arguments, and the
+client is sent a warning notice when it supports notices.
 
 `temperature` is sent on every request except the legacy `deepseek-reasoner`
 model, whatever the effort. DeepSeek ignores it in thinking mode, so it only

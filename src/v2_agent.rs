@@ -1371,6 +1371,43 @@ impl V2Harness {
                     CONTEXT_WINDOW,
                 )),
             )?;
+            // A response cut off by the token cap is not a finished answer. The
+            // tool calls it carries are half-written, so they must not run, and
+            // the turn must not end silently.
+            if completion.finish_reason.as_deref() == Some("length") {
+                {
+                    let mut state = runtime.state.lock().await;
+                    state.record.flush_pending_steering();
+                    state.record.touch();
+                }
+                self.base.store.save(runtime).await?;
+                if !completion.tool_calls.is_empty() {
+                    self.append_unfinished_tools(
+                        runtime,
+                        session_id,
+                        connection,
+                        &completion.tool_calls,
+                        0,
+                        ToolOutcomeStatus::Failed,
+                    )
+                    .await?;
+                }
+                send_update(
+                    connection,
+                    session_id,
+                    SessionUpdate::Notice(
+                        Notice::new(
+                            NoticeSeverity::Warning,
+                            "The response reached the token limit and was cut off",
+                        )
+                        .description(Some(
+                            "Raise --max-tokens, or omit it to use the model's maximum."
+                                .to_string(),
+                        )),
+                    ),
+                )?;
+                return Ok((StopReason::MaxTokens, usage, request_seq));
+            }
             if completion.tool_calls.is_empty() {
                 {
                     let mut state = runtime.state.lock().await;
@@ -1382,7 +1419,6 @@ impl V2Harness {
                     }
                 }
                 let reason = match completion.finish_reason.as_deref() {
-                    Some("length") => StopReason::MaxTokens,
                     Some("content_filter") => StopReason::Refusal,
                     _ => StopReason::EndTurn,
                 };
