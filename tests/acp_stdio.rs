@@ -1101,6 +1101,89 @@ async fn prompt_usage_counts_only_its_own_turn_and_says_so() {
 }
 
 #[tokio::test]
+async fn thinking_effort_is_advertised_and_sent_to_deepseek() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, server)) = mock_single_text_server().await else {
+        eprintln!("skipping effort test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request("initialize", json!({"protocolVersion": 1}))
+        .await;
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": temp.path().to_string_lossy(), "mcpServers": []}),
+        )
+        .await;
+    let effort = session["configOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|option| option["id"] == "reasoning_effort")
+        .expect("session advertises a thinking effort option");
+    assert_eq!(effort["category"], "thought_level");
+    assert_eq!(effort["currentValue"], "high");
+    assert_eq!(
+        effort["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| option["value"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["none", "low", "high", "max"]
+    );
+
+    let set = peer
+        .request(
+            "session/set_config_option",
+            json!({
+                "sessionId": session["sessionId"],
+                "configId": "reasoning_effort",
+                "value": "max"
+            }),
+        )
+        .await;
+    let current = set["configOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|option| option["id"] == "reasoning_effort")
+        .unwrap();
+    assert_eq!(current["currentValue"], "max");
+    let rejected = peer
+        .request_error(
+            "session/set_config_option",
+            json!({
+                "sessionId": session["sessionId"],
+                "configId": "reasoning_effort",
+                "value": "turbo"
+            }),
+        )
+        .await;
+    assert_eq!(rejected["code"], -32602);
+
+    let response = peer
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session["sessionId"],
+                "prompt": [{"type": "text", "text": "think hard"}]
+            }),
+        )
+        .await;
+    assert_eq!(response["stopReason"], "end_turn");
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    let request = server.await.unwrap();
+    assert_eq!(request["reasoning_effort"], "max");
+    // Effort does not gate temperature; DeepSeek ignores it in thinking mode,
+    // but a provider behind --base-url may honor it.
+    assert_eq!(request["temperature"], 0.2);
+}
+
+#[tokio::test]
 async fn model_request_failures_name_the_setting_to_check() {
     let Some(closed) = loopback_listener().await else {
         eprintln!("skipping request failure test: loopback networking is unavailable");
@@ -1366,6 +1449,70 @@ async fn plan_mode_allows_only_read_only_http_mcp_tools() {
         ["report"],
         "MCP requests: {mcp_requests:?}"
     );
+}
+
+#[tokio::test]
+async fn v2_effort_command_tells_the_client_the_new_setting() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut peer = spawn_peer(temp.path(), None).await;
+    peer.request(
+        "initialize",
+        json!({
+            "protocolVersion": 2,
+            "info": {"name": "v2-test-client", "version": "1.0.0"},
+            "capabilities": {}
+        }),
+    )
+    .await;
+    let cwd = temp.path().to_string_lossy().to_string();
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": cwd, "mcpServers": [], "additionalDirectories": []}),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+
+    let accepted = peer
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "/effort max"}]
+            }),
+        )
+        .await;
+    assert!(accepted["messageId"].as_str().is_some());
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let message = peer.next_message().await;
+            if message["params"]["update"]["sessionUpdate"] == "state_update"
+                && message["params"]["update"]["state"] == "idle"
+            {
+                return message;
+            }
+            peer.updates.push(message);
+        }
+    })
+    .await
+    .expect("the effort command should settle to idle");
+
+    // The client must hear about the change, or its selector keeps showing the
+    // old value. A hand-written field list here once dropped this update.
+    let announced = peer
+        .updates
+        .iter()
+        .filter(|update| update["params"]["update"]["sessionUpdate"] == "config_option_update")
+        .flat_map(|update| {
+            update["params"]["update"]["configOptions"]
+                .as_array()
+                .cloned()
+        })
+        .flatten()
+        .find(|option| option["configId"] == "reasoning_effort")
+        .unwrap_or_else(|| panic!("no config update for effort: {:?}", peer.updates));
+    assert_eq!(announced["currentValue"], "max");
 }
 
 #[tokio::test]

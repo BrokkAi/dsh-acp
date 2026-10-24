@@ -52,6 +52,15 @@ struct Cli {
     #[arg(long, env = "DSH_ACP_TEMPERATURE", default_value_t = 0.2)]
     temperature: f64,
 
+    /// Thinking effort: none, low, high, or max. "none" disables thinking mode.
+    #[arg(
+        long,
+        env = "DSH_ACP_REASONING_EFFORT",
+        default_value = "high",
+        value_name = "EFFORT"
+    )]
+    reasoning_effort: String,
+
     /// Approximate character budget for conversation context.
     #[arg(long, env = "DSH_ACP_CONTEXT_CHARS", default_value_t = 400_000)]
     context_chars: usize,
@@ -96,6 +105,10 @@ impl TryFrom<Cli> for Config {
             agent_client_protocol::Error::invalid_params()
                 .data("permission mode must be ask, allow, or deny")
         })?;
+        let reasoning_effort = cli.reasoning_effort.parse().map_err(|()| {
+            agent_client_protocol::Error::invalid_params()
+                .data("reasoning effort must be none, low, high, or max")
+        })?;
         Ok(Self {
             api_key: cli.api_key,
             base_url: cli.base_url,
@@ -106,6 +119,7 @@ impl TryFrom<Cli> for Config {
             system_prompt: cli.system_prompt,
             max_tokens: cli.max_tokens,
             temperature: cli.temperature,
+            reasoning_effort,
             context_chars: cli.context_chars,
             tool_output_bytes: cli.tool_output_bytes,
             http_timeout: std::time::Duration::from_secs(cli.http_timeout_secs),

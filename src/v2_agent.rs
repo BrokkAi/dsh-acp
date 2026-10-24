@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     agent::Harness,
+    config::ReasoningEffort,
     deepseek::{Completion, StreamEvent},
     model::{
         ChatMessage, ContentPart, ImageUrl, MessageContent, PendingUserMessage,
@@ -1227,11 +1228,9 @@ impl V2Harness {
             self.base.store.save(runtime).await?;
             send_agent_text(connection, session_id, &response)?;
             let after = runtime.snapshot().await;
-            if before.config.model != after.config.model
-                || before.config.mode != after.config.mode
-                || before.config.permission_mode != after.config.permission_mode
-                || before.config.network != after.config.network
-            {
+            // Compare the whole config rather than a hand-listed set of fields,
+            // so a new option such as thinking effort is announced too.
+            if before.config != after.config {
                 send_update(
                     connection,
                     session_id,
@@ -1337,7 +1336,12 @@ impl V2Harness {
                 )?;
                 compaction_reported = true;
             }
-            let request = client.request(record.config.model.clone(), context, tools);
+            let request = client.request(
+                record.config.model.clone(),
+                record.config.reasoning_effort,
+                context,
+                tools,
+            );
             let answer_id = message_id_for(&record.id, record.messages.len());
             let thought_id = format!("{answer_id}-thought");
             let mut on_event = |event: StreamEvent| match event {
@@ -1458,7 +1462,7 @@ impl V2Harness {
                 (command, argument.trim())
             });
         let response = match command {
-            "/help" => "Available commands:\n/plan - enter read-only planning mode\n/agent - enter agent mode\n/model [name] - show or select the model\n/status - show session configuration".to_string(),
+            "/help" => "Available commands:\n/plan - enter read-only planning mode\n/agent - enter agent mode\n/model [name] - show or select the model\n/effort [none|low|high|max] - show or select the thinking effort\n/status - show session configuration".to_string(),
             "/plan" => {
                 let mut state = runtime.state.lock().await;
                 state.record.config.mode = "plan".to_string();
@@ -1486,13 +1490,31 @@ impl V2Harness {
                 self.base.store.save(runtime).await?;
                 format!("Model set to {argument}.")
             }
+            "/effort" if argument.is_empty() => {
+                format!(
+                    "Current thinking effort: {}",
+                    runtime.snapshot().await.config.reasoning_effort.as_str()
+                )
+            }
+            "/effort" => match argument.parse::<ReasoningEffort>() {
+                Ok(effort) => {
+                    let mut state = runtime.state.lock().await;
+                    state.record.config.reasoning_effort = effort;
+                    state.record.touch();
+                    drop(state);
+                    self.base.store.save(runtime).await?;
+                    format!("Thinking effort set to {}.", effort.as_str())
+                }
+                Err(()) => "Unknown effort. Use none, low, high, or max.".to_string(),
+            },
             "/status" => {
                 let record = runtime.snapshot().await;
                 format!(
-                    "model: {}\nmode: {}\npermission: {}\nnetwork: {}\nusage: {} tokens",
+                    "model: {}\nmode: {}\npermission: {}\neffort: {}\nnetwork: {}\nusage: {} tokens",
                     record.config.model,
                     record.config.mode,
                     record.config.permission_mode.as_str(),
+                    record.config.reasoning_effort.as_str(),
                     record.config.network,
                     record.usage.total_tokens
                 )
@@ -1980,6 +2002,19 @@ impl V2Harness {
                     v2::SessionConfigSelectOption::new("deny", "Deny"),
                 ],
             ),
+            v2::SessionConfigOption::select(
+                "reasoning_effort",
+                "Thinking effort",
+                record.config.reasoning_effort.as_str(),
+                ReasoningEffort::VALUES
+                    .into_iter()
+                    .map(|effort| {
+                        v2::SessionConfigSelectOption::new(effort.as_str(), effort.label())
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .description("How hard DeepSeek thinks before answering. None disables thinking.")
+            .category(v2::SessionConfigOptionCategory::ThoughtLevel),
             v2::SessionConfigOption::boolean("network", "Network access", record.config.network),
         ]
     }
@@ -2667,6 +2702,13 @@ fn apply_config(
                 .to_string()
                 .parse()
                 .map_err(|()| Error::invalid_params().data("invalid permission policy"))?;
+            Ok(())
+        }
+        ("reasoning_effort", v2::SessionConfigOptionValue::Id { value }) => {
+            record.config.reasoning_effort = value
+                .to_string()
+                .parse()
+                .map_err(|()| Error::invalid_params().data("invalid reasoning effort"))?;
             Ok(())
         }
         ("network", v2::SessionConfigOptionValue::Boolean { value }) => {

@@ -21,6 +21,7 @@ pub struct SessionStore {
     system_prompt: Arc<str>,
     default_model: Arc<str>,
     default_permission: crate::config::PermissionMode,
+    default_reasoning_effort: crate::config::ReasoningEffort,
 }
 
 impl SessionStore {
@@ -44,6 +45,7 @@ impl SessionStore {
             system_prompt: Arc::from(config.built_in_system_prompt()),
             default_model: Arc::from(config.default_model.as_str()),
             default_permission: config.permission_mode,
+            default_reasoning_effort: config.reasoning_effort,
         })
     }
 
@@ -60,6 +62,7 @@ impl SessionStore {
             additional_directories,
             self.default_model.to_string(),
             self.default_permission,
+            self.default_reasoning_effort,
             system_prompt,
             parent_session_id,
         );
@@ -270,7 +273,7 @@ pub(crate) fn validate_roots(cwd: &Path, additional: &[PathBuf]) -> Result<(), E
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::PermissionMode;
+    use crate::config::{PermissionMode, ReasoningEffort};
 
     #[tokio::test]
     async fn records_round_trip_and_delete() {
@@ -285,6 +288,7 @@ mod tests {
             system_prompt: None,
             max_tokens: 100,
             temperature: 0.0,
+            reasoning_effort: ReasoningEffort::High,
             context_chars: 1000,
             tool_output_bytes: 1000,
             http_timeout: std::time::Duration::from_secs(1),

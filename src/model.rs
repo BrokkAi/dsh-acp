@@ -251,12 +251,16 @@ impl TokenUsage {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct SessionConfig {
     pub model: String,
     pub mode: String,
     pub permission_mode: crate::config::PermissionMode,
     pub network: bool,
+    /// Sessions stored before thinking effort was configurable default to
+    /// DeepSeek's own default, high.
+    #[serde(default)]
+    pub reasoning_effort: crate::config::ReasoningEffort,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -351,6 +355,7 @@ impl SessionRecord {
         additional_directories: Vec<std::path::PathBuf>,
         default_model: String,
         permission_mode: crate::config::PermissionMode,
+        reasoning_effort: crate::config::ReasoningEffort,
         system_prompt: Option<String>,
         parent_session_id: Option<String>,
     ) -> Self {
@@ -367,6 +372,7 @@ impl SessionRecord {
                 mode: "agent".to_string(),
                 permission_mode,
                 network: true,
+                reasoning_effort,
             },
             system_prompt,
             messages: Vec::new(),
@@ -588,7 +594,7 @@ pub fn ensure_session_unique_tool_call_ids(record: &SessionRecord, calls: &mut [
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::PermissionMode;
+    use crate::config::{PermissionMode, ReasoningEffort};
 
     fn record() -> SessionRecord {
         SessionRecord::new(
@@ -596,6 +602,7 @@ mod tests {
             Vec::new(),
             "deepseek-flash".to_string(),
             PermissionMode::Ask,
+            ReasoningEffort::High,
             None,
             None,
         )

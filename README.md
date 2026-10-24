@@ -116,6 +116,7 @@ The binary is `target/release/dsh-acp`.
 --models <A,B>                   Models in the ACP model selector
 --data-dir <PATH>                Session storage (default: .dsh-acp)
 --permission-mode ask|allow|deny Sensitive-tool policy
+--reasoning-effort <EFFORT>      Thinking effort (default: high)
 --context-chars <N>              Approximate context budget
 --tool-output-bytes <N>          Per-tool output cap
 --disable-web                    Disable web_fetch
@@ -212,14 +213,32 @@ how many model/tool round trips it may take.
 content is translated into DeepSeek/OpenAI-compatible `image_url` parts and is
 retained in session history for replay.
 
+Thinking effort is a per-session setting sent to DeepSeek as `reasoning_effort`,
+one of `none`, `low`, `high`, or `max`. `none` turns thinking mode off and is
+cheapest; the other levels enable it and leave the chain of thought in the
+streamed reasoning updates. DeepSeek's default is `high`, which is also this
+harness's default. Set it with `--reasoning-effort`,
+`DSH_ACP_REASONING_EFFORT`, the ACP "Thinking effort" config option, or the
+`/effort` command.
+
+DeepSeek counts the chain of thought inside `max_tokens`, so a low cap can let
+reasoning consume the whole response and truncate the answer into
+`max_tokens`. The default cap is 8192, which suits `none` through `high`; raise
+`--max-tokens` when selecting `max`.
+
+`temperature` is sent on every request except the legacy `deepseek-reasoner`
+model, whatever the effort. DeepSeek ignores it in thinking mode, so it only
+affects the answer at effort `none`, or when `--base-url` points at a provider
+that honors it.
+
 `ask_user` uses ACP form elicitation by default. When the Client advertises URL
 elicitation, the model may also request an HTTPS URL with an optional stable
 `elicitation_id`. Embedded URL credentials and plain HTTP outside localhost are
 rejected.
 
 Session model and permission configuration is available through ACP config
-options. The in-conversation commands `/help`, `/plan`, `/agent`, `/model`, and
-`/status` are also supported.
+options. The in-conversation commands `/help`, `/plan`, `/agent`, `/model`,
+`/effort`, and `/status` are also supported.
 
 ## Persistence
 
