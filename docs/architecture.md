@@ -15,7 +15,7 @@ wire-specific behavior does not leak across versions.
 Each session contains:
 
 - immutable identity, working directory, and additional roots;
-- model, mode, permission, and network configuration;
+- model, mode, permission, thinking effort, and network configuration;
 - conversation messages and original ACP prompt blocks;
 - tool outcomes, raw output, diffs, and terminal snapshots;
 - plans, compactions, message IDs, and pending steering input;

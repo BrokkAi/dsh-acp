@@ -60,6 +60,16 @@ version's lifecycle and payload shapes.
 Audio is intentionally not advertised because the DeepSeek input API used by
 this harness does not accept audio content.
 
+## Session configuration options
+
+Both protocol versions expose select options for `model`, `mode`,
+`permission_mode`, and `reasoning_effort`, plus a boolean `network` toggle.
+`model`, `mode`, and `reasoning_effort` carry the ACP `model`, `mode`, and
+`thought_level` categories; `permission_mode` is uncategorized. The thinking
+effort carries `none`, `low`, `high`, or `max`, is stored with the session, and
+is sent to DeepSeek as `reasoning_effort`. `temperature` is unaffected by
+effort and rides every request except the legacy `deepseek-reasoner` model.
+
 ## Prompt lifecycle
 
 ACP v2 responds to `session/prompt` after inserting the user message, before

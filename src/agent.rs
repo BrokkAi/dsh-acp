@@ -41,7 +41,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    config::{Config, PermissionMode},
+    config::{Config, PermissionMode, ReasoningEffort},
     deepseek::{Completion, DeepSeekClient, StreamEvent},
     mcp::{McpSession, mcp_result_text},
     model::{
@@ -1324,7 +1324,12 @@ impl Harness {
                 ))?;
                 compaction_reported = true;
             }
-            let request = deepseek.request(record.config.model.clone(), context, tools);
+            let request = deepseek.request(
+                record.config.model.clone(),
+                record.config.reasoning_effort,
+                context,
+                tools,
+            );
             let thought_message_id = format!("thought-{}", uuid::Uuid::new_v4().simple());
             let answer_message_id = format!("message-{}", uuid::Uuid::new_v4().simple());
             let mut on_event = |event: StreamEvent| {
@@ -1808,7 +1813,7 @@ impl Harness {
             });
         let reply = match command {
             "/help" => {
-                "Available commands:\n/plan - enter read-only planning mode\n/agent - enter agent mode\n/model [name] - show or select the model\n/status - show session configuration"
+                "Available commands:\n/plan - enter read-only planning mode\n/agent - enter agent mode\n/model [name] - show or select the model\n/effort [none|low|high|max] - show or select the thinking effort\n/status - show session configuration"
                     .to_string()
             }
             "/plan" => {
@@ -1848,13 +1853,34 @@ impl Harness {
                 self.store.save(runtime).await?;
                 format!("Model set to {argument}.")
             }
+            "/effort" if argument.is_empty() => {
+                let record = runtime.snapshot().await;
+                format!(
+                    "Current thinking effort: {}",
+                    record.config.reasoning_effort.as_str()
+                )
+            }
+            "/effort" => match argument.parse::<ReasoningEffort>() {
+                Ok(effort) => {
+                    let mut state = runtime.state.lock().await;
+                    state.record.config.reasoning_effort = effort;
+                    state.record.touch();
+                    drop(state);
+                    self.store.save(runtime).await?;
+                    format!("Thinking effort set to {}.", effort.as_str())
+                }
+                Err(()) => {
+                    "Unknown effort. Use none, low, high, or max.".to_string()
+                }
+            },
             "/status" => {
                 let record = runtime.snapshot().await;
                 format!(
-                    "model: {}\nmode: {}\npermission: {}\nnetwork: {}\nusage: {} tokens",
+                    "model: {}\nmode: {}\npermission: {}\neffort: {}\nnetwork: {}\nusage: {} tokens",
                     record.config.model,
                     record.config.mode,
                     record.config.permission_mode.as_str(),
+                    record.config.reasoning_effort.as_str(),
                     record.config.network,
                     record.usage.total_tokens
                 )
@@ -1937,6 +1963,20 @@ impl Harness {
             )
             .description("Permission policy for writes and command execution."),
             SessionConfigOption::select(
+                "reasoning_effort",
+                "Thinking effort",
+                record.config.reasoning_effort.as_str(),
+                ReasoningEffort::VALUES
+                    .into_iter()
+                    .map(|effort| {
+                        SessionConfigSelectOption::new(effort.as_str(), effort.label())
+                            .description(effort.describe())
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .description("How hard DeepSeek thinks before answering. None disables thinking.")
+            .category(SessionConfigOptionCategory::ThoughtLevel),
+            SessionConfigOption::select(
                 "network",
                 "Network access",
                 if record.config.network {
@@ -1996,6 +2036,13 @@ fn apply_config_value(
                 .to_string()
                 .parse()
                 .map_err(|()| Error::invalid_params().data("invalid permission mode"))?;
+            Ok(())
+        }
+        ("reasoning_effort", SessionConfigOptionValue::ValueId { value }) => {
+            record.config.reasoning_effort = value
+                .to_string()
+                .parse()
+                .map_err(|()| Error::invalid_params().data("invalid reasoning effort"))?;
             Ok(())
         }
         ("network", SessionConfigOptionValue::ValueId { value }) => {

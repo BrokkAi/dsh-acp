@@ -1503,6 +1503,7 @@ fn lexical_path(cwd: &Path, path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ReasoningEffort;
 
     #[test]
     fn html_conversion_removes_scripts_and_tags() {
@@ -1556,6 +1557,7 @@ mod tests {
             Vec::new(),
             "deepseek-flash".to_string(),
             PermissionMode::Ask,
+            ReasoningEffort::High,
             None,
             None,
         )

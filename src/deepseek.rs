@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    config::Config,
+    config::{Config, ReasoningEffort},
     model::{ChatMessage, FunctionCall, TokenUsage, ToolCall},
 };
 
@@ -18,6 +18,9 @@ pub struct ChatRequest {
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
+    /// DeepSeek thinking effort. `none` turns thinking mode off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<&'static str>,
     pub max_tokens: u32,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Value>,
@@ -114,16 +117,21 @@ impl DeepSeekClient {
     pub fn request(
         &self,
         model: impl Into<String>,
+        effort: ReasoningEffort,
         messages: Vec<ChatMessage>,
         tools: Vec<Value>,
     ) -> ChatRequest {
         let model = model.into();
+        // Unchanged: temperature rides every request except the legacy
+        // reasoner. DeepSeek itself ignores it in thinking mode, and providers
+        // behind --base-url may honor it, so effort does not gate it.
         let temperature = (model != "deepseek-reasoner").then_some(self.temperature);
         ChatRequest {
             model,
             messages,
             stream: true,
             temperature,
+            reasoning_effort: Some(effort.as_str()),
             max_tokens: self.max_tokens,
             tools,
             tool_choice: None,
@@ -494,6 +502,57 @@ pub fn sanitize_tool_calls(mut completion: Completion) -> Completion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_carries_thinking_effort() {
+        let config = Config {
+            api_key: Some("key".to_string()),
+            base_url: "http://localhost".to_string(),
+            default_model: "deepseek-flash".to_string(),
+            models: vec!["deepseek-flash".to_string()],
+            data_dir: std::path::PathBuf::from(".dsh-acp"),
+            permission_mode: crate::config::PermissionMode::Ask,
+            system_prompt: None,
+            max_tokens: 100,
+            temperature: 0.2,
+            reasoning_effort: ReasoningEffort::High,
+            context_chars: 1000,
+            tool_output_bytes: 1000,
+            http_timeout: std::time::Duration::from_secs(1),
+            disable_web: true,
+            trace: false,
+        };
+        let client = DeepSeekClient::new(&config).unwrap();
+        let request = client.request(
+            "deepseek-flash",
+            ReasoningEffort::Max,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(request.reasoning_effort, Some("max"));
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["reasoning_effort"], "max");
+
+        // Effort does not gate temperature: DeepSeek ignores it in thinking
+        // mode, and a provider behind --base-url may honor it.
+        assert_eq!(request.temperature, Some(0.2));
+        let request = client.request(
+            "deepseek-flash",
+            ReasoningEffort::None,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(request.reasoning_effort, Some("none"));
+        assert_eq!(request.temperature, Some(0.2));
+
+        let request = client.request(
+            "deepseek-reasoner",
+            ReasoningEffort::High,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(request.temperature, None);
+    }
 
     #[test]
     fn parses_stream_events_and_usage() {
