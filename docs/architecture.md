@@ -40,6 +40,12 @@ already saw. An empty body is never accepted as an answer. The HTTP client
 bounds connecting and stalled reads rather than total request time, so a long
 stream that keeps producing tokens is not interrupted.
 
+A completion that ends with `finish_reason: "length"` is not a finished answer.
+The turn stops with `max_tokens`, and any tool call in that completion is marked
+failed rather than executed, because its arguments were cut off mid-string.
+Clients that advertise notice support also receive a warning describing the
+truncation.
+
 ACP v2 reports foreground state independently from prompt acceptance. Cancelling
 active work stops the model stream and tool operations, emits final tool state,
 and settles to idle with the `cancelled` reason.

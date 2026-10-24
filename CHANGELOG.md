@@ -8,6 +8,11 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ### Fixed
 
+- A response that ended at the token limit was treated as a finished answer: any
+  tool call it carried was executed even though its arguments had been cut off
+  mid-string, and the turn ended with `max_tokens` and no explanation. Such a
+  response now stops the turn, marks those tool calls failed instead of running
+  them, and reports a warning notice when the client supports notices.
 - The default `--max-tokens` was 8192, about 2% of what DeepSeek allows, so a
   large file write or a long chain of thought hit `max_tokens` and truncated
   the answer. The harness no longer sends `max_tokens` at all, matching

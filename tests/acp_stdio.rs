@@ -3005,3 +3005,96 @@ async fn a_stream_that_keeps_producing_outlives_the_request_timeout() {
     );
     assert_eq!(streamed_text(&peer).concat(), "slow but alive");
 }
+
+/// Serve one response that ends at the token cap, carrying a half-written tool
+/// call whose arguments were cut off mid-string.
+async fn mock_truncated_with_tool_call() -> Option<(String, tokio::task::JoinHandle<usize>)> {
+    let listener = loopback_listener().await?;
+    let address = listener.local_addr().unwrap();
+    let body = encode_sse(&[
+        json!({"choices":[{"delta":{"content":"Writing the file"},"finish_reason":null}]}),
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-cut","type":"function","function":{"name":"write_file","arguments":"{\"file_path\":\"big.txt\",\"content\":\"half of a fi"}}]}}]}),
+        json!({"choices":[{"delta":{},"finish_reason":"length"}]}),
+        json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":9,"total_tokens":19}}),
+    ]);
+    let task = tokio::spawn(async move {
+        let mut requests = 0;
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let _ = read_http_json_body(&mut socket).await;
+            requests += 1;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if socket.write_all(head.as_bytes()).await.is_err() {
+                break;
+            }
+            if socket.write_all(body.as_bytes()).await.is_err() {
+                break;
+            }
+            let _ = socket.shutdown().await;
+        }
+        requests
+    });
+    Some((format!("http://{address}"), task))
+}
+
+#[tokio::test]
+async fn a_response_cut_off_at_the_token_limit_says_so_and_runs_no_tools() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, server)) = mock_truncated_with_tool_call().await else {
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request(
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {
+                "fs": {},
+                "terminal": false,
+                "session": {"notices": {}}
+            }
+        }),
+    )
+    .await;
+    let response = peer_prompt(&mut peer, temp.path(), "write a big file").await;
+
+    assert_eq!(response["stopReason"], "max_tokens");
+    assert!(
+        !temp.path().join("big.txt").exists(),
+        "a half-written tool call must not run"
+    );
+    let notices: Vec<&Value> = peer
+        .updates
+        .iter()
+        .map(|update| &update["params"]["update"])
+        .filter(|update| update["sessionUpdate"] == "notice")
+        .collect();
+    assert_eq!(notices.len(), 1, "truncation must be reported, not silent");
+    assert!(
+        notices[0]["title"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("token limit"),
+        "unexpected notice: {:?}",
+        notices[0]
+    );
+    assert!(
+        notices[0]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("--max-tokens"),
+        "the notice should say how to fix it: {:?}",
+        notices[0]
+    );
+    let failed = peer.updates.iter().any(|update| {
+        update["params"]["update"]["sessionUpdate"] == "tool_call_update"
+            && update["params"]["update"]["status"] == "failed"
+    });
+    assert!(failed, "the truncated tool call should be marked failed");
+    server.abort();
+}
