@@ -46,7 +46,6 @@ pub struct Config {
     pub system_prompt: Option<String>,
     pub max_tokens: u32,
     pub temperature: f64,
-    pub max_tool_rounds: usize,
     pub context_chars: usize,
     pub tool_output_bytes: usize,
     pub http_timeout: Duration,
@@ -64,9 +63,6 @@ impl Config {
         }
         if !(0.0..=2.0).contains(&self.temperature) {
             return Err(Error::invalid_params().data("temperature must be between 0.0 and 2.0"));
-        }
-        if self.max_tool_rounds == 0 {
-            return Err(Error::invalid_params().data("max tool rounds must be positive"));
         }
         if self.max_tokens == 0 {
             return Err(Error::invalid_params().data("max tokens must be positive"));

@@ -30,7 +30,7 @@ The DeepSeek request context is bounded by the configured character budget.
 The model may emit text, reasoning, and function calls. Tool calls are
 assembled from streamed fragments, assigned session-unique IDs, authorized,
 executed, persisted, and returned to the model until the model completes or the
-round limit is reached.
+user cancels the turn. A turn has no round limit.
 
 ACP v2 reports foreground state independently from prompt acceptance. Cancelling
 active work stops the model stream and tool operations, emits final tool state,
