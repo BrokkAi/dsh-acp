@@ -6,6 +6,30 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ## Unreleased
 
+## 0.3.0 - 2026-10-24
+
+### Added
+
+- Thinking effort is now configurable per session, through the `--reasoning-effort`
+  flag and `DSH_ACP_REASONING_EFFORT` environment variable, the "Thinking effort"
+  ACP config option in both protocol versions (category `thought_level`), and the
+  `/effort` command. It is sent to DeepSeek as `reasoning_effort` with the values
+  `none`, `low`, `high`, and `max`, defaulting to `high` as DeepSeek does.
+  Sessions stored before this change default to `high`. `none` turns thinking
+  mode off and is cheapest. DeepSeek counts the chain of thought inside
+  `max_tokens`, so an explicitly bounded `--max-tokens` may need to be larger
+  when using `max`.
+
+### Changed
+
+- A prompt is no longer capped at a fixed number of model/tool round trips.
+  The old limit (24, `--max-tool-rounds`) ended a turn mid-task with
+  `max_turn_requests`, marked the remaining tool calls failed without a
+  message, and sent the client nothing to explain it, which read as the
+  session exiting early on its own. A turn now runs until the model stops
+  asking for tools or the user cancels it. The `--max-tool-rounds` flag and
+  `DSH_ACP_MAX_TOOL_ROUNDS` environment variable are removed.
+
 ### Fixed
 
 - A response that ended at the token limit was treated as a finished answer: any
@@ -22,20 +46,6 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   the context gauge read as full long before it was. The default conversation
   budget (`--context-chars`) rises from 400000 to 2000000 characters, roughly
   600000 tokens, leaving room for the response.
-
-### Added
-
-- Thinking effort is now configurable per session, through the `--reasoning-effort`
-  flag and `DSH_ACP_REASONING_EFFORT` environment variable, the "Thinking effort"
-  ACP config option in both protocol versions (category `thought_level`), and the
-  `/effort` command. It is sent to DeepSeek as `reasoning_effort` with the values
-  `none`, `low`, `high`, and `max`, defaulting to `high` as DeepSeek does.
-  Sessions stored before this change default to `high`. `none` turns thinking
-  mode off and is cheapest. DeepSeek counts the chain of thought inside
-  `max_tokens`, so `max` may want a larger `--max-tokens` than the 8192 default.
-
-### Fixed
-
 - A completion that was still streaming tokens at the request deadline was
   killed mid-answer: `reqwest`'s total timeout also bounded the response body,
   and the error claimed the API "did not answer in time" when it was answering
@@ -49,16 +59,6 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   retried up to three attempts with exponential backoff, honouring
   `Retry-After`. Retries stop once text has reached the client, so a partly
   streamed answer is reported instead of being duplicated.
-
-### Changed
-
-- A prompt is no longer capped at a fixed number of model/tool round trips.
-  The old limit (24, `--max-tool-rounds`) ended a turn mid-task with
-  `max_turn_requests`, marked the remaining tool calls failed without a
-  message, and sent the client nothing to explain it, which read as the
-  session exiting early on its own. A turn now runs until the model stops
-  asking for tools or the user cancels it. The `--max-tool-rounds` flag and
-  `DSH_ACP_MAX_TOOL_ROUNDS` environment variable are removed.
 
 ## 0.2.3 - 2026-10-23
 
