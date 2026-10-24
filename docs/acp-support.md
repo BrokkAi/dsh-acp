@@ -79,6 +79,10 @@ The session `cwd` and additional roots define the filesystem boundary. Sensitive
 tools request permission unless the session policy or an explicit remembered
 decision allows them.
 
+In plan mode, read-only MCP tools marked with `annotations.readOnlyHint: true`
+remain available and may be called. Other MCP tools are hidden and refused
+before permission is requested.
+
 A write or edit shows its change before it runs: the pending tool call and the
 permission request carry a diff of the whole file (old and new text in v1, a
 patch in v2). When the change cannot be worked out, for example because the

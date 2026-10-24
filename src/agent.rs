@@ -1264,7 +1264,7 @@ impl Harness {
             if supports_elicitation {
                 tools.push(crate::tools::ask_user_definition());
             }
-            {
+            let read_only_mcp_names = {
                 let mut state = runtime.state.lock().await;
                 if let Some(mcp) = state.mcp.as_mut() {
                     if let Err(error) = mcp.refresh(&cancellation).await {
@@ -1280,12 +1280,15 @@ impl Harness {
                         }
                     }
                     tools.extend(mcp.definitions());
+                    mcp.read_only_names()
+                } else {
+                    Vec::new()
                 }
-            }
+            };
             tools.truncate(MAX_MODEL_TOOLS);
             let mut context = record.context_messages(self.config.context_chars);
             if record.config.mode == "plan" {
-                crate::tools::restrict_to_plan_mode(&mut tools, &mut context);
+                crate::tools::restrict_to_plan_mode(&mut tools, &mut context, &read_only_mcp_names);
             }
             let retained_non_system = context
                 .iter()
@@ -1563,8 +1566,15 @@ impl Harness {
         let title = tool_title(&call.function.name, &arguments);
         let record = runtime.snapshot().await;
         let locations = tool_locations(&call.function.name, &arguments, &record);
-        let refused_in_plan_mode =
-            record.config.mode == "plan" && crate::tools::refused_in_plan_mode(&call.function.name);
+        let read_only_mcp = runtime
+            .state
+            .lock()
+            .await
+            .mcp
+            .as_ref()
+            .is_some_and(|mcp| mcp.is_read_only(&call.function.name));
+        let refused_in_plan_mode = record.config.mode == "plan"
+            && crate::tools::refused_in_plan_mode(&call.function.name, read_only_mcp);
         // Show what a write or edit will change before the user approves it.
         // Plan mode refuses the call below, so there is nothing to show.
         let preview = if refused_in_plan_mode {

@@ -6,6 +6,11 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ## Unreleased
 
+### Changed
+
+- Plan mode now offers and allows MCP tools that declare `readOnlyHint: true`.
+  Other MCP tools remain hidden and are refused before permission is requested.
+
 ## 0.2.2 - 2026-10-23
 
 ### Changed

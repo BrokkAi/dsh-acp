@@ -421,25 +421,33 @@ pub fn permission_required(name: &str) -> bool {
 /// What the model is told while a session is in plan mode. Without it the
 /// model is not told it is planning, tries to make the change, and the user is
 /// asked to approve edits that plan mode then refuses.
-pub const PLAN_MODE_INSTRUCTIONS: &str = "The session is in plan mode. You can read, list, and search files and fetch web pages, but you cannot write or edit files, run commands, or call MCP tools. Investigate as needed, then reply with a concrete plan for the user to review. Do not say you made changes.";
+pub const PLAN_MODE_INSTRUCTIONS: &str = "The session is in plan mode. You can read, list, and search files, fetch web pages, and use read-only MCP tools. You cannot write or edit files, run commands, or use other MCP tools. Investigate as needed, then reply with a concrete plan for the user to review. Do not say you made changes.";
 
 /// The reply to a tool call that plan mode refuses before any permission is
 /// requested.
-pub const PLAN_MODE_REFUSAL: &str = "The session is in plan mode. Switch to agent mode before modifying files, running commands, or calling MCP tools.";
+pub const PLAN_MODE_REFUSAL: &str = "The session is in plan mode. Switch to agent mode before modifying files, running commands, or using MCP tools that are not read-only.";
 
 /// Whether plan mode refuses this tool: built-in tools that change the
 /// workspace, and every MCP tool, whose mutation safety cannot be determined.
-pub fn refused_in_plan_mode(name: &str) -> bool {
-    matches!(name, "write_file" | "edit_file" | "run_command") || name.starts_with("mcp__")
+pub fn refused_in_plan_mode(name: &str, read_only_mcp: bool) -> bool {
+    matches!(name, "write_file" | "edit_file" | "run_command")
+        || (name.starts_with("mcp__") && !read_only_mcp)
 }
 
 /// Restrict a model request to plan mode: drop the tools plan mode refuses and
 /// add [`PLAN_MODE_INSTRUCTIONS`] to the system prompt.
-pub fn restrict_to_plan_mode(tools: &mut Vec<Value>, context: &mut Vec<ChatMessage>) {
+pub fn restrict_to_plan_mode(
+    tools: &mut Vec<Value>,
+    context: &mut Vec<ChatMessage>,
+    read_only_mcp_names: &[String],
+) {
     tools.retain(|tool| {
-        !tool["function"]["name"]
-            .as_str()
-            .is_some_and(refused_in_plan_mode)
+        !tool["function"]["name"].as_str().is_some_and(|name| {
+            refused_in_plan_mode(
+                name,
+                read_only_mcp_names.iter().any(|allowed| allowed == name),
+            )
+        })
     });
     match context.first_mut() {
         Some(ChatMessage {
@@ -467,7 +475,7 @@ pub async fn execute(
     if cancellation.is_cancelled() {
         return Err(agent_client_protocol::Error::request_cancelled());
     }
-    if session.config.mode == "plan" && refused_in_plan_mode(name) {
+    if session.config.mode == "plan" && refused_in_plan_mode(name, false) {
         return Err(agent_client_protocol::Error::invalid_request().data(PLAN_MODE_REFUSAL));
     }
 

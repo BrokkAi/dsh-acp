@@ -22,6 +22,7 @@ pub struct McpToolMetadata {
     pub original_name: String,
     pub description: String,
     pub input_schema: Value,
+    pub read_only: bool,
 }
 
 pub struct McpSession {
@@ -82,6 +83,7 @@ impl McpSession {
                     original_name: tool.name,
                     description,
                     input_schema,
+                    read_only: tool.read_only,
                 });
             }
         }
@@ -106,6 +108,20 @@ impl McpSession {
         self.tools
             .iter()
             .any(|tool| tool.qualified_name == qualified_name)
+    }
+
+    pub fn is_read_only(&self, qualified_name: &str) -> bool {
+        self.tools
+            .iter()
+            .any(|tool| tool.qualified_name == qualified_name && tool.read_only)
+    }
+
+    pub fn read_only_names(&self) -> Vec<String> {
+        self.tools
+            .iter()
+            .filter(|tool| tool.read_only)
+            .map(|tool| tool.qualified_name.clone())
+            .collect()
     }
 
     pub async fn call(
@@ -218,6 +234,7 @@ struct McpToolDescription {
     name: String,
     description: Option<String>,
     input_schema: Option<Value>,
+    read_only: bool,
 }
 
 struct McpClient {
@@ -362,6 +379,11 @@ fn parse_tool_list_page(value: &Value) -> Result<(Vec<McpToolDescription>, Optio
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
                 input_schema: tool.get("inputSchema").cloned(),
+                read_only: tool
+                    .get("annotations")
+                    .and_then(|annotations| annotations.get("readOnlyHint"))
+                    .and_then(Value::as_bool)
+                    == Some(true),
             })
         })
         .collect();
@@ -794,5 +816,21 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(tools[0].name, "echo");
+    }
+
+    #[test]
+    fn parses_read_only_hint_only_when_true_boolean() {
+        let tools = parse_tool_list(&json!({"tools": [
+            {"name":"true", "annotations":{"readOnlyHint":true}},
+            {"name":"false", "annotations":{"readOnlyHint":false}},
+            {"name":"absent"},
+            {"name":"string", "annotations":{"readOnlyHint":"true"}},
+            {"name":"number", "annotations":{"readOnlyHint":1}}
+        ]}))
+        .unwrap();
+        assert_eq!(
+            tools.iter().map(|tool| tool.read_only).collect::<Vec<_>>(),
+            [true, false, false, false, false]
+        );
     }
 }

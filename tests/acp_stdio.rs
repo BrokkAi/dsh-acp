@@ -1214,6 +1214,98 @@ async fn plan_mode_tells_the_model_and_refuses_writes_without_asking() {
 }
 
 #[tokio::test]
+async fn plan_mode_allows_only_read_only_http_mcp_tools() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((mcp_url, mcp_server)) = mock_http_mcp_server().await else {
+        eprintln!("skipping plan mode MCP test: loopback networking is unavailable");
+        return;
+    };
+    let Some((base_url, model_server)) = mock_sequence_server(vec![
+        mock_named_tool_call_stream("mcp__review__report"),
+        mock_text_stream(),
+        mock_named_tool_call_stream("mcp__review__mutate"),
+        mock_text_stream(),
+    ])
+    .await
+    else {
+        eprintln!("skipping plan mode MCP test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request("initialize", json!({"protocolVersion": 1}))
+        .await;
+    let session = peer
+        .request(
+            "session/new",
+            json!({
+                    "cwd": temp.path().to_string_lossy(),
+            "mcpServers": [{"type":"http", "name":"review", "url":mcp_url, "headers":[]}],
+                    "additionalDirectories": []
+                }),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    peer.request(
+        "session/set_mode",
+        json!({"sessionId":session_id,"modeId":"plan"}),
+    )
+    .await;
+    for input in ["report", "mutate"] {
+        let response = peer
+            .request(
+                "session/prompt",
+                json!({
+                    "sessionId":session_id,"prompt":[{"type":"text","text":input}]
+                }),
+            )
+            .await;
+        assert_eq!(response["stopReason"], "end_turn");
+        if input == "report" {
+            assert_eq!(
+                peer.permission_requests.len(),
+                1,
+                "read-only MCP still asks permission"
+            );
+        }
+    }
+    let requests = model_server.await.unwrap();
+    let offered: Vec<&str> = requests[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect();
+    assert!(offered.contains(&"mcp__review__report"), "{offered:?}");
+    assert!(!offered.contains(&"mcp__review__mutate"), "{offered:?}");
+    assert!(
+        requests[0]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("read-only MCP tools")
+    );
+    assert_eq!(
+        peer.permission_requests.len(),
+        1,
+        "mutate must be refused before permission"
+    );
+    assert!(
+        peer.updates
+            .iter()
+            .any(|update| { update["params"]["update"]["rawOutput"]["reason"] == "plan_mode" })
+    );
+    let mcp_requests = mcp_server.await.unwrap();
+    assert_eq!(
+        mcp_requests
+            .iter()
+            .filter(|request| request["method"] == "tools/call")
+            .map(|request| request["params"]["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["report"],
+        "MCP requests: {mcp_requests:?}"
+    );
+}
+
+#[tokio::test]
 async fn v2_prompt_runs_local_tool_loop_and_permission_request() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("sample.txt"), "old contents").unwrap();
@@ -2194,6 +2286,53 @@ async fn mock_sequence_server(
     Some((format!("http://{address}"), task))
 }
 
+async fn mock_http_mcp_server() -> Option<(String, tokio::task::JoinHandle<Vec<Value>>)> {
+    let listener = loopback_listener().await?;
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for _ in 0..5 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_json_body(&mut socket).await;
+            let response = match request["method"].as_str().unwrap() {
+                "initialize" => json!({"jsonrpc":"2.0", "id":request["id"], "result":{
+                    "protocolVersion":"2025-06-18", "capabilities":{"tools":{}},
+                    "serverInfo":{"name":"mock", "version":"1"}
+                }}),
+                "notifications/initialized" => Value::Null,
+                "tools/list" => json!({"jsonrpc":"2.0", "id":request["id"], "result":{"tools":[
+                    {"name":"report", "description":"Report findings", "inputSchema":{"type":"object"}, "annotations":{"readOnlyHint":true}},
+                    {"name":"mutate", "description":"Change state", "inputSchema":{"type":"object"}}
+                ]}}),
+                "tools/call" => {
+                    json!({"jsonrpc":"2.0", "id":request["id"], "result":{"content":[{"type":"text","text":"reported"}]}})
+                }
+                method => panic!("unexpected MCP method: {method}"),
+            };
+            requests.push(request.clone());
+            if request.get("id").is_none() {
+                socket
+                    .write_all(
+                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                let body = serde_json::to_vec(&response).unwrap();
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: test-session\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(headers.as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+            }
+            socket.shutdown().await.unwrap();
+        }
+        requests
+    });
+    Some((format!("http://{address}"), task))
+}
+
 async fn loopback_listener() -> Option<TcpListener> {
     match TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => Some(listener),
@@ -2234,6 +2373,15 @@ fn mock_tool_call_stream() -> String {
     let events = [
         json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"sample.txt\","}}]}}]}),
         json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"content\":\"written by tool\"}"}}]}}]}),
+        json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}),
+    ];
+    encode_sse(&events)
+}
+
+fn mock_named_tool_call_stream(name: &str) -> String {
+    let events = [
+        json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-mcp","type":"function","function":{"name":name,"arguments":"{}"}}]}}]}),
         json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
         json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}),
     ];
