@@ -1,6 +1,6 @@
 [package]
 name = "dsh-acp"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.89"
 description = "A full-featured DeepSeek ACP agent harness"
@@ -35,4 +35,3 @@ tempfile = "3.27.0"
 [profile.release]
 lto = "thin"
 strip = true
-
