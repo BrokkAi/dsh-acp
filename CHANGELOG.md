@@ -6,6 +6,16 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ## Unreleased
 
+### Changed
+
+- A prompt is no longer capped at a fixed number of model/tool round trips.
+  The old limit (24, `--max-tool-rounds`) ended a turn mid-task with
+  `max_turn_requests`, marked the remaining tool calls failed without a
+  message, and sent the client nothing to explain it, which read as the
+  session exiting early on its own. A turn now runs until the model stops
+  asking for tools or the user cancels it. The `--max-tool-rounds` flag and
+  `DSH_ACP_MAX_TOOL_ROUNDS` environment variable are removed.
+
 ## 0.2.3 - 2026-10-23
 
 ### Changed

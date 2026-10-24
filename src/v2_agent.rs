@@ -1254,7 +1254,10 @@ impl V2Harness {
                 capabilities.supports_form() || capabilities.supports_url()
             });
         let mut compaction_reported = false;
-        for round in 0..self.base.config.max_tool_rounds {
+        // A turn runs until the model stops asking for tools, the user
+        // cancels, or a request fails. There is no round limit: a task that
+        // needs many steps used to be cut off mid-way.
+        loop {
             {
                 let mut state = runtime.state.lock().await;
                 if !state.record.pending_steering.is_empty() {
@@ -1381,24 +1384,6 @@ impl V2Harness {
                 };
                 return Ok((reason, usage, request_seq));
             }
-            if round + 1 == self.base.config.max_tool_rounds {
-                {
-                    let mut state = runtime.state.lock().await;
-                    state.record.flush_pending_steering();
-                    state.record.touch();
-                }
-                self.base.store.save(runtime).await?;
-                self.append_unfinished_tools(
-                    runtime,
-                    session_id,
-                    connection,
-                    &completion.tool_calls,
-                    0,
-                    ToolOutcomeStatus::Cancelled,
-                )
-                .await?;
-                return Ok((StopReason::MaxTurnRequests, usage, request_seq));
-            }
             for (index, call) in completion.tool_calls.iter().enumerate() {
                 if cancellation.is_cancelled() {
                     self.append_unfinished_tools(
@@ -1463,8 +1448,6 @@ impl V2Harness {
                 self.base.store.save(runtime).await?;
             }
         }
-        let request_seq = runtime.state.lock().await.prompt_seq;
-        Ok((StopReason::MaxTurnRequests, usage, request_seq))
     }
 
     async fn command(&self, runtime: &SessionRuntime, prompt: &str) -> Result<String, Error> {

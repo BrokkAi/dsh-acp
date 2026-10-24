@@ -116,7 +116,6 @@ The binary is `target/release/dsh-acp`.
 --models <A,B>                   Models in the ACP model selector
 --data-dir <PATH>                Session storage (default: .dsh-acp)
 --permission-mode ask|allow|deny Sensitive-tool policy
---max-tool-rounds <N>            Model/tool round limit
 --context-chars <N>              Approximate context budget
 --tool-output-bytes <N>          Per-tool output cap
 --disable-web                    Disable web_fetch
@@ -206,7 +205,8 @@ are supported; a session can declare multiple servers.
 Responses use DeepSeek's OpenAI-compatible streaming API. Reasoning chunks are
 forwarded as ACP thought updates. Tool calls are assembled from streamed
 fragments, executed sequentially, returned as tool messages, and fed back to
-the model until it finishes or the configured round limit is reached.
+the model until it finishes or the turn is cancelled. A prompt has no limit on
+how many model/tool round trips it may take.
 
 `deepseek-flash` supports JPEG, PNG, GIF, and WebP image inputs. ACP image
 content is translated into DeepSeek/OpenAI-compatible `image_url` parts and is

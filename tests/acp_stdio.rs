@@ -156,6 +156,69 @@ impl Peer {
 }
 
 #[tokio::test]
+async fn a_prompt_is_not_capped_at_a_fixed_number_of_tool_rounds() {
+    let temp = tempfile::tempdir().unwrap();
+    // Comfortably more rounds than the 24-round cap the harness used to
+    // impose, so a reintroduced cap fails this test.
+    const ROUNDS: usize = 30;
+    let Some((base_url, server)) = mock_long_tool_loop_server(ROUNDS).await else {
+        eprintln!("skipping round-limit test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request(
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {"fs": {}, "terminal": false}
+        }),
+    )
+    .await;
+    let cwd = temp.path().to_string_lossy().to_string();
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": cwd, "mcpServers": [], "additionalDirectories": []}),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+
+    let response = peer
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "Take as many steps as you need"}]
+            }),
+        )
+        .await;
+
+    assert_eq!(
+        response["stopReason"], "end_turn",
+        "a long turn must end because the model finished, not at a round cap"
+    );
+    let executed = peer
+        .updates
+        .iter()
+        .filter(|update| {
+            let update = &update["params"]["update"];
+            update["sessionUpdate"] == "tool_call_update"
+                && update["status"] == "completed"
+                && update["toolCallId"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("call-"))
+        })
+        .count();
+    assert_eq!(executed, ROUNDS, "every tool call of the turn should run");
+    assert!(peer.updates.iter().any(|update| {
+        update["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+            && update["params"]["update"]["content"]["text"] == "mock answer"
+    }));
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), ROUNDS + 1);
+}
+
+#[tokio::test]
 async fn stdio_supports_initialize_and_session_lifecycle() {
     let temp = tempfile::tempdir().unwrap();
     let mut peer = spawn_peer(temp.path(), None).await;
@@ -2157,6 +2220,41 @@ async fn mock_command_server() -> Option<(String, tokio::task::JoinHandle<Vec<Va
                     json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-command","type":"function","function":{"name":"run_command","arguments":"{\"command\":\"sh\",\"args\":[\"-c\",\"printf terminal-output\"]}"}}]}}]}),
                     json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
                     json!({"choices":[],"usage":{"prompt_tokens":8,"completion_tokens":3,"total_tokens":11}}),
+                ])
+            } else {
+                mock_text_stream()
+            };
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                response.len()
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        }
+        requests
+    });
+    Some((format!("http://{address}"), task))
+}
+
+/// Serves `rounds` tool-call streams and then one text stream, so a test can
+/// drive a prompt past any fixed cap on model/tool round trips.
+async fn mock_long_tool_loop_server(
+    rounds: usize,
+) -> Option<(String, tokio::task::JoinHandle<Vec<Value>>)> {
+    let listener = loopback_listener().await?;
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for index in 0..=rounds {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let body = read_http_json_body(&mut socket).await;
+            requests.push(body);
+            let response = if index < rounds {
+                encode_sse(&[
+                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":format!("call-{index}"),"type":"function","function":{"name":"run_command","arguments":"{\"command\":\"sh\",\"args\":[\"-c\",\"true\"]}"}}]}}]}),
+                    json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+                    json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}),
                 ])
             } else {
                 mock_text_stream()

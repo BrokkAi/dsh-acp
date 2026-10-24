@@ -1240,7 +1240,10 @@ impl Harness {
             .is_some();
         let mut compaction_reported = false;
 
-        for round in 0..self.config.max_tool_rounds {
+        // A turn runs until the model stops asking for tools, the user
+        // cancels, or a request fails. There is no round limit: a task that
+        // needs many steps used to be cut off mid-way.
+        loop {
             let flushed_steering = {
                 let mut state = runtime.state.lock().await;
                 let pending = !state.record.pending_steering.is_empty();
@@ -1380,26 +1383,6 @@ impl Harness {
                 return Ok(PromptResponse::new(stop_reason).usage(Some(turn_acp_usage(turn_usage))));
             }
 
-            if round + 1 == self.config.max_tool_rounds {
-                {
-                    let mut state = runtime.state.lock().await;
-                    state.record.flush_pending_steering();
-                    state.record.touch();
-                }
-                self.store.save(&runtime).await?;
-                self.append_unfinished_tool_results(
-                    &runtime,
-                    &access,
-                    &session_id,
-                    &completion.tool_calls,
-                    0,
-                    "Tool call was not executed because the model reached the round limit.",
-                )
-                .await?;
-                return Ok(PromptResponse::new(StopReason::MaxTurnRequests)
-                    .usage(Some(turn_acp_usage(turn_usage))));
-            }
-
             for (index, tool_call) in completion.tool_calls.iter().enumerate() {
                 if cancellation.is_cancelled() {
                     self.append_unfinished_tool_results(
@@ -1449,11 +1432,6 @@ impl Harness {
                 self.store.save(&runtime).await?;
             }
         }
-
-        Ok(
-            PromptResponse::new(StopReason::MaxTurnRequests)
-                .usage(Some(turn_acp_usage(turn_usage))),
-        )
     }
 
     async fn append_unfinished_tool_results(

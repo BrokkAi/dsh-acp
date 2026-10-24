@@ -285,7 +285,6 @@ mod tests {
             system_prompt: None,
             max_tokens: 100,
             temperature: 0.0,
-            max_tool_rounds: 2,
             context_chars: 1000,
             tool_output_bytes: 1000,
             http_timeout: std::time::Duration::from_secs(1),

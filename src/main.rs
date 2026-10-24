@@ -52,10 +52,6 @@ struct Cli {
     #[arg(long, env = "DSH_ACP_TEMPERATURE", default_value_t = 0.2)]
     temperature: f64,
 
-    /// Maximum model/tool round trips in one prompt.
-    #[arg(long, env = "DSH_ACP_MAX_TOOL_ROUNDS", default_value_t = 24)]
-    max_tool_rounds: usize,
-
     /// Approximate character budget for conversation context.
     #[arg(long, env = "DSH_ACP_CONTEXT_CHARS", default_value_t = 400_000)]
     context_chars: usize,
@@ -110,7 +106,6 @@ impl TryFrom<Cli> for Config {
             system_prompt: cli.system_prompt,
             max_tokens: cli.max_tokens,
             temperature: cli.temperature,
-            max_tool_rounds: cli.max_tool_rounds,
             context_chars: cli.context_chars,
             tool_output_bytes: cli.tool_output_bytes,
             http_timeout: std::time::Duration::from_secs(cli.http_timeout_secs),
