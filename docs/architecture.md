@@ -32,6 +32,14 @@ assembled from streamed fragments, assigned session-unique IDs, authorized,
 executed, persisted, and returned to the model until the model completes or the
 user cancels the turn. A turn has no round limit.
 
+One completion is requested with up to three attempts. A rate limit or 5xx is
+retried with backoff; connection failures and responses that end without a
+`finish_reason` are retried too. Retrying stops as soon as text or reasoning
+has reached the client, because a second attempt would duplicate what the user
+already saw. An empty body is never accepted as an answer. The HTTP client
+bounds connecting and stalled reads rather than total request time, so a long
+stream that keeps producing tokens is not interrupted.
+
 ACP v2 reports foreground state independently from prompt acceptance. Cancelling
 active work stops the model stream and tool operations, emits final tool state,
 and settles to idle with the `cancelled` reason.

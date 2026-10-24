@@ -208,6 +208,14 @@ fragments, executed sequentially, returned as tool messages, and fed back to
 the model until it finishes or the turn is cancelled. A prompt has no limit on
 how many model/tool round trips it may take.
 
+`--http-timeout-secs` bounds connecting and stalled reads, not the whole
+response: a completion that keeps streaming tokens is never cut off for taking
+a long time. A response that closes before its `finish_reason` (or `[DONE]`) is
+an error, not a finished answer. Rate limits and 5xx responses are retried up
+to three attempts with backoff, honouring `Retry-After`, but only while no text
+has reached the client yet, so a retry never duplicates an answer that was
+already partly streamed.
+
 `deepseek-flash` supports JPEG, PNG, GIF, and WebP image inputs. ACP image
 content is translated into DeepSeek/OpenAI-compatible `image_url` parts and is
 retained in session history for replay.

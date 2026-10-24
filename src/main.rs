@@ -60,7 +60,7 @@ struct Cli {
     #[arg(long, env = "DSH_ACP_TOOL_OUTPUT_BYTES", default_value_t = 131_072)]
     tool_output_bytes: usize,
 
-    /// HTTP timeout in seconds.
+    /// Seconds to wait for a connection, or for a stalled stream to resume.
     #[arg(long, env = "DSH_ACP_HTTP_TIMEOUT_SECS", default_value_t = 180)]
     http_timeout_secs: u64,
 
