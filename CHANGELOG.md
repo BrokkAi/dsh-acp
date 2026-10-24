@@ -6,6 +6,17 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ## Unreleased
 
+### Added
+
+- Thinking effort is now configurable per session, through the `--reasoning-effort`
+  flag and `DSH_ACP_REASONING_EFFORT` environment variable, the "Thinking effort"
+  ACP config option in both protocol versions (category `thought_level`), and the
+  `/effort` command. It is sent to DeepSeek as `reasoning_effort` with the values
+  `none`, `low`, `high`, and `max`, defaulting to `high` as DeepSeek does.
+  Sessions stored before this change default to `high`. `none` turns thinking
+  mode off and is cheapest. DeepSeek counts the chain of thought inside
+  `max_tokens`, so `max` may want a larger `--max-tokens` than the 8192 default.
+
 ### Fixed
 
 - A completion that was still streaming tokens at the request deadline was

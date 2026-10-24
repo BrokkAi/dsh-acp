@@ -35,6 +35,68 @@ impl PermissionMode {
     }
 }
 
+/// DeepSeek thinking-mode effort. `None` turns thinking off entirely and
+/// enables sampling parameters such as temperature.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    None,
+    Low,
+    #[default]
+    High,
+    Max,
+}
+
+impl FromStr for ReasoningEffort {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" | "disabled" | "off" => Ok(Self::None),
+            "minimal" | "low" => Ok(Self::Low),
+            "medium" | "high" | "xhigh" | "enabled" | "on" => Ok(Self::High),
+            "max" | "ultra" => Ok(Self::Max),
+            _ => Err(()),
+        }
+    }
+}
+
+impl ReasoningEffort {
+    pub const VALUES: [Self; 4] = [Self::None, Self::Low, Self::High, Self::Max];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Low => "low",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Low => "Low",
+            Self::High => "High",
+            Self::Max => "Max",
+        }
+    }
+
+    /// Whether this effort turns DeepSeek thinking mode on.
+    pub fn thinking(self) -> bool {
+        self != Self::None
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::None => "Answer without thinking; cheapest and fastest.",
+            Self::Low => "Brief thinking before answering.",
+            Self::High => "DeepSeek's default thinking effort.",
+            Self::Max => "Longest thinking, for hard problems.",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub api_key: Option<String>,
@@ -46,6 +108,7 @@ pub struct Config {
     pub system_prompt: Option<String>,
     pub max_tokens: u32,
     pub temperature: f64,
+    pub reasoning_effort: ReasoningEffort,
     pub context_chars: usize,
     pub tool_output_bytes: usize,
     pub http_timeout: Duration,
@@ -117,5 +180,48 @@ Do not expose secrets. Do not run broad destructive commands. When a task is com
             prompt.push('\n');
         }
         prompt
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_effort_parses_deepseek_names_and_aliases() {
+        assert_eq!("none".parse(), Ok(ReasoningEffort::None));
+        assert_eq!("off".parse(), Ok(ReasoningEffort::None));
+        assert_eq!("minimal".parse(), Ok(ReasoningEffort::Low));
+        assert_eq!("medium".parse(), Ok(ReasoningEffort::High));
+        assert_eq!("xhigh".parse(), Ok(ReasoningEffort::High));
+        assert_eq!(" MAX ".parse(), Ok(ReasoningEffort::Max));
+        assert_eq!("bogus".parse::<ReasoningEffort>(), Err(()));
+    }
+
+    #[test]
+    fn reasoning_effort_names_round_trip_and_none_disables_thinking() {
+        for effort in ReasoningEffort::VALUES {
+            assert_eq!(effort.as_str().parse(), Ok(effort));
+        }
+        assert!(!ReasoningEffort::None.thinking());
+        assert!(ReasoningEffort::Max.thinking());
+    }
+
+    #[test]
+    fn a_stored_session_without_an_effort_uses_the_deepseek_default() {
+        let record: crate::model::SessionRecord = serde_json::from_value(serde_json::json!({
+            "id": "dsh-1",
+            "cwd": "/tmp",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "config": {
+                "model": "deepseek-flash",
+                "mode": "agent",
+                "permission_mode": "ask",
+                "network": true
+            }
+        }))
+        .unwrap();
+        assert_eq!(record.config.reasoning_effort, ReasoningEffort::High);
     }
 }
