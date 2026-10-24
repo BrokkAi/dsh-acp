@@ -44,12 +44,13 @@ struct Cli {
     #[arg(long, env = "DSH_ACP_SYSTEM_PROMPT")]
     system_prompt: Option<String>,
 
-    /// Maximum response tokens per model completion. DeepSeek allows 384000.
+    /// Maximum response tokens per model completion.
     ///
-    /// Thinking tokens count toward this cap, so a small value truncates an
-    /// answer before it finishes.
-    #[arg(long, env = "DSH_ACP_MAX_TOKENS", default_value_t = 65_536)]
-    max_tokens: u32,
+    /// Omitted by default, so DeepSeek uses its maximum (384000 for both
+    /// models). Thinking tokens count toward this cap. Set it only to bound
+    /// cost.
+    #[arg(long, env = "DSH_ACP_MAX_TOKENS")]
+    max_tokens: Option<u32>,
 
     /// Sampling temperature. Ignored by some DeepSeek models.
     #[arg(long, env = "DSH_ACP_TEMPERATURE", default_value_t = 0.2)]

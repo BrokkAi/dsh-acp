@@ -167,17 +167,24 @@ async fn a_request_asks_for_the_models_real_output_allowance() {
     let _ = peer_prompt(&mut peer, temp.path(), "Write sample.txt and report back").await;
 
     let requests = server.await.unwrap();
-    // DeepSeek allows 384000 output tokens. A cap far below that truncates a
-    // large file write into `max_tokens`, so the default must leave real room.
-    let max_tokens = requests[0]["max_tokens"].as_u64().unwrap();
-    assert!(
-        max_tokens >= 32_768,
-        "max_tokens {max_tokens} is far below what the model allows"
-    );
-    assert!(
-        max_tokens <= 384_000,
-        "max_tokens {max_tokens} exceeds the API"
-    );
+    // DeepSeek's own examples do not send `max_tokens`, letting the API use
+    // its maximum (384000). Capping it lower truncates a large file write or a
+    // long chain of thought into `finish_reason: "length"`.
+    let request = &requests[0];
+    match request.get("max_tokens") {
+        None => {}
+        Some(value) => {
+            let max_tokens = value.as_u64().unwrap();
+            assert!(
+                max_tokens >= 65_536,
+                "max_tokens {max_tokens} is far below what the model allows"
+            );
+            assert!(
+                max_tokens <= 384_000,
+                "max_tokens {max_tokens} exceeds the API"
+            );
+        }
+    }
 }
 
 #[tokio::test]

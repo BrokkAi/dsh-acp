@@ -10,8 +10,9 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 - The default `--max-tokens` was 8192, about 2% of what DeepSeek allows, so a
   large file write or a long chain of thought hit `max_tokens` and truncated
-  the answer. Both models accept 384000 output tokens; the default is now
-  65536 and the flag still raises it to the maximum.
+  the answer. The harness no longer sends `max_tokens` at all, matching
+  DeepSeek's own examples, so the API uses its maximum of 384000 output tokens.
+  `--max-tokens` remains available to bound cost.
 - The reported context window was 128K, while both models accept 1M tokens, so
   the context gauge read as full long before it was. The default conversation
   budget (`--context-chars`) rises from 400000 to 2000000 characters, roughly

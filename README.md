@@ -229,11 +229,11 @@ harness's default. Set it with `--reasoning-effort`,
 `DSH_ACP_REASONING_EFFORT`, the ACP "Thinking effort" config option, or the
 `/effort` command.
 
-DeepSeek counts the chain of thought inside `max_tokens`, so a low cap can let
-reasoning consume the whole response and truncate the answer into
-`max_tokens`. Both models accept up to 384000 output tokens and 1M tokens of
-context; the default cap is 65536, and `--max-tokens` raises it to the 384000
-maximum when selecting `max` effort or writing large files.
+DeepSeek counts the chain of thought inside `max_tokens`. The harness does not
+send `max_tokens` at all, the same as DeepSeek's own examples, so the API uses
+its maximum: 384000 output tokens and a 1M-token context on both models. Pass
+`--max-tokens` only to bound cost, and keep it well above the expected
+reasoning length, because reasoning spends the same budget as the answer.
 
 `temperature` is sent on every request except the legacy `deepseek-reasoner`
 model, whatever the effort. DeepSeek ignores it in thinking mode, so it only

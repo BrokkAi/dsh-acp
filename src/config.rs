@@ -106,7 +106,7 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub permission_mode: PermissionMode,
     pub system_prompt: Option<String>,
-    pub max_tokens: u32,
+    pub max_tokens: Option<u32>,
     pub temperature: f64,
     pub reasoning_effort: ReasoningEffort,
     pub context_chars: usize,
@@ -127,7 +127,7 @@ impl Config {
         if !(0.0..=2.0).contains(&self.temperature) {
             return Err(Error::invalid_params().data("temperature must be between 0.0 and 2.0"));
         }
-        if self.max_tokens == 0 {
+        if self.max_tokens == Some(0) {
             return Err(Error::invalid_params().data("max tokens must be positive"));
         }
         if self.context_chars == 0 {

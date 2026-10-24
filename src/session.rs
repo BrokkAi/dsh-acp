@@ -286,7 +286,7 @@ mod tests {
             data_dir: temp.path().join("data"),
             permission_mode: PermissionMode::Ask,
             system_prompt: None,
-            max_tokens: 100,
+            max_tokens: Some(100),
             temperature: 0.0,
             reasoning_effort: ReasoningEffort::High,
             context_chars: 1000,
