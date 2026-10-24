@@ -156,6 +156,31 @@ impl Peer {
 }
 
 #[tokio::test]
+async fn a_request_asks_for_the_models_real_output_allowance() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, server)) = mock_deepseek_server().await else {
+        eprintln!("skipping output allowance test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer_raw_initialize(&mut peer).await;
+    let _ = peer_prompt(&mut peer, temp.path(), "Write sample.txt and report back").await;
+
+    let requests = server.await.unwrap();
+    // DeepSeek allows 384000 output tokens. A cap far below that truncates a
+    // large file write into `max_tokens`, so the default must leave real room.
+    let max_tokens = requests[0]["max_tokens"].as_u64().unwrap();
+    assert!(
+        max_tokens >= 32_768,
+        "max_tokens {max_tokens} is far below what the model allows"
+    );
+    assert!(
+        max_tokens <= 384_000,
+        "max_tokens {max_tokens} exceeds the API"
+    );
+}
+
+#[tokio::test]
 async fn a_prompt_is_not_capped_at_a_fixed_number_of_tool_rounds() {
     let temp = tempfile::tempdir().unwrap();
     // Comfortably more rounds than the 24-round cap the harness used to

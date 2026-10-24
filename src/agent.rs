@@ -57,7 +57,7 @@ use crate::{
 };
 
 const PAGE_SIZE: usize = 100;
-const DEFAULT_CONTEXT_WINDOW: u64 = 128 * 1024;
+const DEFAULT_CONTEXT_WINDOW: u64 = 1_000_000;
 const MAX_MODEL_TOOLS: usize = 128;
 const STEERING_METHOD: &str = "_session/steering";
 

@@ -231,8 +231,9 @@ harness's default. Set it with `--reasoning-effort`,
 
 DeepSeek counts the chain of thought inside `max_tokens`, so a low cap can let
 reasoning consume the whole response and truncate the answer into
-`max_tokens`. The default cap is 8192, which suits `none` through `high`; raise
-`--max-tokens` when selecting `max`.
+`max_tokens`. Both models accept up to 384000 output tokens and 1M tokens of
+context; the default cap is 65536, and `--max-tokens` raises it to the 384000
+maximum when selecting `max` effort or writing large files.
 
 `temperature` is sent on every request except the legacy `deepseek-reasoner`
 model, whatever the effort. DeepSeek ignores it in thinking mode, so it only

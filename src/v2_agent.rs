@@ -47,7 +47,7 @@ use crate::{
 
 const PAGE_SIZE: usize = 100;
 const MAX_MODEL_TOOLS: usize = 128;
-const CONTEXT_WINDOW: u64 = 128 * 1024;
+const CONTEXT_WINDOW: u64 = 1_000_000;
 const STEERING_METHOD: &str = "_session/steering";
 
 #[derive(Clone)]

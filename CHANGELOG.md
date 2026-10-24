@@ -6,6 +6,17 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ## Unreleased
 
+### Fixed
+
+- The default `--max-tokens` was 8192, about 2% of what DeepSeek allows, so a
+  large file write or a long chain of thought hit `max_tokens` and truncated
+  the answer. Both models accept 384000 output tokens; the default is now
+  65536 and the flag still raises it to the maximum.
+- The reported context window was 128K, while both models accept 1M tokens, so
+  the context gauge read as full long before it was. The default conversation
+  budget (`--context-chars`) rises from 400000 to 2000000 characters, roughly
+  600000 tokens, leaving room for the response.
+
 ### Added
 
 - Thinking effort is now configurable per session, through the `--reasoning-effort`
