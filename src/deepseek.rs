@@ -100,7 +100,12 @@ impl DeepSeekClient {
             ));
         }
         let http = reqwest::Client::builder()
-            .timeout(config.http_timeout)
+            // A total timeout would also bound the response body, so a
+            // completion that is still streaming tokens at the deadline was
+            // killed mid-answer. These two bound connection setup and stalls
+            // instead: a stream that keeps producing is never cut off.
+            .connect_timeout(config.http_timeout)
+            .read_timeout(config.http_timeout)
             .user_agent(concat!("dsh-acp/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(Error::into_internal_error)?;
@@ -141,12 +146,64 @@ impl DeepSeekClient {
         }
     }
 
+    /// Ask for one completion, retrying a failure that a later attempt can fix.
+    ///
+    /// A retry is only attempted when nothing has been streamed to the client
+    /// yet: repeating text the client already rendered would duplicate it, so
+    /// a response that dies after its first token is reported instead.
     pub async fn stream_chat(
         &self,
         request: ChatRequest,
         cancellation: &CancellationToken,
         on_event: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Completion, Error> {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let emitted = std::sync::atomic::AtomicBool::new(false);
+            let outcome = {
+                let mut emit = |event: StreamEvent| {
+                    if matches!(&event, StreamEvent::Text(_) | StreamEvent::Reasoning(_)) {
+                        emitted.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    on_event(event);
+                };
+                self.stream_chat_once(&request, cancellation, &mut emit)
+                    .await
+            };
+            let failure = match outcome {
+                Ok(completion) => return Ok(completion),
+                Err(failure) => failure,
+            };
+            if !failure.retryable
+                || emitted.load(std::sync::atomic::Ordering::Relaxed)
+                || attempt >= MAX_ATTEMPTS
+            {
+                return Err(explain_failure(
+                    failure,
+                    emitted.load(std::sync::atomic::Ordering::Relaxed),
+                ));
+            }
+            let delay = failure.retry_after.unwrap_or_else(|| backoff(attempt));
+            tracing::warn!(
+                attempt,
+                ?delay,
+                error = %failure.error,
+                "retrying the model request"
+            );
+            tokio::select! {
+                _ = cancellation.cancelled() => return Err(Error::request_cancelled()),
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+    }
+
+    async fn stream_chat_once(
+        &self,
+        request: &ChatRequest,
+        cancellation: &CancellationToken,
+        on_event: &mut (dyn FnMut(StreamEvent) + Send),
+    ) -> Result<Completion, AttemptFailure> {
         let mut builder = self
             .http
             .post(&self.endpoint)
@@ -161,19 +218,23 @@ impl DeepSeekClient {
             builder = builder.bearer_auth(api_key);
         }
         let response = tokio::select! {
-            _ = cancellation.cancelled() => return Err(Error::request_cancelled()),
+            _ = cancellation.cancelled() => return Err(AttemptFailure::permanent(Error::request_cancelled())),
             response = builder
-                .json(&request)
-                .send() => response.map_err(http_error)?,
+                .json(request)
+                .send() => response.map_err(|error| AttemptFailure::transient(http_error(error)))?,
         };
 
         let status = response.status();
         if !status.is_success() {
+            let retry_after = retry_after(&response);
             let body = tokio::select! {
-                _ = cancellation.cancelled() => return Err(Error::request_cancelled()),
-                body = response.text() => body.unwrap_or_default(),
+                _ = cancellation.cancelled() => return Err(AttemptFailure::permanent(Error::request_cancelled())),
+                body = response.text() => body,
             };
-            let detail = extract_api_error(&body).unwrap_or(body);
+            let detail = body
+                .ok()
+                .map(|body| extract_api_error(&body).unwrap_or(body))
+                .unwrap_or_default();
             let message = format!("DeepSeek API returned HTTP {status}: {detail}");
             return Err(
                 if status == reqwest::StatusCode::UNAUTHORIZED
@@ -182,11 +243,26 @@ impl DeepSeekClient {
                     let message = format!(
                         "{message}. Check DEEPSEEK_API_KEY (or --api-key, or the provider's Authorization header)."
                     );
-                    Error::auth_required()
-                        .data(json!({"status": status.as_u16(), "message": message}))
+                    AttemptFailure::permanent(
+                        Error::auth_required()
+                            .data(json!({"status": status.as_u16(), "message": message})),
+                    )
+                } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status.is_server_error()
+                {
+                    AttemptFailure {
+                        error: Box::new(
+                            Error::internal_error()
+                                .data(json!({"status": status.as_u16(), "message": message})),
+                        ),
+                        retryable: true,
+                        retry_after,
+                    }
                 } else {
-                    Error::internal_error()
-                        .data(json!({"status": status.as_u16(), "message": message}))
+                    AttemptFailure::permanent(
+                        Error::internal_error()
+                            .data(json!({"status": status.as_u16(), "message": message})),
+                    )
                 },
             );
         }
@@ -200,12 +276,13 @@ impl DeepSeekClient {
 
         if content_type.contains("application/json") {
             let bytes = tokio::select! {
-                _ = cancellation.cancelled() => return Err(Error::request_cancelled()),
-                body = response.bytes() => body.map_err(http_error)?,
+                _ = cancellation.cancelled() => return Err(AttemptFailure::permanent(Error::request_cancelled())),
+                body = response.bytes() => body.map_err(|error| AttemptFailure::transient(http_error(error)))?,
             };
             let mut completion = Completion::default();
-            ingest_json_response(&bytes, &mut completion, on_event)?;
-            return Ok(completion);
+            ingest_json_response(&bytes, &mut completion, on_event)
+                .map_err(AttemptFailure::permanent)?;
+            return ensure_not_empty(completion);
         }
 
         let mut stream = response.bytes_stream();
@@ -213,16 +290,17 @@ impl DeepSeekClient {
         let mut completion = Completion::default();
         let mut pending_data = String::new();
         let mut saw_data = false;
+        let mut saw_done = false;
 
         loop {
             let next = tokio::select! {
-                _ = cancellation.cancelled() => return Err(Error::request_cancelled()),
+                _ = cancellation.cancelled() => return Err(AttemptFailure::permanent(Error::request_cancelled())),
                 next = stream.next() => next,
             };
             let Some(chunk) = next else {
                 break;
             };
-            let chunk = chunk.map_err(http_error)?;
+            let chunk = chunk.map_err(|error| AttemptFailure::transient(http_error(error)))?;
             byte_buffer.extend_from_slice(&chunk);
 
             while let Some(newline) = byte_buffer.iter().position(|byte| *byte == b'\n') {
@@ -232,7 +310,8 @@ impl DeepSeekClient {
 
                 if line.is_empty() {
                     if !pending_data.is_empty() {
-                        ingest_stream_data(&pending_data, &mut completion, on_event)?;
+                        ingest_stream_data(&pending_data, &mut completion, on_event)
+                            .map_err(AttemptFailure::permanent)?;
                         pending_data.clear();
                     }
                     continue;
@@ -243,6 +322,7 @@ impl DeepSeekClient {
                 if let Some(data) = line.strip_prefix("data:") {
                     let data = data.trim_start();
                     if data == "[DONE]" {
+                        saw_done = true;
                         continue;
                     }
                     saw_data = true;
@@ -257,15 +337,109 @@ impl DeepSeekClient {
         }
 
         if !pending_data.is_empty() {
-            ingest_stream_data(&pending_data, &mut completion, on_event)?;
+            ingest_stream_data(&pending_data, &mut completion, on_event)
+                .map_err(AttemptFailure::permanent)?;
         } else if !saw_data && !byte_buffer.is_empty() {
             // Some compatible gateways label a single JSON response as an SSE
             // stream. Accept it rather than losing an otherwise valid response.
-            ingest_json_response(&byte_buffer, &mut completion, on_event)?;
+            ingest_json_response(&byte_buffer, &mut completion, on_event)
+                .map_err(AttemptFailure::permanent)?;
+            return ensure_not_empty(completion);
         }
 
-        Ok(completion)
+        // A response is complete when the API says it finished. A connection
+        // that closes first used to read as a finished answer, so a half
+        // written file looked like a completed task.
+        if saw_done || completion.finish_reason.is_some() {
+            return Ok(completion);
+        }
+        Err(AttemptFailure::transient(Error::internal_error().data(
+            json!({
+                "message": if saw_data {
+                    "The DeepSeek API closed the connection before the response finished."
+                } else {
+                    "The DeepSeek API returned an empty response."
+                }
+            }),
+        )))
     }
+}
+
+/// How many times one completion may be requested before giving up.
+const MAX_ATTEMPTS: u32 = 3;
+
+/// A failed attempt, and whether asking again could succeed.
+struct AttemptFailure {
+    // Boxed so the common success path does not carry a large error type.
+    error: Box<Error>,
+    retryable: bool,
+    retry_after: Option<std::time::Duration>,
+}
+
+impl AttemptFailure {
+    fn permanent(error: Error) -> Self {
+        Self {
+            error: Box::new(error),
+            retryable: false,
+            retry_after: None,
+        }
+    }
+
+    fn transient(error: Error) -> Self {
+        Self {
+            error: Box::new(error),
+            retryable: true,
+            retry_after: None,
+        }
+    }
+}
+
+/// A completion that carries nothing is a failed request, not an empty answer.
+fn ensure_not_empty(completion: Completion) -> Result<Completion, AttemptFailure> {
+    if completion.content.is_empty()
+        && completion.reasoning_content.is_empty()
+        && completion.tool_calls.is_empty()
+    {
+        return Err(AttemptFailure::transient(Error::internal_error().data(
+            json!({
+                "message": "The DeepSeek API returned an empty response."
+            }),
+        )));
+    }
+    Ok(completion)
+}
+
+fn explain_failure(failure: AttemptFailure, emitted: bool) -> Error {
+    if emitted && failure.retryable {
+        let message = failure
+            .error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("the connection failed");
+        return Error::internal_error().data(json!({
+            "message": format!("{message}. The answer was already partly streamed, so it was not retried.")
+        }));
+    }
+    *failure.error
+}
+/// `Retry-After` in seconds, when the API asks for a pause before retrying.
+fn retry_after(response: &reqwest::Response) -> Option<std::time::Duration> {
+    let seconds = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(std::time::Duration::from_secs(seconds.min(30)))
+}
+
+/// Exponential backoff: 500ms, then 1s.
+fn backoff(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(500u64 << attempt.saturating_sub(1).min(5))
 }
 
 /// A transport failure with its causes, which reqwest's own message omits

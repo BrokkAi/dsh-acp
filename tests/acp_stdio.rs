@@ -578,11 +578,20 @@ async fn stdio_negotiates_acp_v2_and_uses_async_prompt_lifecycle() {
 }
 
 async fn spawn_peer(data_dir: &std::path::Path, base_url: Option<&str>) -> Peer {
+    spawn_peer_with_args(data_dir, base_url, &[]).await
+}
+
+async fn spawn_peer_with_args(
+    data_dir: &std::path::Path,
+    base_url: Option<&str>,
+    extra_args: &[&str],
+) -> Peer {
     let mut command = Command::new(env!("CARGO_BIN_EXE_dsh-acp"));
     command
         .arg("--data-dir")
         .arg(data_dir.join("sessions-data"))
         .arg("--disable-web")
+        .args(extra_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -2651,4 +2660,316 @@ fn encode_sse(events: &[Value]) -> String {
     }
     output.push_str("data: [DONE]\n\n");
     output
+}
+
+// ---------------------------------------------------------------------------
+// Failure modes that used to end a turn silently.
+// ---------------------------------------------------------------------------
+
+/// Answer the first request with `status` and a JSON error, then serve a text
+/// stream. Returns how many requests were made.
+async fn mock_fails_then_recovers(
+    status: &'static str,
+) -> Option<(String, tokio::task::JoinHandle<usize>)> {
+    let listener = loopback_listener().await?;
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut requests = 0;
+        for index in 0..3 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = read_http_json_body(&mut socket).await;
+            requests += 1;
+            let (head, body) = if index == 0 {
+                let body = r#"{"error":{"message":"overloaded"}}"#.to_string();
+                (
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    ),
+                    body,
+                )
+            } else {
+                let body = mock_text_stream();
+                (
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    ),
+                    body,
+                )
+            };
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(body.as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+            if index > 0 {
+                break;
+            }
+        }
+        requests
+    });
+    Some((format!("http://{address}"), task))
+}
+
+/// Serve an empty 200 event-stream once, then a real answer.
+async fn mock_empty_then_recovers() -> Option<(String, tokio::task::JoinHandle<usize>)> {
+    let listener = loopback_listener().await?;
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut requests = 0;
+        for index in 0..3 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = read_http_json_body(&mut socket).await;
+            requests += 1;
+            let body = if index == 0 {
+                String::new()
+            } else {
+                mock_text_stream()
+            };
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(body.as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+            if index > 0 {
+                break;
+            }
+        }
+        requests
+    });
+    Some((format!("http://{address}"), task))
+}
+
+/// Send a 200 event-stream whose body is `body`.
+async fn mock_raw_stream(body: String) -> Option<(String, tokio::task::JoinHandle<usize>)> {
+    let listener = loopback_listener().await?;
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut requests = 0;
+        for _ in 0..3 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = read_http_json_body(&mut socket).await;
+            requests += 1;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(body.as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+        }
+        requests
+    });
+    Some((format!("http://{address}"), task))
+}
+
+/// Stream four chunks 400ms apart, so the whole answer takes longer than the
+/// configured timeout while no single gap reaches it.
+async fn mock_slow_but_live_server() -> Option<(String, tokio::task::JoinHandle<()>)> {
+    let listener = loopback_listener().await?;
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_http_json_body(&mut socket).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let chunks = [
+            json!({"choices":[{"delta":{"content":"slow "}}]}),
+            json!({"choices":[{"delta":{"content":"but "}}]}),
+            json!({"choices":[{"delta":{"content":"alive"}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+        ];
+        for (index, chunk) in chunks.iter().enumerate() {
+            if index > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
+            let mut payload = format!("data: {chunk}\n\n");
+            if index == chunks.len() - 1 {
+                payload.push_str("data: [DONE]\n\n");
+            }
+            let framed = format!("{:x}\r\n{payload}\r\n", payload.len());
+            socket.write_all(framed.as_bytes()).await.unwrap();
+        }
+        socket.write_all(b"0\r\n\r\n").await.unwrap();
+        let _ = socket.shutdown().await;
+    });
+    Some((format!("http://{address}"), task))
+}
+
+async fn peer_raw_initialize(peer: &mut Peer) {
+    peer.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {"fs": {}, "terminal": false}}),
+    )
+    .await;
+}
+
+async fn peer_prompt(peer: &mut Peer, cwd: &std::path::Path, text: &str) -> Value {
+    let cwd = cwd.to_string_lossy().to_string();
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": cwd, "mcpServers": [], "additionalDirectories": []}),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+    peer.request(
+        "session/prompt",
+        json!({"sessionId": session_id, "prompt": [{"type": "text", "text": text}]}),
+    )
+    .await
+}
+
+fn streamed_text(peer: &Peer) -> Vec<String> {
+    peer.updates
+        .iter()
+        .filter(|update| update["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+        .map(|update| {
+            update["params"]["update"]["content"]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_transient_api_failure_is_retried_instead_of_ending_the_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, server)) = mock_fails_then_recovers("503 Service Unavailable").await else {
+        eprintln!("skipping retry test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer_raw_initialize(&mut peer).await;
+    let response = peer_prompt(&mut peer, temp.path(), "do the task").await;
+    assert_eq!(response["stopReason"], "end_turn");
+    assert_eq!(streamed_text(&peer), ["mock answer"]);
+    assert_eq!(
+        server.await.unwrap(),
+        2,
+        "the failed request is retried once"
+    );
+}
+
+#[tokio::test]
+async fn a_rate_limited_request_is_retried() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, server)) = mock_fails_then_recovers("429 Too Many Requests").await else {
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer_raw_initialize(&mut peer).await;
+    let response = peer_prompt(&mut peer, temp.path(), "do the task").await;
+    assert_eq!(response["stopReason"], "end_turn");
+    assert_eq!(server.await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn an_empty_response_is_retried_rather_than_reported_as_an_answer() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, server)) = mock_empty_then_recovers().await else {
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer_raw_initialize(&mut peer).await;
+    let response = peer_prompt(&mut peer, temp.path(), "do the task").await;
+    assert_eq!(
+        response["stopReason"], "end_turn",
+        "the retry should reach the real answer"
+    );
+    assert_eq!(streamed_text(&peer), ["mock answer"]);
+    assert_eq!(server.await.unwrap(), 2, "the empty answer is retried once");
+}
+
+#[tokio::test]
+async fn an_api_that_only_returns_empty_bodies_fails_loudly() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, _server)) = mock_raw_stream(String::new()).await else {
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer_raw_initialize(&mut peer).await;
+    let cwd = temp.path().to_string_lossy().to_string();
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": cwd, "mcpServers": [], "additionalDirectories": []}),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+    let error = peer
+        .request_error(
+            "session/prompt",
+            json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "do the task"}]}),
+        )
+        .await;
+    assert_eq!(
+        error["data"]["message"].as_str(),
+        Some("The DeepSeek API returned an empty response."),
+        "an empty answer is an error, never a finished turn"
+    );
+    assert!(streamed_text(&peer).is_empty());
+}
+
+#[tokio::test]
+async fn a_truncated_response_is_an_error_not_a_finished_answer() {
+    let temp = tempfile::tempdir().unwrap();
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"half an answer\"}}]}\n\n".to_string();
+    let Some((base_url, _server)) = mock_raw_stream(body).await else {
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer_raw_initialize(&mut peer).await;
+    let cwd = temp.path().to_string_lossy().to_string();
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": cwd, "mcpServers": [], "additionalDirectories": []}),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+    let error = peer
+        .request_error(
+            "session/prompt",
+            json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "do the task"}]}),
+        )
+        .await;
+    let message = error["data"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("closed the connection before the response finished"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        message.contains("partly streamed"),
+        "the error must say why it was not retried: {error}"
+    );
+    assert_eq!(
+        streamed_text(&peer),
+        ["half an answer"],
+        "partial text must not be duplicated by a retry"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_that_keeps_producing_outlives_the_request_timeout() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, _server)) = mock_slow_but_live_server().await else {
+        return;
+    };
+    // Every gap between chunks is 400ms; the whole answer takes ~1.2s.
+    let mut peer =
+        spawn_peer_with_args(temp.path(), Some(&base_url), &["--http-timeout-secs", "1"]).await;
+    peer_raw_initialize(&mut peer).await;
+    let response = peer_prompt(&mut peer, temp.path(), "write the file").await;
+    assert_eq!(
+        response["stopReason"], "end_turn",
+        "a live stream must not be killed by the request timeout"
+    );
+    assert_eq!(streamed_text(&peer).concat(), "slow but alive");
 }

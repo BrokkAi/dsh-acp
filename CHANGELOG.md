@@ -17,6 +17,22 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   mode off and is cheapest. DeepSeek counts the chain of thought inside
   `max_tokens`, so `max` may want a larger `--max-tokens` than the 8192 default.
 
+### Fixed
+
+- A completion that was still streaming tokens at the request deadline was
+  killed mid-answer: `reqwest`'s total timeout also bounded the response body,
+  and the error claimed the API "did not answer in time" when it was answering
+  fine. The client now bounds connecting and stalled reads instead, so a long
+  answer completes.
+- A 200 with an empty or truncated event-stream was reported as `end_turn`, so
+  a dropped upstream connection looked like the model simply stopped and a
+  half-written file looked like a finished task. A response now has to carry a
+  `finish_reason` or `[DONE]`, and an empty body is never an answer.
+- Rate limits and 5xx responses ended the turn without a retry. They are now
+  retried up to three attempts with exponential backoff, honouring
+  `Retry-After`. Retries stop once text has reached the client, so a partly
+  streamed answer is reported instead of being duplicated.
+
 ### Changed
 
 - A prompt is no longer capped at a fixed number of model/tool round trips.
