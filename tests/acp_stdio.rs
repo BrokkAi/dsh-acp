@@ -1104,8 +1104,12 @@ async fn a_session_whose_agent_died_during_a_tool_call_still_takes_prompts() {
 #[tokio::test]
 async fn prompt_usage_counts_only_its_own_turn_and_says_so() {
     let temp = tempfile::tempdir().unwrap();
-    let Some((base_url, server)) =
-        mock_sequence_server(vec![mock_text_stream(), mock_text_stream()]).await
+    let Some((base_url, server)) = mock_sequence_server(vec![
+        mock_text_stream(),
+        mock_tool_call_stream(),
+        mock_text_stream(),
+    ])
+    .await
     else {
         eprintln!("skipping turn usage test: loopback networking is unavailable");
         return;
@@ -1119,7 +1123,7 @@ async fn prompt_usage_counts_only_its_own_turn_and_says_so() {
             json!({"cwd": temp.path().to_string_lossy(), "mcpServers": []}),
         )
         .await;
-    for text in ["first", "second"] {
+    for (text, expected) in [("first", 22), ("tool round", 36)] {
         let response = peer
             .request(
                 "session/prompt",
@@ -1129,7 +1133,10 @@ async fn prompt_usage_counts_only_its_own_turn_and_says_so() {
                 }),
             )
             .await;
-        assert_eq!(response["usage"]["totalTokens"], 22, "{text}: {response}");
+        assert_eq!(
+            response["usage"]["totalTokens"], expected,
+            "{text}: {response}"
+        );
         assert_eq!(
             response["usage"]["_meta"]["mjolnir.dev/usage-scope"],
             "turn"
@@ -1138,8 +1145,64 @@ async fn prompt_usage_counts_only_its_own_turn_and_says_so() {
 
     drop(peer.stdin);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
-    assert_eq!(server.await.unwrap().len(), 2);
+    assert_eq!(server.await.unwrap().len(), 3);
 }
+
+#[tokio::test]
+async fn v2_idle_usage_counts_only_its_own_turn_and_says_so() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, server)) = mock_sequence_server(vec![
+        mock_text_stream(),
+        mock_tool_call_stream(),
+        mock_text_stream(),
+    ])
+    .await
+    else {
+        eprintln!("skipping v2 turn usage test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request(
+        "initialize",
+        json!({
+            "protocolVersion": 2,
+            "info": {"name": "v2-test-client", "version": "1.0.0"},
+            "capabilities": {}
+        }),
+    )
+    .await;
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": temp.path().to_string_lossy(), "mcpServers": []}),
+        )
+        .await;
+    for (text, expected) in [("first", 22), ("tool round", 36)] {
+        peer.request(
+            "session/prompt",
+            json!({
+                "sessionId": session["sessionId"],
+                "prompt": [{"type": "text", "text": text}]
+            }),
+        )
+        .await;
+        let idle = next_v2_idle(&mut peer).await;
+        assert_eq!(
+            idle["params"]["update"]["usage"]["totalTokens"], expected,
+            "{text}: {idle}"
+        );
+        assert_eq!(
+            idle["params"]["update"]["usage"]["_meta"]["mjolnir.dev/usage-scope"], "turn",
+            "{text}: {idle}"
+        );
+    }
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    assert_eq!(server.await.unwrap().len(), 3);
+}
+
+
 
 #[tokio::test]
 async fn thinking_effort_is_advertised_and_sent_to_deepseek() {
@@ -2856,6 +2919,22 @@ async fn peer_prompt(peer: &mut Peer, cwd: &std::path::Path, text: &str) -> Valu
         json!({"sessionId": session_id, "prompt": [{"type": "text", "text": text}]}),
     )
     .await
+}
+
+async fn next_v2_idle(peer: &mut Peer) -> Value {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let message = peer.next_message().await;
+            if message["params"]["update"]["sessionUpdate"] == "state_update"
+                && message["params"]["update"]["state"] == "idle"
+            {
+                return message;
+            }
+            peer.updates.push(message);
+        }
+    })
+    .await
+    .expect("v2 prompt should settle to idle")
 }
 
 fn streamed_text(peer: &Peer) -> Vec<String> {

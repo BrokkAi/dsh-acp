@@ -48,7 +48,8 @@ truncation.
 
 ACP v2 reports foreground state independently from prompt acceptance. Cancelling
 active work stops the model stream and tool operations, emits final tool state,
-and settles to idle with the `cancelled` reason.
+and settles to idle with the `cancelled` reason. Idle usage covers only that
+foreground turn; per-update usage continues to track the session total.
 
 ## Replay
 

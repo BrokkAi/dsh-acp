@@ -67,8 +67,11 @@ Both protocol versions expose select options for `model`, `mode`,
 `model`, `mode`, and `reasoning_effort` carry the ACP `model`, `mode`, and
 `thought_level` categories; `permission_mode` is uncategorized. The thinking
 effort carries `none`, `low`, `high`, or `max`, is stored with the session, and
-is sent to DeepSeek as `reasoning_effort`. `temperature` is unaffected by
-effort and rides every request except the legacy `deepseek-reasoner` model.
+is sent to DeepSeek as `reasoning_effort`.
+
+The v1 prompt response and the v2 idle state report only the completed turn's
+token usage, with `_meta["mjolnir.dev/usage-scope"] = "turn"`. Session
+`usage_update` notifications continue to report the cumulative session total.
 
 ## Prompt lifecycle
 

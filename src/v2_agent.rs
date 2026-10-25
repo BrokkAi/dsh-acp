@@ -1134,7 +1134,7 @@ impl V2Harness {
             ),
         );
         let initial_usage = runtime.snapshot().await.usage;
-        let mut usage = initial_usage;
+        let mut usage = initial_usage.clone();
         let mut allow_command = true;
         loop {
             let result = self
@@ -1183,7 +1183,7 @@ impl V2Harness {
                         SessionUpdate::StateUpdate(StateUpdate::Idle(
                             IdleStateUpdate::new()
                                 .stop_reason(Some(stop_reason))
-                                .usage(Some(v2_usage(usage.clone()))),
+                                .usage(Some(v2_turn_usage(&usage, &initial_usage))),
                         )),
                     );
                     state.active_prompt.store(false, Ordering::Release);
@@ -2846,6 +2846,32 @@ fn v2_usage(usage: TokenUsage) -> v2::Usage {
         usage.completion_tokens,
     )
     .cached_read_tokens(Some(usage.prompt_cache_hit_tokens))
+}
+
+/// A completed v2 foreground turn's own usage. `usage_update` still carries
+/// the session total, while this declares the scope the idle snapshot uses.
+fn v2_turn_usage(session_usage: &TokenUsage, initial_usage: &TokenUsage) -> v2::Usage {
+    let turn_usage = TokenUsage {
+        prompt_tokens: session_usage
+            .prompt_tokens
+            .saturating_sub(initial_usage.prompt_tokens),
+        completion_tokens: session_usage
+            .completion_tokens
+            .saturating_sub(initial_usage.completion_tokens),
+        total_tokens: session_usage
+            .total_tokens
+            .saturating_sub(initial_usage.total_tokens),
+        prompt_cache_hit_tokens: session_usage
+            .prompt_cache_hit_tokens
+            .saturating_sub(initial_usage.prompt_cache_hit_tokens),
+        prompt_cache_miss_tokens: session_usage
+            .prompt_cache_miss_tokens
+            .saturating_sub(initial_usage.prompt_cache_miss_tokens),
+    };
+    v2_usage(turn_usage).meta(Some(serde_json::Map::from_iter([(
+        "mjolnir.dev/usage-scope".to_string(),
+        json!("turn"),
+    )])))
 }
 
 fn v2_error_from(error: Error) -> v2::Error {

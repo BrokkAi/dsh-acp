@@ -6,6 +6,13 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ## Unreleased
 
+### Fixed
+
+- ACP v2 idle usage now reports the completed foreground turn's own tokens
+  instead of the session's running total, and declares
+  `_meta["mjolnir.dev/usage-scope"] = "turn"`. A local command reports zero.
+  `usage_update` still carries the session total.
+
 ## 0.3.0 - 2026-10-24
 
 ### Added
