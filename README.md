@@ -238,11 +238,6 @@ a response does hit the cap it ends the turn with `max_tokens`, any tool call it
 carried is marked failed rather than run with truncated arguments, and the
 client is sent a warning notice when it supports notices.
 
-`temperature` is sent on every request except the legacy `deepseek-reasoner`
-model, whatever the effort. DeepSeek ignores it in thinking mode, so it only
-affects the answer at effort `none`, or when `--base-url` points at a provider
-that honors it.
-
 `ask_user` uses ACP form elicitation by default. When the Client advertises URL
 elicitation, the model may also request an HTTPS URL with an optional stable
 `elicitation_id`. Embedded URL credentials and plain HTTP outside localhost are

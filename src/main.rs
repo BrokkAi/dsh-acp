@@ -52,10 +52,6 @@ struct Cli {
     #[arg(long, env = "DSH_ACP_MAX_TOKENS")]
     max_tokens: Option<u32>,
 
-    /// Sampling temperature. Ignored by some DeepSeek models.
-    #[arg(long, env = "DSH_ACP_TEMPERATURE", default_value_t = 0.2)]
-    temperature: f64,
-
     /// Thinking effort: none, low, high, or max. "none" disables thinking mode.
     #[arg(
         long,
@@ -123,7 +119,6 @@ impl TryFrom<Cli> for Config {
             permission_mode,
             system_prompt: cli.system_prompt,
             max_tokens: cli.max_tokens,
-            temperature: cli.temperature,
             reasoning_effort,
             context_chars: cli.context_chars,
             tool_output_bytes: cli.tool_output_bytes,

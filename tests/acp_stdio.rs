@@ -1219,9 +1219,10 @@ async fn thinking_effort_is_advertised_and_sent_to_deepseek() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
     let request = server.await.unwrap();
     assert_eq!(request["reasoning_effort"], "max");
-    // Effort does not gate temperature; DeepSeek ignores it in thinking mode,
-    // but a provider behind --base-url may honor it.
-    assert_eq!(request["temperature"], 0.2);
+    assert!(
+        request.get("temperature").is_none(),
+        "temperature must not be sent: {request}"
+    );
 }
 
 #[tokio::test]
