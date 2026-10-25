@@ -16,8 +16,6 @@ pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f64>,
     /// DeepSeek thinking effort. `none` turns thinking mode off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<&'static str>,
@@ -59,7 +57,6 @@ pub struct DeepSeekClient {
     endpoint: String,
     api_key: Option<String>,
     headers: reqwest::header::HeaderMap,
-    temperature: f64,
     max_tokens: Option<u32>,
 }
 
@@ -117,7 +114,6 @@ impl DeepSeekClient {
             endpoint,
             api_key,
             headers: header_map,
-            temperature: config.temperature,
             max_tokens: config.max_tokens,
         })
     }
@@ -130,15 +126,10 @@ impl DeepSeekClient {
         tools: Vec<Value>,
     ) -> ChatRequest {
         let model = model.into();
-        // Unchanged: temperature rides every request except the legacy
-        // reasoner. DeepSeek itself ignores it in thinking mode, and providers
-        // behind --base-url may honor it, so effort does not gate it.
-        let temperature = (model != "deepseek-reasoner").then_some(self.temperature);
         ChatRequest {
             model,
             messages,
             stream: true,
-            temperature,
             reasoning_effort: Some(effort.as_str()),
             max_tokens: self.max_tokens,
             tools,
@@ -691,7 +682,6 @@ mod tests {
             permission_mode: crate::config::PermissionMode::Ask,
             system_prompt: None,
             max_tokens: Some(100),
-            temperature: 0.2,
             reasoning_effort: ReasoningEffort::High,
             context_chars: 1000,
             tool_output_bytes: 1000,
@@ -710,9 +700,7 @@ mod tests {
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["reasoning_effort"], "max");
 
-        // Effort does not gate temperature: DeepSeek ignores it in thinking
-        // mode, and a provider behind --base-url may honor it.
-        assert_eq!(request.temperature, Some(0.2));
+        assert!(json.get("temperature").is_none());
         let request = client.request(
             "deepseek-flash",
             ReasoningEffort::None,
@@ -720,7 +708,12 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(request.reasoning_effort, Some("none"));
-        assert_eq!(request.temperature, Some(0.2));
+        assert!(
+            serde_json::to_value(&request)
+                .unwrap()
+                .get("temperature")
+                .is_none()
+        );
 
         let request = client.request(
             "deepseek-reasoner",
@@ -728,7 +721,12 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        assert_eq!(request.temperature, None);
+        assert!(
+            serde_json::to_value(&request)
+                .unwrap()
+                .get("temperature")
+                .is_none()
+        );
     }
 
     #[test]

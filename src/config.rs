@@ -35,8 +35,7 @@ impl PermissionMode {
     }
 }
 
-/// DeepSeek thinking-mode effort. `None` turns thinking off entirely and
-/// enables sampling parameters such as temperature.
+/// DeepSeek thinking-mode effort. `None` turns thinking off entirely.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
@@ -107,7 +106,6 @@ pub struct Config {
     pub permission_mode: PermissionMode,
     pub system_prompt: Option<String>,
     pub max_tokens: Option<u32>,
-    pub temperature: f64,
     pub reasoning_effort: ReasoningEffort,
     pub context_chars: usize,
     pub tool_output_bytes: usize,
@@ -123,9 +121,6 @@ impl Config {
         }
         if self.default_model.trim().is_empty() {
             return Err(Error::invalid_params().data("default model must not be empty"));
-        }
-        if !(0.0..=2.0).contains(&self.temperature) {
-            return Err(Error::invalid_params().data("temperature must be between 0.0 and 2.0"));
         }
         if self.max_tokens == Some(0) {
             return Err(Error::invalid_params().data("max tokens must be positive"));

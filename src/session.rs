@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -12,9 +13,12 @@ use crate::{
     model::{Role, SessionRecord, SessionRuntime},
 };
 
+const MAX_INSTRUCTION_BYTES: u64 = 1024 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct SessionStore {
     directory: PathBuf,
+    data_dir: PathBuf,
     sessions: Arc<Mutex<HashMap<String, SessionRuntime>>>,
     deleted: Arc<Mutex<std::collections::HashSet<String>>>,
     write_lock: Arc<Mutex<()>>,
@@ -39,6 +43,7 @@ impl SessionStore {
         }
         Ok(Self {
             directory,
+            data_dir: config.data_dir.clone(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             deleted: Arc::new(Mutex::new(std::collections::HashSet::new())),
             write_lock: Arc::new(Mutex::new(())),
@@ -66,7 +71,7 @@ impl SessionStore {
             system_prompt,
             parent_session_id,
         );
-        record.install_system_prompt(self.effective_system_prompt(&record));
+        record.install_system_prompt(self.effective_system_prompt(&record)?);
         let runtime = SessionRuntime::new(record.clone());
         self.save_record(&record).await?;
         self.sessions
@@ -85,7 +90,7 @@ impl SessionStore {
         // Before pending steering is appended after the interrupted calls.
         record.close_interrupted_tool_calls();
         record.flush_pending_steering();
-        record.install_system_prompt(self.effective_system_prompt(&record));
+        record.install_system_prompt(self.effective_system_prompt(&record)?);
         let runtime = SessionRuntime::new(record);
         let mut sessions = self.sessions.lock().await;
         Ok(sessions.entry(id.to_string()).or_insert(runtime).clone())
@@ -189,14 +194,57 @@ impl SessionStore {
         Ok(())
     }
 
-    pub fn effective_system_prompt(&self, record: &SessionRecord) -> String {
+    pub fn effective_system_prompt(&self, record: &SessionRecord) -> Result<String, Error> {
         let mut prompt = self.system_prompt.to_string();
+        let mut seen = std::collections::HashSet::new();
+        let roots = std::iter::once(self.data_dir.as_path())
+            .chain(std::iter::once(record.cwd.as_path()))
+            .chain(record.additional_directories.iter().map(PathBuf::as_path))
+            .filter(|root| seen.insert(*root));
+        for root in roots {
+            let path = root.join("AGENTS.md");
+            let Some(instructions) = read_instructions(root, &path)? else {
+                continue;
+            };
+            prompt.push_str("\nInstructions from ");
+            prompt.push_str(&path.display().to_string());
+            prompt.push_str(":\n");
+            prompt.push_str(&instructions);
+            if !instructions.ends_with('\n') {
+                prompt.push('\n');
+            }
+        }
         if let Some(system_prompt) = &record.system_prompt {
             prompt.push_str("\nClient-provided system instructions:\n");
             prompt.push_str(system_prompt);
             prompt.push('\n');
         }
-        prompt
+        Ok(prompt)
+    }
+
+    pub fn update_session_instructions(
+        &self,
+        record: &mut SessionRecord,
+        additional_directories: Vec<PathBuf>,
+        system_prompt: Option<String>,
+    ) -> Result<(), Error> {
+        let mut candidate = record.clone();
+        candidate.additional_directories = additional_directories;
+        if let Some(system_prompt) = system_prompt {
+            candidate.system_prompt = Some(system_prompt);
+        }
+        self.rebuild_system_prompt(&mut candidate)?;
+        *record = candidate;
+        Ok(())
+    }
+
+    pub fn rebuild_system_prompt(&self, record: &mut SessionRecord) -> Result<(), Error> {
+        let mut candidate = record.clone();
+        let prompt = self.effective_system_prompt(&candidate)?;
+        candidate.install_system_prompt(prompt);
+        candidate.touch();
+        *record = candidate;
+        Ok(())
     }
 
     fn record_path(&self, id: &str) -> PathBuf {
@@ -216,6 +264,99 @@ impl SessionStore {
             })?;
         serde_json::from_slice(&bytes).map_err(Error::into_internal_error)
     }
+}
+
+fn read_instructions(root: &Path, path: &Path) -> Result<Option<String>, Error> {
+    let root = root.canonicalize().map_err(|error| {
+        Error::internal_error().data(format!(
+            "failed to resolve instruction root {}: {error}",
+            root.display()
+        ))
+    })?;
+    let target = match path.canonicalize() {
+        Ok(target) => target,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(Error::internal_error().data(format!(
+                "failed to resolve instructions from {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    if !target.starts_with(&root) {
+        return Err(Error::invalid_params().data(format!(
+            "instructions from {} resolve outside allowed root {}",
+            path.display(),
+            root.display()
+        )));
+    }
+    let metadata = std::fs::metadata(&target).map_err(|error| {
+        Error::internal_error().data(format!(
+            "failed to inspect instructions from {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(Error::invalid_params().data(format!(
+            "instructions from {} are not a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() > MAX_INSTRUCTION_BYTES {
+        return Err(Error::invalid_params().data(format!(
+            "instructions from {} exceed the {} byte limit",
+            path.display(),
+            MAX_INSTRUCTION_BYTES
+        )));
+    }
+    let file = std::fs::File::open(&target).map_err(|error| {
+        Error::internal_error().data(format!(
+            "failed to open instructions from {}: {error}",
+            path.display()
+        ))
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        Error::internal_error().data(format!(
+            "failed to inspect opened instructions from {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(Error::invalid_params().data(format!(
+            "instructions from {} changed to a non-regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() > MAX_INSTRUCTION_BYTES {
+        return Err(Error::invalid_params().data(format!(
+            "instructions from {} exceed the {} byte limit",
+            path.display(),
+            MAX_INSTRUCTION_BYTES
+        )));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_INSTRUCTION_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            Error::internal_error().data(format!(
+                "failed to read instructions from {}: {error}",
+                path.display()
+            ))
+        })?;
+    if bytes.len() as u64 > MAX_INSTRUCTION_BYTES {
+        return Err(Error::invalid_params().data(format!(
+            "instructions from {} exceed the {} byte limit",
+            path.display(),
+            MAX_INSTRUCTION_BYTES
+        )));
+    }
+    let instructions = String::from_utf8(bytes).map_err(|_| {
+        Error::invalid_params().data(format!(
+            "instructions from {} are not valid UTF-8",
+            path.display()
+        ))
+    })?;
+    Ok((!instructions.trim().is_empty()).then_some(instructions))
 }
 
 fn validate_session_id(id: &str) -> Result<(), Error> {
@@ -287,7 +428,6 @@ mod tests {
             permission_mode: PermissionMode::Ask,
             system_prompt: None,
             max_tokens: Some(100),
-            temperature: 0.0,
             reasoning_effort: ReasoningEffort::High,
             context_chars: 1000,
             tool_output_bytes: 1000,
@@ -307,5 +447,200 @@ mod tests {
         store.save(&runtime).await.unwrap();
         assert!(store.list(None).await.unwrap().is_empty());
         assert!(store.get("../../outside").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn loads_and_refreshes_agents_files_without_changing_client_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let workspace = temp.path().join("workspace");
+        let extra = temp.path().join("extra");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        std::fs::write(data_dir.join("AGENTS.md"), "user-level instructions\n").unwrap();
+        std::fs::write(workspace.join("AGENTS.md"), "workspace instructions v1\n").unwrap();
+        std::fs::write(extra.join("AGENTS.md"), "additional-root instructions\n").unwrap();
+        let config = Config {
+            api_key: None,
+            base_url: "http://localhost".to_string(),
+            default_model: "deepseek-flash".to_string(),
+            models: vec!["deepseek-flash".to_string()],
+            data_dir: data_dir.clone(),
+            permission_mode: PermissionMode::Ask,
+            system_prompt: Some("launch instructions".to_string()),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::High,
+            context_chars: 1000,
+            tool_output_bytes: 1000,
+            http_timeout: std::time::Duration::from_secs(1),
+            disable_web: true,
+            trace: false,
+        };
+        let store = SessionStore::open(&config).await.unwrap();
+        let runtime = store
+            .create(
+                workspace.clone(),
+                vec![extra],
+                Some("client instructions".to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+        let record = runtime.snapshot().await;
+        let prompt = record.messages[0].text_content().unwrap();
+        let positions = [
+            prompt.find("launch instructions").unwrap(),
+            prompt.find("user-level instructions").unwrap(),
+            prompt.find("workspace instructions v1").unwrap(),
+            prompt.find("additional-root instructions").unwrap(),
+            prompt.find("client instructions").unwrap(),
+        ];
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            !record
+                .system_prompt
+                .as_deref()
+                .unwrap()
+                .contains("workspace")
+        );
+
+        std::fs::write(workspace.join("AGENTS.md"), "workspace instructions v2\n").unwrap();
+        let refreshed = store.effective_system_prompt(&record).unwrap();
+        assert!(refreshed.contains("workspace instructions v2"));
+        assert!(!refreshed.contains("workspace instructions v1"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn instruction_symlinks_cannot_escape_the_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let outside = temp.path().join("secret.txt");
+        std::fs::write(&outside, "outside secret\n").unwrap();
+        let config = Config {
+            api_key: None,
+            base_url: "http://localhost".to_string(),
+            default_model: "deepseek-flash".to_string(),
+            models: vec!["deepseek-flash".to_string()],
+            data_dir,
+            permission_mode: PermissionMode::Ask,
+            system_prompt: None,
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::High,
+            context_chars: 1000,
+            tool_output_bytes: 1000,
+            http_timeout: std::time::Duration::from_secs(1),
+            disable_web: true,
+            trace: false,
+        };
+        let store = SessionStore::open(&config).await.unwrap();
+        let runtime = store
+            .create(workspace, Vec::new(), None, None)
+            .await
+            .unwrap();
+        let workspace = runtime.snapshot().await.cwd;
+        std::os::unix::fs::symlink(outside, workspace.join("AGENTS.md")).unwrap();
+        let record = runtime.snapshot().await;
+        assert!(store.effective_system_prompt(&record).is_err());
+    }
+
+    #[tokio::test]
+    async fn instruction_files_are_size_limited() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let config = Config {
+            api_key: None,
+            base_url: "http://localhost".to_string(),
+            default_model: "deepseek-flash".to_string(),
+            models: vec!["deepseek-flash".to_string()],
+            data_dir,
+            permission_mode: PermissionMode::Ask,
+            system_prompt: None,
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::High,
+            context_chars: 1000,
+            tool_output_bytes: 1000,
+            http_timeout: std::time::Duration::from_secs(1),
+            disable_web: true,
+            trace: false,
+        };
+        let store = SessionStore::open(&config).await.unwrap();
+        let runtime = store
+            .create(workspace, Vec::new(), None, None)
+            .await
+            .unwrap();
+        std::fs::write(
+            runtime.snapshot().await.cwd.join("AGENTS.md"),
+            vec![b'x'; MAX_INSTRUCTION_BYTES as usize + 1],
+        )
+        .unwrap();
+        let record = runtime.snapshot().await;
+        assert!(store.effective_system_prompt(&record).is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_instruction_refresh_does_not_mutate_the_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let workspace = temp.path().join("workspace");
+        let extra = temp.path().join("extra");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        let config = Config {
+            api_key: None,
+            base_url: "http://localhost".to_string(),
+            default_model: "deepseek-flash".to_string(),
+            models: vec!["deepseek-flash".to_string()],
+            data_dir,
+            permission_mode: PermissionMode::Ask,
+            system_prompt: None,
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::High,
+            context_chars: 1000,
+            tool_output_bytes: 1000,
+            http_timeout: std::time::Duration::from_secs(1),
+            disable_web: true,
+            trace: false,
+        };
+        let store = SessionStore::open(&config).await.unwrap();
+        let runtime = store
+            .create(
+                workspace.clone(),
+                Vec::new(),
+                Some("client instructions v1".to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut record = runtime.snapshot().await;
+        let original_prompt = record.messages[0].clone();
+        std::fs::write(workspace.join("AGENTS.md"), [0xff, 0xfe]).unwrap();
+
+        assert!(
+            store
+                .update_session_instructions(
+                    &mut record,
+                    vec![extra],
+                    Some("client instructions v2".to_string()),
+                )
+                .is_err()
+        );
+        assert!(
+            record
+                .system_prompt
+                .as_deref()
+                .unwrap()
+                .contains("client instructions v1")
+        );
+        assert!(record.additional_directories.is_empty());
+        assert_eq!(record.messages[0], original_prompt);
     }
 }

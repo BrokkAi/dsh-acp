@@ -16,6 +16,8 @@ Each session contains:
 
 - immutable identity, working directory, and additional roots;
 - model, mode, permission, thinking effort, and network configuration;
+- effective system instructions loaded from configuration, `AGENTS.md`, and
+  the ACP client;
 - conversation messages and original ACP prompt blocks;
 - tool outcomes, raw output, diffs, and terminal snapshots;
 - plans, compactions, message IDs, and pending steering input;
@@ -48,7 +50,8 @@ truncation.
 
 ACP v2 reports foreground state independently from prompt acceptance. Cancelling
 active work stops the model stream and tool operations, emits final tool state,
-and settles to idle with the `cancelled` reason.
+and settles to idle with the `cancelled` reason. Idle usage covers only that
+foreground turn; per-update usage continues to track the session total.
 
 ## Replay
 
@@ -73,3 +76,5 @@ Workspace roots are canonicalized and checked before tool access. Writable paths
 check the nearest existing ancestor before creating files. Web access rejects
 private and local destinations, including via redirects. Provider and MCP
 headers are supplied by configuration and are not persisted as session data.
+Instruction files are canonicalized against their source root, limited to
+regular files, and capped at 1 MiB.

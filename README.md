@@ -116,6 +116,7 @@ The binary is `target/release/dsh-acp`.
 --models <A,B>                   Models in the ACP model selector
 --data-dir <PATH>                Session storage (default: .dsh-acp)
 --permission-mode ask|allow|deny Sensitive-tool policy
+--system-prompt <TEXT>           Extra system instructions
 --reasoning-effort <EFFORT>      Thinking effort (default: high)
 --context-chars <N>              Approximate context budget
 --tool-output-bytes <N>          Per-tool output cap
@@ -125,6 +126,20 @@ The binary is `target/release/dsh-acp`.
 
 Every option has an environment fallback; run `dsh-acp --help` for the complete
 list.
+
+## Instructions
+
+The system prompt combines the built-in harness guidance, any
+`--system-prompt` / `DSH_ACP_SYSTEM_PROMPT` text, `AGENTS.md` from
+`<data-dir>`, `AGENTS.md` from the session working directory, and
+`AGENTS.md` from each additional workspace root. A client-provided ACP system
+prompt is appended last.
+
+Instruction files are read again when a session is created, loaded, resumed, or
+forked. Keeping persistent instructions in `<data-dir>/AGENTS.md` avoids
+operating-system command-line and environment size limits. Each instruction
+file must resolve within its source root, be a regular file, and be no larger
+than 1 MiB.
 
 ## ACP support
 
@@ -238,11 +253,6 @@ a response does hit the cap it ends the turn with `max_tokens`, any tool call it
 carried is marked failed rather than run with truncated arguments, and the
 client is sent a warning notice when it supports notices.
 
-`temperature` is sent on every request except the legacy `deepseek-reasoner`
-model, whatever the effort. DeepSeek ignores it in thinking mode, so it only
-affects the answer at effort `none`, or when `--base-url` points at a provider
-that honors it.
-
 `ask_user` uses ACP form elicitation by default. When the Client advertises URL
 elicitation, the model may also request an HTTPS URL with an optional stable
 `elicitation_id`. Embedded URL credentials and plain HTTP outside localhost are
@@ -336,4 +346,3 @@ in heavily sandboxed environments.
 ## License
 
 MIT. See [LICENSE](LICENSE).
-
