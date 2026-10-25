@@ -513,6 +513,10 @@ impl V2Harness {
             return responder
                 .respond_with_error(Error::invalid_params().data("unsupported replay cursor"));
         }
+        let system_prompt = match v2_system_prompt_text(request.system_prompt.as_ref()) {
+            Ok(prompt) => prompt,
+            Err(error) => return responder.respond_with_error(error),
+        };
         let runtime = match self.base.store.get(&request.session_id.to_string()).await {
             Ok(runtime) => runtime,
             Err(error) => return responder.respond_with_error(error),
@@ -531,8 +535,13 @@ impl V2Harness {
                     request.cwd.0.display()
                 )));
             }
-            state.record.additional_directories = additional_directories;
-            state.record.touch();
+            if let Err(error) = self.base.store.update_session_instructions(
+                &mut state.record,
+                additional_directories,
+                system_prompt,
+            ) {
+                return responder.respond_with_error(error);
+            }
         }
         if let Err(error) = self.attach_mcp(&runtime, &request.mcp_servers).await {
             return responder.respond_with_error(error);
@@ -615,26 +624,36 @@ impl V2Harness {
             Ok(runtime) => runtime,
             Err(error) => return responder.respond_with_error(error),
         };
-        {
+        let runtime_id = runtime.snapshot().await.id;
+        let refresh = {
             let mut state = runtime.state.lock().await;
-            state.record.messages = source.messages.clone();
-            state.record.prompt_blocks = source.prompt_blocks.clone();
-            state.record.message_ids = source.message_ids.clone();
-            state.record.pending_steering = source.pending_steering.clone();
-            state.record.tool_outcomes = source.tool_outcomes.clone();
-            state.record.compactions = source.compactions.clone();
-            state.record.config = source.config;
-            state.record.title = source.title;
-            state.record.usage = source.usage;
-            state.record.context_used = source.context_used;
-            let prompt = self.base.store.effective_system_prompt(&state.record);
-            state.record.install_system_prompt(prompt);
-            state.record.touch();
+            let mut candidate = state.record.clone();
+            candidate.messages = source.messages.clone();
+            candidate.prompt_blocks = source.prompt_blocks.clone();
+            candidate.message_ids = source.message_ids.clone();
+            candidate.pending_steering = source.pending_steering.clone();
+            candidate.tool_outcomes = source.tool_outcomes.clone();
+            candidate.compactions = source.compactions.clone();
+            candidate.config = source.config;
+            candidate.title = source.title;
+            candidate.usage = source.usage;
+            candidate.context_used = source.context_used;
+            let refresh = self.base.store.rebuild_system_prompt(&mut candidate);
+            if refresh.is_ok() {
+                state.record = candidate;
+            }
+            refresh
+        };
+        if let Err(error) = refresh {
+            let _ = self.base.store.delete(&runtime_id).await;
+            return responder.respond_with_error(error);
         }
         if let Err(error) = self.attach_mcp(&runtime, &request.mcp_servers).await {
+            let _ = self.base.store.delete(&runtime_id).await;
             return responder.respond_with_error(error);
         }
         if let Err(error) = self.base.store.save(&runtime).await {
+            let _ = self.base.store.delete(&runtime_id).await;
             return responder.respond_with_error(error);
         }
         let record = runtime.snapshot().await;

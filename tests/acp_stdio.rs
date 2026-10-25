@@ -1202,7 +1202,245 @@ async fn v2_idle_usage_counts_only_its_own_turn_and_says_so() {
     assert_eq!(server.await.unwrap().len(), 3);
 }
 
+#[tokio::test]
+async fn agents_md_and_resumed_system_prompts_reach_the_model() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let extra = temp.path().join("extra");
+    let data_dir = temp.path().join("sessions-data");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&extra).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::write(data_dir.join("AGENTS.md"), "user-level instructions\n").unwrap();
+    std::fs::write(workspace.join("AGENTS.md"), "workspace instructions v1\n").unwrap();
+    std::fs::write(extra.join("AGENTS.md"), "additional-root instructions\n").unwrap();
+    let Some((base_url, server)) =
+        mock_sequence_server(vec![mock_text_stream(), mock_text_stream()]).await
+    else {
+        eprintln!("skipping AGENTS.md test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request("initialize", json!({"protocolVersion": 1}))
+        .await;
+    let session = peer
+        .request(
+            "session/new",
+            json!({
+                "cwd": workspace,
+                "mcpServers": [],
+                "additionalDirectories": [extra],
+                "systemPrompt": {
+                    "mode": "append",
+                    "content": [{"type": "text", "text": "client instructions v1"}]
+                }
+            }),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    peer.request(
+        "session/prompt",
+        json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "first"}]}),
+    )
+    .await;
 
+    std::fs::write(workspace.join("AGENTS.md"), "workspace instructions v2\n").unwrap();
+    peer.request(
+        "session/resume",
+        json!({
+            "sessionId": session_id,
+            "cwd": workspace,
+            "mcpServers": [],
+            "additionalDirectories": [extra],
+            "systemPrompt": {
+                "mode": "append",
+                "content": [{"type": "text", "text": "client instructions v2"}]
+            }
+        }),
+    )
+    .await;
+    peer.request(
+        "session/prompt",
+        json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "second"}]}),
+    )
+    .await;
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    let requests = server.await.unwrap();
+    let first_prompt = requests[0]["messages"][0]["content"].as_str().unwrap();
+    for expected in [
+        "user-level instructions",
+        "workspace instructions v1",
+        "additional-root instructions",
+        "client instructions v1",
+    ] {
+        assert!(first_prompt.contains(expected), "{first_prompt}");
+    }
+    let second_prompt = requests[1]["messages"][0]["content"].as_str().unwrap();
+    for expected in [
+        "user-level instructions",
+        "workspace instructions v2",
+        "additional-root instructions",
+        "client instructions v2",
+    ] {
+        assert!(second_prompt.contains(expected), "{second_prompt}");
+    }
+    assert!(!second_prompt.contains("workspace instructions v1"));
+    assert!(!second_prompt.contains("client instructions v1"));
+}
+
+#[tokio::test]
+async fn a_failed_instruction_refresh_does_not_partially_apply_resume() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let Some((base_url, server)) =
+        mock_sequence_server(vec![mock_text_stream(), mock_text_stream()]).await
+    else {
+        eprintln!("skipping instruction rollback test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request("initialize", json!({"protocolVersion": 1}))
+        .await;
+    let session = peer
+        .request(
+            "session/new",
+            json!({
+                "cwd": workspace,
+                "mcpServers": [],
+                "systemPrompt": {
+                    "mode": "append",
+                    "content": [{"type": "text", "text": "client instructions v1"}]
+                }
+            }),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap();
+    peer.request(
+        "session/prompt",
+        json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "first"}]}),
+    )
+    .await;
+
+    std::fs::write(workspace.join("AGENTS.md"), [0xff, 0xfe]).unwrap();
+    peer.request_error(
+        "session/resume",
+        json!({
+            "sessionId": session_id,
+            "cwd": workspace,
+            "mcpServers": [],
+            "systemPrompt": {
+                "mode": "append",
+                "content": [{"type": "text", "text": "client instructions v2"}]
+            }
+        }),
+    )
+    .await;
+    std::fs::write(workspace.join("AGENTS.md"), "recovered instructions\n").unwrap();
+    peer.request(
+        "session/resume",
+        json!({
+            "sessionId": session_id,
+            "cwd": workspace,
+            "mcpServers": []
+        }),
+    )
+    .await;
+    peer.request(
+        "session/prompt",
+        json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "second"}]}),
+    )
+    .await;
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    let requests = server.await.unwrap();
+    let prompt = requests[1]["messages"][0]["content"].as_str().unwrap();
+    assert!(prompt.contains("client instructions v1"), "{prompt}");
+    assert!(!prompt.contains("client instructions v2"), "{prompt}");
+    assert!(prompt.contains("recovered instructions"), "{prompt}");
+}
+
+#[tokio::test]
+async fn v2_resume_refreshes_agents_md_and_system_prompts() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let data_dir = temp.path().join("sessions-data");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::write(workspace.join("AGENTS.md"), "workspace instructions v1\n").unwrap();
+    let Some((base_url, server)) =
+        mock_sequence_server(vec![mock_text_stream(), mock_text_stream()]).await
+    else {
+        eprintln!("skipping v2 AGENTS.md test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request(
+        "initialize",
+        json!({
+            "protocolVersion": 2,
+            "info": {"name": "v2-test-client", "version": "1.0.0"},
+            "capabilities": {}
+        }),
+    )
+    .await;
+    let session = peer
+        .request(
+            "session/new",
+            json!({
+                "cwd": workspace,
+                "mcpServers": [],
+                "systemPrompt": {
+                    "mode": "append",
+                    "content": [{"type": "text", "text": "client instructions v1"}]
+                }
+            }),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+    peer.request(
+        "session/prompt",
+        json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "first"}]}),
+    )
+    .await;
+    next_v2_idle(&mut peer).await;
+
+    std::fs::write(workspace.join("AGENTS.md"), "workspace instructions v2\n").unwrap();
+    peer.request(
+        "session/resume",
+        json!({
+            "sessionId": session_id,
+            "cwd": workspace,
+            "mcpServers": [],
+            "systemPrompt": {
+                "mode": "append",
+                "content": [{"type": "text", "text": "client instructions v2"}]
+            }
+        }),
+    )
+    .await;
+    peer.request(
+        "session/prompt",
+        json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "second"}]}),
+    )
+    .await;
+    next_v2_idle(&mut peer).await;
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    let requests = server.await.unwrap();
+    let first_prompt = requests[0]["messages"][0]["content"].as_str().unwrap();
+    assert!(first_prompt.contains("workspace instructions v1"));
+    assert!(first_prompt.contains("client instructions v1"));
+    let second_prompt = requests[1]["messages"][0]["content"].as_str().unwrap();
+    assert!(second_prompt.contains("workspace instructions v2"));
+    assert!(second_prompt.contains("client instructions v2"));
+    assert!(!second_prompt.contains("workspace instructions v1"));
+    assert!(!second_prompt.contains("client instructions v1"));
+}
 
 #[tokio::test]
 async fn thinking_effort_is_advertised_and_sent_to_deepseek() {

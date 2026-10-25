@@ -6,12 +6,30 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ## Unreleased
 
+### Added
+
+- The system prompt now includes `AGENTS.md` from `<data-dir>/AGENTS.md`, the
+  session working directory, and each additional workspace root. Repository
+  and user instructions are rebuilt on session create, load, resume, and fork,
+  so long-lived clients no longer need to pass them through an environment
+  variable or ACP request. Instruction files are confined to their source root,
+  must be regular files, and are limited to 1 MiB.
+
+### Changed
+
+- Removed `--temperature` and `DSH_ACP_TEMPERATURE`. DeepSeek ignores sampling
+  parameters in thinking mode, which is enabled by default, so the setting was
+  inert for most sessions.
+
 ### Fixed
 
 - ACP v2 idle usage now reports the completed foreground turn's own tokens
   instead of the session's running total, and declares
   `_meta["mjolnir.dev/usage-scope"] = "turn"`. A local command reports zero.
   `usage_update` still carries the session total.
+- `session/resume` now reads the client-provided system prompt in both protocol
+  versions instead of leaving the instructions from the previous lifecycle
+  request in place.
 
 ## 0.3.0 - 2026-10-24
 

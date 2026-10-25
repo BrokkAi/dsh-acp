@@ -116,6 +116,7 @@ The binary is `target/release/dsh-acp`.
 --models <A,B>                   Models in the ACP model selector
 --data-dir <PATH>                Session storage (default: .dsh-acp)
 --permission-mode ask|allow|deny Sensitive-tool policy
+--system-prompt <TEXT>           Extra system instructions
 --reasoning-effort <EFFORT>      Thinking effort (default: high)
 --context-chars <N>              Approximate context budget
 --tool-output-bytes <N>          Per-tool output cap
@@ -125,6 +126,20 @@ The binary is `target/release/dsh-acp`.
 
 Every option has an environment fallback; run `dsh-acp --help` for the complete
 list.
+
+## Instructions
+
+The system prompt combines the built-in harness guidance, any
+`--system-prompt` / `DSH_ACP_SYSTEM_PROMPT` text, `AGENTS.md` from
+`<data-dir>`, `AGENTS.md` from the session working directory, and
+`AGENTS.md` from each additional workspace root. A client-provided ACP system
+prompt is appended last.
+
+Instruction files are read again when a session is created, loaded, resumed, or
+forked. Keeping persistent instructions in `<data-dir>/AGENTS.md` avoids
+operating-system command-line and environment size limits. Each instruction
+file must resolve within its source root, be a regular file, and be no larger
+than 1 MiB.
 
 ## ACP support
 
@@ -331,4 +346,3 @@ in heavily sandboxed environments.
 ## License
 
 MIT. See [LICENSE](LICENSE).
-
