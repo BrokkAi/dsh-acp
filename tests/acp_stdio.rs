@@ -521,6 +521,11 @@ async fn stdio_negotiates_acp_v2_and_uses_async_prompt_lifecycle() {
     .await
     .expect("v2 prompt should settle to idle");
     assert_eq!(idle["params"]["update"]["stopReason"], "end_turn");
+    assert_eq!(idle["params"]["update"]["usage"]["totalTokens"], 0);
+    assert_eq!(
+        idle["params"]["update"]["usage"]["_meta"]["mjolnir.dev/usage-scope"],
+        "turn"
+    );
 
     let extra = temp.path().join("extra-root");
     std::fs::create_dir(&extra).unwrap();
