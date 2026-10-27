@@ -45,7 +45,7 @@ use crate::{
     auth_status,
     config::{Config, PermissionMode, ReasoningEffort},
     deepseek::{Completion, DeepSeekClient, StreamEvent},
-    mcp::{McpSession, mcp_result_text},
+    mcp::{AcpConnection, McpSession, mcp_result_text},
     model::{
         ChatMessage, ClientPromptMode, ClientSystemPrompt, ContentPart, ImageUrl, MessageContent,
         PendingUserMessage, PersistedCompaction, PersistedDiff, Role, SessionRecord,
@@ -515,7 +515,7 @@ impl Harness {
                     )
                     .embedded_context(true),
             )
-            .mcp_capabilities(McpCapabilities::new().http(true).sse(false))
+            .mcp_capabilities(McpCapabilities::new().http(true).sse(false).acp(true))
             .session_capabilities(session_capabilities)
             .auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new()))
             .providers(ProvidersCapabilities::new());
@@ -673,7 +673,14 @@ impl Harness {
             Ok(runtime) => runtime,
             Err(error) => return responder.respond_with_error(error),
         };
-        if let Err(error) = self.attach_mcp(&runtime, &request.mcp_servers).await {
+        if let Err(error) = self
+            .attach_mcp(
+                &runtime,
+                &request.mcp_servers,
+                AcpConnection::V1(connection.clone()),
+            )
+            .await
+        {
             let _ = self.store.delete(&runtime.snapshot().await.id).await;
             return responder.respond_with_error(error);
         }
@@ -735,7 +742,14 @@ impl Harness {
             }
         };
         // A load whose MCP servers fail to connect leaves the session as it was.
-        if let Err(error) = self.attach_mcp(&runtime, &request.mcp_servers).await {
+        if let Err(error) = self
+            .attach_mcp(
+                &runtime,
+                &request.mcp_servers,
+                AcpConnection::V1(connection.clone()),
+            )
+            .await
+        {
             return responder.respond_with_error(error);
         }
         instructions.install(&mut runtime.state.lock().await.record);
@@ -812,7 +826,14 @@ impl Harness {
         };
         // A resume whose MCP servers fail to connect leaves the session as it
         // was.
-        if let Err(error) = self.attach_mcp(&runtime, &request.mcp_servers).await {
+        if let Err(error) = self
+            .attach_mcp(
+                &runtime,
+                &request.mcp_servers,
+                AcpConnection::V1(connection.clone()),
+            )
+            .await
+        {
             return responder.respond_with_error(error);
         }
         instructions.install(&mut runtime.state.lock().await.record);
@@ -899,7 +920,14 @@ impl Harness {
             let _ = self.store.delete(&runtime_id).await;
             return responder.respond_with_error(error);
         }
-        if let Err(error) = self.attach_mcp(&runtime, &request.mcp_servers).await {
+        if let Err(error) = self
+            .attach_mcp(
+                &runtime,
+                &request.mcp_servers,
+                AcpConnection::V1(connection.clone()),
+            )
+            .await
+        {
             let _ = self.store.delete(&runtime_id).await;
             return responder.respond_with_error(error);
         }
@@ -1332,10 +1360,14 @@ impl Harness {
         }
     }
 
+    /// Connects the servers a lifecycle request declares. `acp` is the
+    /// connection that request arrived on; its client serves the request's
+    /// MCP-over-ACP servers.
     pub(crate) async fn attach_mcp(
         &self,
         runtime: &SessionRuntime,
         servers: &[agent_client_protocol::schema::v1::McpServer],
+        acp: AcpConnection,
     ) -> Result<(), Error> {
         if servers.is_empty() {
             runtime.state.lock().await.mcp = None;
@@ -1347,6 +1379,7 @@ impl Harness {
         // this one, so the connect timeout is what bounds the wait.
         let mcp = McpSession::connect(
             servers,
+            Some(&acp),
             self.config.mcp_connect_timeout,
             &CancellationToken::new(),
         )

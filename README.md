@@ -209,7 +209,8 @@ ACP v1 includes:
 - `session/update` streaming for agent messages, thoughts, tool calls, tool
   progress/results, modes, config, session info, and token usage
 - Agent-to-client permission, filesystem, and terminal requests
-- MCP stdio and streamable HTTP server declarations and tool calls
+- MCP stdio, streamable HTTP, and MCP-over-ACP server declarations and tool
+  calls
 - Session persistence, pagination, replay, forking, system prompts, additional
   workspace roots, and end-of-turn token usage
 
@@ -224,8 +225,8 @@ advertised as `auth.status` in the agent's capabilities. See
 [docs/acp-support.md](docs/acp-support.md#authentication-status).
 
 Legacy SSE-only MCP transports are best effort and are not advertised.
-MCP-over-ACP requires a proxy component and is not advertised by this
-standalone agent.
+MCP-over-ACP follows a draft RFD and is advertised in both protocol versions;
+see [MCP-over-ACP](docs/acp-support.md#mcp-over-acp).
 
 ## Tools
 
@@ -256,17 +257,24 @@ available as fallbacks. ACP v2 no longer exposes those client capabilities, so
 v2 uses the local workspace tools directly.
 
 MCP tools are exposed to the model as
-`mcp__<server>__<tool>`. Both stdio servers and modern streamable HTTP servers
-are supported; a session can declare multiple servers.
+`mcp__<server>__<tool>`. Stdio servers, modern streamable HTTP servers, and
+servers the ACP client provides over the ACP connection (MCP-over-ACP, a draft
+RFD) are supported; a session can declare multiple servers.
 
-Each server has `--mcp-connect-timeout-secs` seconds (default 60) to start,
-complete the MCP handshake, and list its tools when a session is created,
-loaded, resumed, or forked. Servers connect one after another, so a request
-that declares several servers can take up to that many times the limit. A
-server that misses the deadline fails that request with an error naming the
-server, and the stdio server processes started for the request are killed.
-The limit does not apply to tool calls or to the tool list refresh during a
-turn.
+An MCP-over-ACP server is declared with `"type": "acp"`, a `name`, and the
+client's `serverId`. Each MCP request is an `mcp/message` request to the
+client, using MCP 2026-07-28 with no `initialize` handshake. The agent does
+not contact the server during session setup; its tools are first listed at the
+start of the next turn, then refreshed each model round like other servers'.
+
+Each stdio or HTTP server has `--mcp-connect-timeout-secs` seconds (default
+60) to start, complete the MCP handshake, and list its tools when a session is
+created, loaded, resumed, or forked. Servers connect one after another, so a
+request that declares several servers can take up to that many times the
+limit. A server that misses the deadline fails that request with an error
+naming the server, and the stdio server processes started for the request are
+killed. The limit does not apply to tool calls, to the tool list refresh during
+a turn, or to MCP-over-ACP servers.
 
 ## DeepSeek behavior
 

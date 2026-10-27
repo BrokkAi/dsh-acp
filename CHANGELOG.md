@@ -8,6 +8,18 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ### Added
 
+- MCP-over-ACP (draft RFD): the ACP client can serve MCP tools over the ACP
+  connection itself. Both protocol versions advertise the `acp` MCP transport
+  (`mcpCapabilities.acp: true` in v1, `session.mcp.acp: {}` in v2) and accept
+  `{"type": "acp", "name", "serverId"}` declarations wherever MCP servers are
+  declared. Each MCP operation is an `mcp/message` request to the client,
+  using MCP 2026-07-28 with per-request metadata and no `initialize`
+  handshake. The server is not contacted during session setup; its tools are
+  listed at the start of each model round and named, filtered in plan mode,
+  and permission-checked like other MCP tools. An ACP or MCP error fails only
+  the tool call or refresh, and cancelling the turn withdraws an outstanding
+  request with `$/cancel_request`. Declaring one `serverId` twice in a request
+  fails with `-32602`.
 - ACP clients can now replace the built-in harness prompt instead of only
   appending to it: both protocol versions advertise
   `systemPrompt.mode.override` and accept `mode: "override"` on session

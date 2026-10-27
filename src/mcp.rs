@@ -1,15 +1,19 @@
 use std::{
+    collections::HashSet,
     process::Stdio,
     sync::{Arc, PoisonError, RwLock, RwLockReadGuard},
     time::Duration,
 };
 
 use agent_client_protocol::{
-    Error,
-    schema::v1::{EnvVariable, HttpHeader, McpServer},
+    Client, ConnectionTo, Error, V2ConnectionTo,
+    schema::{
+        v1::{self, EnvVariable, HttpHeader, McpServer},
+        v2,
+    },
 };
 use futures_util::StreamExt;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout},
@@ -18,6 +22,18 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::tools::function_tool;
+
+/// The only MCP revision MCP-over-ACP carries. It is stateless: every request
+/// names its version and capabilities, and there is no `initialize`.
+const MCP_OVER_ACP_VERSION: &str = "2026-07-28";
+
+/// The ACP connection a session was set up on. Its client serves the
+/// session's MCP-over-ACP servers, in that connection's protocol version.
+#[derive(Clone)]
+pub enum AcpConnection {
+    V1(ConnectionTo<Client>),
+    V2(V2ConnectionTo<Client>),
+}
 
 #[derive(Debug, Clone)]
 pub struct McpToolMetadata {
@@ -74,18 +90,25 @@ impl McpSession {
     /// lifecycle request waiting on it holds up every later message on the
     /// connection. If any server fails, the stdio processes started so far
     /// are killed and reaped before the error is returned.
+    ///
+    /// MCP-over-ACP servers are reached through `acp` and are not contacted
+    /// here: stateless MCP has no handshake, and the client cannot answer a
+    /// `tools/list` until the lifecycle request that would wait for it
+    /// returns. The turn's first [`refresh`](Self::refresh) lists their tools.
     pub async fn connect(
         servers: &[McpServer],
+        acp: Option<&AcpConnection>,
         setup_timeout: Duration,
         cancellation: &CancellationToken,
     ) -> Result<Self, Error> {
+        reject_duplicate_acp_servers(servers)?;
         let mut session = Self {
             clients: Vec::new(),
             tools: RwLock::new(Vec::new()),
         };
         for server in servers {
             if let Err(error) = session
-                .add_server(server, setup_timeout, cancellation)
+                .add_server(server, acp, setup_timeout, cancellation)
                 .await
             {
                 for client in &session.clients {
@@ -100,6 +123,7 @@ impl McpSession {
     async fn add_server(
         &mut self,
         server: &McpServer,
+        acp: Option<&AcpConnection>,
         setup_timeout: Duration,
         cancellation: &CancellationToken,
     ) -> Result<(), Error> {
@@ -111,8 +135,11 @@ impl McpSession {
             _ => "mcp",
         };
         let name = unique_server_name(requested_name, self.clients.as_slice());
-        let client = Arc::new(McpClient::start(server, name)?);
+        let client = Arc::new(McpClient::start(server, name, acp)?);
         self.clients.push(client.clone());
+        if matches!(client.transport, McpTransport::Acp(_)) {
+            return Ok(());
+        }
         // One deadline for the whole setup rather than per read, so a server
         // that keeps writing unrelated lines cannot extend it.
         let setup = async {
@@ -209,6 +236,23 @@ impl McpSession {
             .call_tool(&original_name, arguments, cancellation)
             .await
     }
+}
+
+/// A `serverId` names one registration, so declaring it twice for a session
+/// would only offer the same tools under two names.
+fn reject_duplicate_acp_servers(servers: &[McpServer]) -> Result<(), Error> {
+    let mut seen = HashSet::new();
+    for server in servers {
+        if let McpServer::Acp(config) = server
+            && !seen.insert(&config.server_id)
+        {
+            return Err(Error::invalid_params().data(format!(
+                "MCP-over-ACP serverId `{}` is declared more than once",
+                config.server_id
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn unique_server_name(requested: &str, clients: &[Arc<McpClient>]) -> String {
@@ -310,12 +354,14 @@ struct McpClient {
 enum McpTransport {
     Stdio(Mutex<StdioTransport>),
     Http(Mutex<HttpTransport>),
+    /// Each request stands alone, so there is nothing to serialize.
+    Acp(AcpTransport),
 }
 
 impl McpClient {
-    /// Spawns a stdio server or prepares an HTTP client, without talking to
-    /// the server yet.
-    fn start(server: &McpServer, name: String) -> Result<Self, Error> {
+    /// Spawns a stdio server or prepares an HTTP or MCP-over-ACP client,
+    /// without talking to the server yet.
+    fn start(server: &McpServer, name: String, acp: Option<&AcpConnection>) -> Result<Self, Error> {
         let transport = match server {
             McpServer::Stdio(config) => McpTransport::Stdio(Mutex::new(StdioTransport::spawn(
                 &config.command,
@@ -331,12 +377,16 @@ impl McpClient {
                 transport.prefer_streamable_http = true;
                 McpTransport::Http(Mutex::new(transport))
             }
-            McpServer::Acp(config) => {
-                return Err(Error::invalid_params().data(format!(
-                    "MCP-over-ACP server `{}` requires proxy attachment support, which this standalone agent does not provide",
-                    config.name
-                )));
-            }
+            McpServer::Acp(config) => McpTransport::Acp(AcpTransport {
+                connection: acp.cloned().ok_or_else(|| {
+                    Error::internal_error().data(format!(
+                        "MCP-over-ACP server `{}` has no ACP connection",
+                        config.name
+                    ))
+                })?,
+                server_id: config.server_id.0.clone(),
+                server_name: name.clone(),
+            }),
             _ => return Err(Error::invalid_params().data("unsupported MCP server transport")),
         };
         Ok(Self { name, transport })
@@ -350,6 +400,32 @@ impl McpClient {
             McpTransport::Http(transport) => {
                 transport.lock().await.initialize(name, cancellation).await
             }
+            McpTransport::Acp(_) => Ok(()),
+        }
+    }
+
+    async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, Error> {
+        match &self.transport {
+            McpTransport::Stdio(transport) => {
+                transport
+                    .lock()
+                    .await
+                    .request(method, params, cancellation)
+                    .await
+            }
+            McpTransport::Http(transport) => {
+                transport
+                    .lock()
+                    .await
+                    .request(method, params, cancellation)
+                    .await
+            }
+            McpTransport::Acp(transport) => transport.request(method, params, cancellation).await,
         }
     }
 
@@ -375,22 +451,7 @@ impl McpClient {
             let params = cursor
                 .as_ref()
                 .map_or_else(|| json!({}), |cursor| json!({"cursor": cursor}));
-            let response = match &self.transport {
-                McpTransport::Stdio(transport) => {
-                    transport
-                        .lock()
-                        .await
-                        .request("tools/list", params, cancellation)
-                        .await?
-                }
-                McpTransport::Http(transport) => {
-                    transport
-                        .lock()
-                        .await
-                        .request("tools/list", params, cancellation)
-                        .await?
-                }
-            };
+            let response = self.request("tools/list", params, cancellation).await?;
             let (mut page, next_cursor) = parse_tool_list_page(&response)?;
             tools.append(&mut page);
             match next_cursor {
@@ -408,23 +469,166 @@ impl McpClient {
         cancellation: &CancellationToken,
     ) -> Result<Value, Error> {
         let params = json!({"name": name, "arguments": arguments});
-        match &self.transport {
-            McpTransport::Stdio(transport) => {
-                transport
-                    .lock()
-                    .await
-                    .request("tools/call", params, cancellation)
-                    .await
+        self.request("tools/call", params, cancellation).await
+    }
+}
+
+/// An MCP server the ACP client provides (MCP-over-ACP, draft RFD). Each MCP
+/// operation is one `mcp/message` request to the client over the session's
+/// ACP connection, carrying its own MCP 2026-07-28 metadata.
+struct AcpTransport {
+    connection: AcpConnection,
+    server_id: Arc<str>,
+    server_name: String,
+}
+
+/// The inner MCP outcome a successful `mcp/message` response carries.
+enum AcpMcpOutcome {
+    Result(Value),
+    /// An MCP error object. Its code is MCP's, not ACP's.
+    Error(Value),
+}
+
+impl AcpTransport {
+    async fn request(
+        &self,
+        method: &str,
+        params: Value,
+        cancellation: &CancellationToken,
+    ) -> Result<Value, Error> {
+        if cancellation.is_cancelled() {
+            return Err(Error::request_cancelled());
+        }
+        let mut params = match params {
+            Value::Object(params) => params,
+            _ => Map::new(),
+        };
+        params.insert(
+            "_meta".to_string(),
+            json!({
+                "io.modelcontextprotocol/protocolVersion": MCP_OVER_ACP_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "io.modelcontextprotocol/clientInfo": {
+                    "name": "dsh-acp",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }),
+        );
+        // Fresh for every operation, so no two active requests to a server
+        // on this connection share one.
+        let request_id = format!("dsh-acp-{}", uuid::Uuid::new_v4().simple());
+        // Dropping the pending request when the turn is cancelled sends the
+        // client `$/cancel_request` for it.
+        let outcome = match &self.connection {
+            AcpConnection::V1(connection) => {
+                let response = connection.send_request(
+                    v1::MessageMcpRequest::new(self.server_id.clone(), request_id, method)
+                        .params(params),
+                );
+                let response = tokio::select! {
+                    _ = cancellation.cancelled() => return Err(Error::request_cancelled()),
+                    response = response.block_task() => response,
+                };
+                match response.map_err(|error| self.binding_failure(error))? {
+                    v1::MessageMcpResponse::Result { result, .. } => AcpMcpOutcome::Result(result),
+                    v1::MessageMcpResponse::Error { error, .. } => {
+                        AcpMcpOutcome::Error(serde_json::to_value(error).unwrap_or_default())
+                    }
+                    _ => return Err(self.unrecognized_response()),
+                }
             }
-            McpTransport::Http(transport) => {
-                transport
-                    .lock()
-                    .await
-                    .request("tools/call", params, cancellation)
-                    .await
+            AcpConnection::V2(connection) => {
+                let response = connection.send_request(
+                    v2::MessageMcpRequest::new(self.server_id.clone(), request_id, method)
+                        .params(params),
+                );
+                let response = tokio::select! {
+                    _ = cancellation.cancelled() => return Err(Error::request_cancelled()),
+                    response = response.block_task() => response,
+                };
+                match response.map_err(|error| self.binding_failure(error))? {
+                    v2::MessageMcpResponse::Result { result, .. } => AcpMcpOutcome::Result(result),
+                    v2::MessageMcpResponse::Error { error, .. } => {
+                        AcpMcpOutcome::Error(serde_json::to_value(error).unwrap_or_default())
+                    }
+                    _ => return Err(self.unrecognized_response()),
+                }
             }
+        };
+        match outcome {
+            AcpMcpOutcome::Result(result) => self.complete_result(result),
+            AcpMcpOutcome::Error(error) => Err(failure(
+                format!(
+                    "MCP server `{}` returned error {}: {}",
+                    self.server_name,
+                    error.get("code").unwrap_or(&Value::Null),
+                    error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                ),
+                error,
+            )),
         }
     }
+
+    /// MCP 2026-07-28 results say whether they are complete. A server that
+    /// needs more input asks for it with `input_required`, which needs client
+    /// capabilities this agent does not declare.
+    fn complete_result(&self, result: Value) -> Result<Value, Error> {
+        match result.get("resultType") {
+            None => Ok(result),
+            Some(Value::String(kind)) if kind == "complete" => Ok(result),
+            Some(Value::String(kind)) if kind == "input_required" => Err(failure(
+                format!(
+                    "MCP server `{}` asked for more input, which dsh-acp does not support",
+                    self.server_name
+                ),
+                result,
+            )),
+            Some(_) => Err(failure(
+                format!(
+                    "MCP server `{}` returned an unrecognized resultType",
+                    self.server_name
+                ),
+                result,
+            )),
+        }
+    }
+
+    /// An outer ACP error: the client could not route or run the request, for
+    /// example because the `serverId` is unknown (`-33001`). It also covers a
+    /// client that cancels the request itself.
+    fn binding_failure(&self, error: Error) -> Error {
+        failure(
+            format!(
+                "MCP-over-ACP server `{}` failed the request: {}",
+                self.server_name, error.message
+            ),
+            json!({
+                "code": i32::from(error.code),
+                "message": error.message,
+                "data": error.data
+            }),
+        )
+    }
+
+    fn unrecognized_response(&self) -> Error {
+        let message = format!(
+            "MCP-over-ACP server `{}` sent an unrecognized response",
+            self.server_name
+        );
+        failure(message.clone(), Value::String(message))
+    }
+}
+
+/// A failed MCP request. The code is always internal error, whatever code the
+/// client or MCP server used: theirs mean nothing to this ACP connection, and
+/// must not end a turn as cancelled or read as a request to authenticate.
+fn failure(message: String, data: Value) -> Error {
+    let mut error = Error::internal_error().data(data);
+    error.message = message;
+    error
 }
 
 #[cfg(test)]
@@ -904,6 +1108,23 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_repeated_acp_server_id_is_rejected_before_anything_starts() {
+        let servers = [
+            McpServer::Acp(v1::McpServerAcp::new("one", "tools:1")),
+            McpServer::Acp(v1::McpServerAcp::new("two", "tools:1")),
+        ];
+        let error = McpSession::connect(
+            &servers,
+            None,
+            Duration::from_secs(1),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a repeated serverId should be rejected");
+        assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+    }
+
     /// A stdio server that runs `script` with `/bin/sh`, with `args` as `$1`
     /// onwards.
     #[cfg(unix)]
@@ -934,6 +1155,7 @@ mod tests {
             Duration::from_secs(10),
             McpSession::connect(
                 &[server],
+                None,
                 Duration::from_millis(300),
                 &CancellationToken::new(),
             ),
@@ -964,6 +1186,7 @@ mod tests {
         "#;
         let session = McpSession::connect(
             &[shell_server("ok", script, &[])],
+            None,
             Duration::from_secs(10),
             &CancellationToken::new(),
         )
@@ -1026,6 +1249,7 @@ mod tests {
             Duration::from_secs(10),
             McpSession::connect(
                 &servers,
+                None,
                 Duration::from_millis(500),
                 &CancellationToken::new(),
             ),

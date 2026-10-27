@@ -30,6 +30,13 @@ struct Peer {
     /// Each `elicitation/complete` the agent sent, with how many updates the
     /// peer had received by then.
     elicitation_completions: Vec<(Value, usize)>,
+    /// Each `mcp/message` request the agent sent, in order.
+    mcp_requests: Vec<Value>,
+    /// Answers `mcp/message` requests as an MCP-over-ACP provider: the reply's
+    /// `result` or `error`, plus any inner MCP notifications to send first as
+    /// `notify`, or `None` to leave the request unanswered and return it from
+    /// `next_message`.
+    mcp_provider: fn(&Value) -> Option<Value>,
 }
 
 /// The id and output of the terminal the peer pretends to run.
@@ -138,6 +145,36 @@ impl Peer {
                     _ => json!({"result": {}}),
                 };
                 let mut reply = reply.as_object().unwrap().clone();
+                reply.insert("jsonrpc".to_string(), json!("2.0"));
+                reply.insert("id".to_string(), value["id"].clone());
+                self.write(Value::Object(reply)).await;
+                continue;
+            }
+            if value.get("method").and_then(Value::as_str) == Some("mcp/message")
+                && value.get("id").is_some()
+            {
+                self.mcp_requests.push(value.clone());
+                let Some(reply) = (self.mcp_provider)(&value) else {
+                    return value;
+                };
+                let mut reply = reply.as_object().unwrap().clone();
+                // Inner MCP notifications the provider sends for this request
+                // before it answers.
+                if let Some(notifications) = reply.remove("notify") {
+                    for notification in notifications.as_array().unwrap() {
+                        self.write(json!({
+                            "jsonrpc": "2.0",
+                            "method": "mcp/message",
+                            "params": {
+                                "serverId": value["params"]["serverId"],
+                                "requestId": value["params"]["requestId"],
+                                "method": notification["method"],
+                                "params": notification["params"]
+                            }
+                        }))
+                        .await;
+                    }
+                }
                 reply.insert("jsonrpc".to_string(), json!("2.0"));
                 reply.insert("id".to_string(), value["id"].clone());
                 self.write(Value::Object(reply)).await;
@@ -2100,6 +2137,8 @@ async fn spawn_peer_with_options(
         elicitation_requests: Vec::new(),
         elicitation_answer: Some("accept"),
         elicitation_completions: Vec::new(),
+        mcp_requests: Vec::new(),
+        mcp_provider: serve_acp_mcp,
     }
 }
 
@@ -6349,6 +6388,654 @@ fn final_tool_status<'a>(peer: &'a Peer, tool_call_id: &str) -> Option<&'a str> 
         .find_map(|update| update["status"].as_str())
 }
 
+// ---------------------------------------------------------------------------
+// MCP-over-ACP: the test client provides an MCP server through `mcp/message`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn v1_mcp_over_acp_tools_reach_the_model_and_run_in_the_client() {
+    mcp_over_acp_round_trip(1).await;
+}
+
+#[tokio::test]
+async fn v2_mcp_over_acp_tools_reach_the_model_and_run_in_the_client() {
+    mcp_over_acp_round_trip(2).await;
+}
+
+async fn mcp_over_acp_round_trip(version: u64) {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, model_server)) = mock_sequence_server(vec![
+        mock_named_tool_call_stream("mcp__review__report"),
+        mock_text_stream(),
+    ])
+    .await
+    else {
+        eprintln!("skipping MCP-over-ACP test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    let initialize = initialize_version(&mut peer, version).await;
+    if version == 1 {
+        assert_eq!(
+            initialize["agentCapabilities"]["mcpCapabilities"]["acp"],
+            true
+        );
+    } else {
+        assert_eq!(
+            initialize["capabilities"]["session"]["mcp"]["acp"],
+            json!({})
+        );
+    }
+    let session_id = new_acp_mcp_session(&mut peer, temp.path(), ACP_MCP_SERVER_ID).await;
+    // There is no MCP handshake, and session/new does not wait on the client.
+    assert!(peer.mcp_requests.is_empty(), "{:?}", peer.mcp_requests);
+
+    let stop_reason = prompt_turn(&mut peer, version, &session_id, "report").await;
+    assert_eq!(stop_reason, "end_turn");
+    assert_eq!(final_tool_status(&peer, "call-mcp"), Some("completed"));
+    assert_eq!(
+        peer.permission_requests.len(),
+        1,
+        "an MCP-over-ACP tool asks permission like any MCP tool"
+    );
+
+    // Each model round lists the tools again; the call runs in the client.
+    let methods = peer
+        .mcp_requests
+        .iter()
+        .map(|request| request["params"]["method"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(methods, ["tools/list", "tools/call", "tools/list"]);
+    let mut request_ids = std::collections::HashSet::new();
+    for request in &peer.mcp_requests {
+        let params = &request["params"];
+        assert_eq!(params["serverId"], ACP_MCP_SERVER_ID, "{request}");
+        let request_id = params["requestId"].as_str().expect("a string requestId");
+        assert!(
+            request_ids.insert(request_id.to_string()),
+            "requestId {request_id} was reused"
+        );
+        let meta = &params["params"]["_meta"];
+        assert_eq!(
+            meta["io.modelcontextprotocol/protocolVersion"], "2026-07-28",
+            "{request}"
+        );
+        assert_eq!(
+            meta["io.modelcontextprotocol/clientCapabilities"],
+            json!({}),
+            "{request}"
+        );
+        assert_eq!(
+            meta["io.modelcontextprotocol/clientInfo"]["name"], "dsh-acp",
+            "{request}"
+        );
+    }
+    let call = &peer.mcp_requests[1]["params"]["params"];
+    assert_eq!(call["name"], "report");
+    assert_eq!(call["arguments"], json!({}));
+
+    let requests = model_server.await.unwrap();
+    let offered = offered_tool_names(&requests[0]);
+    assert!(
+        offered.contains(&"mcp__review__report") && offered.contains(&"mcp__review__mutate"),
+        "{offered:?}"
+    );
+    assert_eq!(tool_results(&requests[1]), ["report done"]);
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+}
+
+#[tokio::test]
+async fn v1_mcp_over_acp_plan_mode_offers_only_read_only_tools() {
+    mcp_over_acp_plan_mode(1).await;
+}
+
+#[tokio::test]
+async fn v2_mcp_over_acp_plan_mode_offers_only_read_only_tools() {
+    mcp_over_acp_plan_mode(2).await;
+}
+
+async fn mcp_over_acp_plan_mode(version: u64) {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, model_server)) = mock_sequence_server(vec![
+        mock_named_tool_call_stream("mcp__review__report"),
+        mock_text_stream(),
+        mock_named_tool_call_stream("mcp__review__mutate"),
+        mock_text_stream(),
+    ])
+    .await
+    else {
+        eprintln!("skipping MCP-over-ACP plan mode test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    initialize_version(&mut peer, version).await;
+    let session_id = new_acp_mcp_session(&mut peer, temp.path(), ACP_MCP_SERVER_ID).await;
+    set_mode(&mut peer, version, &session_id, "plan").await;
+    for input in ["report", "mutate"] {
+        let stop_reason = prompt_turn(&mut peer, version, &session_id, input).await;
+        assert_eq!(stop_reason, "end_turn", "{input}");
+    }
+
+    let requests = model_server.await.unwrap();
+    for request in [&requests[0], &requests[2]] {
+        let offered = offered_tool_names(request);
+        assert!(offered.contains(&"mcp__review__report"), "{offered:?}");
+        assert!(!offered.contains(&"mcp__review__mutate"), "{offered:?}");
+    }
+    let refusal = tool_results(&requests[3]);
+    assert!(
+        refusal
+            .last()
+            .is_some_and(|text| text.starts_with("The session is in plan mode.")),
+        "{refusal:?}"
+    );
+    let called = peer
+        .mcp_requests
+        .iter()
+        .filter(|request| request["params"]["method"] == "tools/call")
+        .map(|request| request["params"]["params"]["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(called, ["report"]);
+    assert_eq!(
+        peer.permission_requests.len(),
+        1,
+        "mutate must be refused before permission"
+    );
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+}
+
+#[tokio::test]
+async fn v1_mcp_over_acp_errors_fail_the_tool_call_not_the_turn() {
+    mcp_over_acp_errors(1).await;
+}
+
+#[tokio::test]
+async fn v2_mcp_over_acp_errors_fail_the_tool_call_not_the_turn() {
+    mcp_over_acp_errors(2).await;
+}
+
+/// An outer ACP error and an inner MCP error both fail only their tool call,
+/// even when the inner code is ACP's request-cancelled code.
+async fn mcp_over_acp_errors(version: u64) {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, model_server)) = mock_sequence_server(vec![
+        mock_tool_calls_stream(&[
+            ("call-report", "mcp__review__report"),
+            ("call-mutate", "mcp__review__mutate"),
+        ]),
+        mock_text_stream(),
+    ])
+    .await
+    else {
+        eprintln!("skipping MCP-over-ACP error test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.mcp_provider = fail_acp_mcp_calls;
+    initialize_version(&mut peer, version).await;
+    let session_id = new_acp_mcp_session(&mut peer, temp.path(), ACP_MCP_SERVER_ID).await;
+    let stop_reason = prompt_turn(&mut peer, version, &session_id, "report and mutate").await;
+    assert_eq!(stop_reason, "end_turn");
+    assert_eq!(final_tool_status(&peer, "call-report"), Some("failed"));
+    assert_eq!(final_tool_status(&peer, "call-mutate"), Some("failed"));
+
+    let requests = model_server.await.unwrap();
+    let results = tool_results(&requests[1]);
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(
+        results[0].starts_with("MCP tool failed")
+            && results[0].contains("MCP server registration unavailable"),
+        "{results:?}"
+    );
+    assert!(
+        results[1].starts_with("MCP tool failed") && results[1].contains("inner cancellation"),
+        "{results:?}"
+    );
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+}
+
+#[tokio::test]
+async fn v1_mcp_over_acp_unknown_server_is_reported_and_offers_no_tools() {
+    mcp_over_acp_unknown_server(1).await;
+}
+
+#[tokio::test]
+async fn v2_mcp_over_acp_unknown_server_is_reported_and_offers_no_tools() {
+    mcp_over_acp_unknown_server(2).await;
+}
+
+async fn mcp_over_acp_unknown_server(version: u64) {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, model_server)) = mock_sequence_server(vec![mock_text_stream()]).await
+    else {
+        eprintln!("skipping MCP-over-ACP unknown server test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    initialize_version(&mut peer, version).await;
+    let session_id = new_acp_mcp_session(&mut peer, temp.path(), "unregistered:1").await;
+    let stop_reason = prompt_turn(&mut peer, version, &session_id, "report").await;
+    assert_eq!(stop_reason, "end_turn");
+    assert!(
+        peer.updates.iter().any(|update| {
+            let update = &update["params"]["update"];
+            update["sessionUpdate"] == "notice"
+                && update["title"] == "MCP tool refresh failed"
+                && update["description"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("MCP server registration unavailable"))
+        }),
+        "{:?}",
+        peer.updates
+    );
+
+    let requests = model_server.await.unwrap();
+    let offered = offered_tool_names(&requests[0]);
+    assert!(
+        offered.iter().all(|name| !name.starts_with("mcp__")),
+        "{offered:?}"
+    );
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+}
+
+#[tokio::test]
+async fn v1_session_cancel_withdraws_a_running_mcp_over_acp_call() {
+    mcp_over_acp_cancel(1, "tools/call").await;
+}
+
+#[tokio::test]
+async fn v2_session_cancel_withdraws_a_running_mcp_over_acp_call() {
+    mcp_over_acp_cancel(2, "tools/call").await;
+}
+
+#[tokio::test]
+async fn v1_session_cancel_withdraws_a_running_mcp_over_acp_refresh() {
+    mcp_over_acp_cancel(1, "tools/list").await;
+}
+
+#[tokio::test]
+async fn v2_session_cancel_withdraws_a_running_mcp_over_acp_refresh() {
+    mcp_over_acp_cancel(2, "tools/list").await;
+}
+
+/// Cancels the turn while the client holds its `stalled` request, either the
+/// model's tool call or the tool refresh before the model is asked anything.
+async fn mcp_over_acp_cancel(version: u64, stalled: &str) {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, model_server)) =
+        mock_sequence_server(vec![mock_named_tool_call_stream("mcp__review__report")]).await
+    else {
+        eprintln!("skipping MCP-over-ACP cancellation test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.mcp_provider = if stalled == "tools/call" {
+        stall_acp_mcp_calls
+    } else {
+        stall_acp_mcp_lists
+    };
+    initialize_version(&mut peer, version).await;
+    let session_id = new_acp_mcp_session(&mut peer, temp.path(), ACP_MCP_SERVER_ID).await;
+    let prompt_id = peer.next_id;
+    peer.next_id += 1;
+    peer.write(json!({
+        "jsonrpc": "2.0",
+        "id": prompt_id,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "report"}]
+        }
+    }))
+    .await;
+    // The provider leaves the request unanswered, so `next_message` returns
+    // it.
+    let call = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let message = peer.next_message().await;
+            if message["method"] == "mcp/message" {
+                return message;
+            }
+            // The v2 prompt is answered as soon as it is accepted.
+            if message.get("id").and_then(Value::as_u64) != Some(prompt_id) {
+                peer.updates.push(message);
+            }
+        }
+    })
+    .await
+    .expect("the stalled MCP request should reach the client");
+    assert_eq!(call["params"]["method"], stalled, "{call}");
+
+    // A request that needs the session's state is answered while the client
+    // still holds the request.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        set_mode(&mut peer, version, &session_id, "agent"),
+    )
+    .await
+    .expect("setting the mode should not wait for the MCP call");
+
+    peer.write(json!({
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": {"sessionId": session_id}
+    }))
+    .await;
+    let mut withdrawn = false;
+    let stop_reason = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let message = peer.read_message().await;
+            match message.get("method").and_then(Value::as_str) {
+                Some("$/cancel_request") => {
+                    // It names the outer ACP request, not the logical MCP one.
+                    assert_eq!(message["params"]["requestId"], call["id"], "{message}");
+                    withdrawn = true;
+                    // Answer as a client that honors cancellation must.
+                    peer.write(json!({
+                        "jsonrpc": "2.0",
+                        "id": call["id"],
+                        "error": {"code": -32800, "message": "Request cancelled"}
+                    }))
+                    .await;
+                }
+                Some("session/update") => {
+                    let update = &message["params"]["update"];
+                    if version == 2
+                        && update["sessionUpdate"] == "state_update"
+                        && update["state"] == "idle"
+                    {
+                        return update["stopReason"].clone();
+                    }
+                    peer.updates.push(message);
+                }
+                _ if version == 1
+                    && message.get("id").and_then(Value::as_u64) == Some(prompt_id) =>
+                {
+                    return message["result"]["stopReason"].clone();
+                }
+                _ => panic!("unexpected message: {message}"),
+            }
+        }
+    })
+    .await
+    .expect("session/cancel should end the turn without waiting for the client");
+    assert!(withdrawn, "the pending mcp/message should be withdrawn");
+    assert_eq!(stop_reason, "cancelled");
+    if stalled == "tools/call" {
+        assert_eq!(final_tool_status(&peer, "call-mcp"), Some("failed"));
+    } else {
+        // A cancel that lands during the refresh ends the turn; the refresh
+        // did not fail.
+        assert!(!reported_refresh_failure(&peer), "{:?}", peer.updates);
+    }
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    model_server.abort();
+}
+
+#[tokio::test]
+async fn v1_a_loaded_session_uses_the_mcp_over_acp_servers_its_load_declares() {
+    mcp_over_acp_redeclared(1).await;
+}
+
+#[tokio::test]
+async fn v2_a_resumed_session_uses_the_mcp_over_acp_servers_its_resume_declares() {
+    mcp_over_acp_redeclared(2).await;
+}
+
+async fn mcp_over_acp_redeclared(version: u64) {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, model_server)) =
+        mock_sequence_server(vec![mock_text_stream(), mock_text_stream()]).await
+    else {
+        eprintln!("skipping MCP-over-ACP redeclaration test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    initialize_version(&mut peer, version).await;
+    let session_id = new_acp_mcp_session(&mut peer, temp.path(), "review-tools:first").await;
+    assert_eq!(
+        prompt_turn(&mut peer, version, &session_id, "first").await,
+        "end_turn"
+    );
+    let before = peer.mcp_requests.len();
+    let setup = json!({
+        "sessionId": session_id,
+        "cwd": temp.path().to_string_lossy(),
+        "mcpServers": [acp_mcp_server("review-tools:second")],
+        "additionalDirectories": []
+    });
+    if version == 1 {
+        peer.request("session/load", setup).await;
+    } else {
+        peer.request("session/resume", setup).await;
+    }
+    assert_eq!(peer.mcp_requests.len(), before, "{:?}", peer.mcp_requests);
+    assert_eq!(
+        prompt_turn(&mut peer, version, &session_id, "second").await,
+        "end_turn"
+    );
+    let servers = peer
+        .mcp_requests
+        .iter()
+        .map(|request| request["params"]["serverId"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(servers, ["review-tools:first", "review-tools:second"]);
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    assert_eq!(model_server.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_repeated_mcp_over_acp_server_id_fails_session_setup() {
+    for version in [1, 2] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut peer = spawn_peer(temp.path(), None).await;
+        initialize_version(&mut peer, version).await;
+        let error = peer
+            .request_error(
+                "session/new",
+                json!({
+                    "cwd": temp.path().to_string_lossy(),
+                    "mcpServers": [
+                        acp_mcp_server(ACP_MCP_SERVER_ID),
+                        {"type": "acp", "name": "again", "serverId": ACP_MCP_SERVER_ID}
+                    ],
+                    "additionalDirectories": []
+                }),
+            )
+            .await;
+        assert_eq!(error["code"], -32602, "v{version}: {error}");
+        assert!(peer.mcp_requests.is_empty(), "v{version}");
+
+        drop(peer.stdin);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    }
+}
+
+/// The `serverId` of the test client's MCP-over-ACP server. `serve_acp_mcp`
+/// serves any id with the same `review-tools:` prefix as another
+/// registration of the same tools.
+const ACP_MCP_SERVER_ID: &str = "review-tools:7a72";
+
+/// Answers `mcp/message` as an MCP-over-ACP provider of a read-only `report`
+/// tool and a `mutate` tool. A call first sends a request-scoped progress
+/// notification the agent never asked for, which it must ignore. A server it
+/// does not know gets the binding's server-unavailable error.
+fn serve_acp_mcp(request: &Value) -> Option<Value> {
+    let params = &request["params"];
+    if !params["serverId"]
+        .as_str()
+        .is_some_and(|id| id.starts_with("review-tools:"))
+    {
+        return Some(json!({"error": {
+            "code": -33001,
+            "message": "MCP server registration unavailable"
+        }}));
+    }
+    let result = match params["method"].as_str().unwrap() {
+        "tools/list" => json!({"resultType": "complete", "tools": [
+            {"name":"report", "description":"Report findings", "inputSchema":{"type":"object"}, "annotations":{"readOnlyHint":true}},
+            {"name":"mutate", "description":"Change state", "inputSchema":{"type":"object"}}
+        ]}),
+        "tools/call" => json!({
+            "resultType": "complete",
+            "content": [{
+                "type": "text",
+                "text": format!("{} done", params["params"]["name"].as_str().unwrap())
+            }],
+            "isError": false
+        }),
+        method => panic!("unexpected MCP method: {method}"),
+    };
+    let notify = if params["method"] == "tools/call" {
+        json!([{
+            "method": "notifications/progress",
+            "params": {"progressToken": "unrequested", "progress": 1, "total": 2}
+        }])
+    } else {
+        json!([])
+    };
+    Some(json!({"notify": notify, "result": {"result": result}}))
+}
+
+/// Like `serve_acp_mcp`, but leaves every `tools/call` unanswered.
+fn stall_acp_mcp_calls(request: &Value) -> Option<Value> {
+    if request["params"]["method"] == "tools/call" {
+        None
+    } else {
+        serve_acp_mcp(request)
+    }
+}
+
+/// Like `serve_acp_mcp`, but leaves every `tools/list` unanswered.
+fn stall_acp_mcp_lists(request: &Value) -> Option<Value> {
+    if request["params"]["method"] == "tools/list" {
+        None
+    } else {
+        serve_acp_mcp(request)
+    }
+}
+
+/// Like `serve_acp_mcp`, but `report` fails with the binding's
+/// server-unavailable error, and `mutate` with an MCP error whose code is
+/// ACP's request-cancelled code.
+fn fail_acp_mcp_calls(request: &Value) -> Option<Value> {
+    let params = &request["params"];
+    if params["method"] != "tools/call" {
+        return serve_acp_mcp(request);
+    }
+    if params["params"]["name"] == "report" {
+        Some(json!({"error": {
+            "code": -33001,
+            "message": "MCP server registration unavailable"
+        }}))
+    } else {
+        Some(json!({"result": {"error": {"code": -32800, "message": "inner cancellation"}}}))
+    }
+}
+
+fn acp_mcp_server(server_id: &str) -> Value {
+    json!({"type": "acp", "name": "review", "serverId": server_id})
+}
+
+/// Initializes ACP `version`. A v1 client declares notices, which v2 has as
+/// baseline.
+async fn initialize_version(peer: &mut Peer, version: u64) -> Value {
+    if version == 1 {
+        peer.request(
+            "initialize",
+            json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {"session": {"notices": {}}}
+            }),
+        )
+        .await
+    } else {
+        peer.request(
+            "initialize",
+            json!({
+                "protocolVersion": 2,
+                "info": {"name": "v2-test-client", "version": "1.0.0"},
+                "capabilities": {}
+            }),
+        )
+        .await
+    }
+}
+
+async fn new_acp_mcp_session(peer: &mut Peer, cwd: &std::path::Path, server_id: &str) -> String {
+    let session = peer
+        .request(
+            "session/new",
+            json!({
+                "cwd": cwd.to_string_lossy(),
+                "mcpServers": [acp_mcp_server(server_id)],
+                "additionalDirectories": []
+            }),
+        )
+        .await;
+    session["sessionId"].as_str().unwrap().to_string()
+}
+
+/// Runs a prompt until its turn ends and returns the stop reason.
+async fn prompt_turn(peer: &mut Peer, version: u64, session_id: &str, text: &str) -> Value {
+    let params = json!({"sessionId": session_id, "prompt": [{"type": "text", "text": text}]});
+    if version == 1 {
+        peer.request("session/prompt", params).await["stopReason"].clone()
+    } else {
+        peer.request("session/prompt", params).await;
+        next_v2_idle(peer).await["params"]["update"]["stopReason"].clone()
+    }
+}
+
+async fn set_mode(peer: &mut Peer, version: u64, session_id: &str, mode: &str) {
+    if version == 1 {
+        peer.request(
+            "session/set_mode",
+            json!({"sessionId": session_id, "modeId": mode}),
+        )
+        .await;
+    } else {
+        peer.request(
+            "session/set_config_option",
+            json!({"sessionId": session_id, "configId": "mode", "type": "id", "value": mode}),
+        )
+        .await;
+    }
+}
+
+/// The names of the tools a model request offers.
+fn offered_tool_names(request: &Value) -> Vec<&str> {
+    request["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect()
+}
+
+/// The tool results a model request carries, in order.
+fn tool_results(request: &Value) -> Vec<&str> {
+    request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .filter_map(|message| message["content"].as_str())
+        .collect()
+}
+
 #[tokio::test]
 async fn cancel_request_ends_an_in_flight_prompt_with_request_cancelled() {
     let temp = tempfile::tempdir().unwrap();
@@ -7522,6 +8209,23 @@ fn mock_named_tool_call_stream(name: &str) -> String {
         json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}),
     ];
     encode_sse(&events)
+}
+
+/// One completion that calls several tools, each `(id, name)` with no
+/// arguments.
+fn mock_tool_calls_stream(calls: &[(&str, &str)]) -> String {
+    let tool_calls = calls
+        .iter()
+        .enumerate()
+        .map(|(index, (id, name))| {
+            json!({"index": index, "id": id, "type": "function", "function": {"name": name, "arguments": "{}"}})
+        })
+        .collect::<Vec<_>>();
+    encode_sse(&[
+        json!({"choices":[{"delta":{"tool_calls": tool_calls}}]}),
+        json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        json!({"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}),
+    ])
 }
 
 fn mock_text_stream() -> String {

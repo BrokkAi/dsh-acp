@@ -313,7 +313,8 @@ impl V2Harness {
             .mcp(
                 v2::McpCapabilities::new()
                     .stdio(v2::McpStdioCapabilities::new())
-                    .http(v2::McpHttpCapabilities::new()),
+                    .http(v2::McpHttpCapabilities::new())
+                    .acp(v2::McpAcpCapabilities::new()),
             )
             .delete(v2::SessionDeleteCapabilities::new())
             .additional_directories(v2::SessionAdditionalDirectoriesCapabilities::new())
@@ -476,7 +477,10 @@ impl V2Harness {
             Ok(runtime) => runtime,
             Err(error) => return responder.respond_with_error(error),
         };
-        if let Err(error) = self.attach_mcp(&runtime, &request.mcp_servers).await {
+        if let Err(error) = self
+            .attach_mcp(&runtime, &request.mcp_servers, &connection)
+            .await
+        {
             let _ = self.base.store.delete(&runtime.snapshot().await.id).await;
             return responder.respond_with_error(error);
         }
@@ -576,7 +580,10 @@ impl V2Harness {
         // A resume whose MCP servers fail to connect leaves the session as it
         // was. Installing touches only the instructions, so a turn that is
         // still running keeps the messages it adds meanwhile.
-        if let Err(error) = self.attach_mcp(&runtime, &request.mcp_servers).await {
+        if let Err(error) = self
+            .attach_mcp(&runtime, &request.mcp_servers, &connection)
+            .await
+        {
             return responder.respond_with_error(error);
         }
         instructions.install(&mut runtime.state.lock().await.record);
@@ -679,7 +686,10 @@ impl V2Harness {
             let _ = self.base.store.delete(&runtime_id).await;
             return responder.respond_with_error(error);
         }
-        if let Err(error) = self.attach_mcp(&runtime, &request.mcp_servers).await {
+        if let Err(error) = self
+            .attach_mcp(&runtime, &request.mcp_servers, &connection)
+            .await
+        {
             let _ = self.base.store.delete(&runtime_id).await;
             return responder.respond_with_error(error);
         }
@@ -2234,6 +2244,7 @@ impl V2Harness {
         &self,
         runtime: &SessionRuntime,
         servers: &[v2::McpServer],
+        connection: &V2ConnectionTo<Client>,
     ) -> Result<(), Error> {
         if servers.is_empty() {
             return Ok(());
@@ -2242,7 +2253,13 @@ impl V2Harness {
             .iter()
             .map(convert_mcp_server)
             .collect::<Result<Vec<_>, _>>()?;
-        self.base.attach_mcp(runtime, &converted).await
+        self.base
+            .attach_mcp(
+                runtime,
+                &converted,
+                crate::mcp::AcpConnection::V2(connection.clone()),
+            )
+            .await
     }
 }
 
@@ -3014,6 +3031,12 @@ fn convert_mcp_server(
                     .collect(),
             ),
         )),
+        // Requests to it are still sent as v2 `mcp/message`, over the v2
+        // connection `attach_mcp` passes along.
+        v2::McpServer::Acp(config) => Ok(v1::McpServer::Acp(v1::McpServerAcp::new(
+            &config.name,
+            config.server_id.0.clone(),
+        ))),
         _ => Err(Error::invalid_params()
             .data("this v2 MCP transport is not supported by the standalone agent")),
     }

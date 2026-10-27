@@ -91,14 +91,23 @@ lossy text reconstruction.
 - Session transitions and final idle reporting use a per-session turn lock.
 - Steering requests for a session serialize through that same lock.
 - Closing prevents new prompt insertion and waits for active work to settle.
-- MCP calls are serialized per server. A turn does not hold the session's
-  state lock while it waits on an MCP server, so `session/cancel` and other
-  requests for the session are not held up by a slow or unresponsive server.
+- Calls to a stdio or HTTP MCP server are serialized per server. An
+  MCP-over-ACP request stands alone, so it takes no lock. A turn does not hold
+  the session's state lock while it waits on an MCP server, so
+  `session/cancel` and other requests for the session are not held up by a
+  slow or unresponsive server.
 - Session lifecycle requests run in the SDK's dispatch loop, so no other
   incoming message is handled until they answer. Connecting their MCP servers
   is bounded per server by `--mcp-connect-timeout-secs`. Servers connect one
   after another, so a request with N servers can wait up to N times that
   limit.
+- MCP-over-ACP servers are not contacted during a lifecycle request. The
+  client's answer to an `mcp/message` arrives through the same dispatch loop,
+  so waiting for it there would never finish. The servers keep the connection
+  of the lifecycle request that declared them, and the session's turns send
+  `mcp/message` requests over it from outside the loop: the per-round tool
+  refresh lists the tools, and dropping a request when the turn is cancelled
+  sends the client `$/cancel_request`.
 - Session-store writes are serialized process-wide. Loading a stored session
   takes the same lock, so a title `session/set_title` writes to a stored
   record cannot be lost to a load in progress.
