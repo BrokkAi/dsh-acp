@@ -297,8 +297,9 @@ carried is marked failed rather than run with truncated arguments, and the
 client is sent a warning notice when it supports notices.
 
 `ask_user` uses ACP form elicitation by default. When the Client advertises URL
-elicitation, the model may also request an HTTPS URL with an optional stable
-`elicitation_id`. Embedded URL credentials and plain HTTP outside localhost are
+elicitation, the model may also request an HTTPS URL with an optional
+`elicitation_id`; one is generated when it is omitted, and an ID still in use
+is refused. Embedded URL credentials and plain HTTP outside localhost are
 rejected. Accepting a URL only means the user agreed to open it, so the result
 gives the model the elicitation ID; after it has verified the external step
 finished, the model calls `complete_url_elicitation`, which sends

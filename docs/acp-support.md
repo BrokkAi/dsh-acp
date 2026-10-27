@@ -243,8 +243,11 @@ It uses form mode, or URL mode when the model passes a URL and the Client
 advertises URL elicitation. A URL must use HTTPS outside localhost and must not
 embed credentials. In both versions, a request refused before it is sent, or
 answered with an error, fails that tool call with the reason and the turn
-continues; only cancellation ends the turn. ACP v2 reports `requires_action`
-only once the request has been sent.
+continues. Only the turn's own cancellation ends the turn: `session/cancel`, or
+in ACP v1 a `$/cancel_request` for the prompt. A Client that cancels the
+elicitation request itself answers `-32800`; that fails only the tool call, and
+a URL elicitation's ID is freed as it is for a decline. ACP v2 reports
+`requires_action` only once the request has been sent.
 
 Accepting a URL elicitation means only that the user consented to open the
 URL. The harness has no callback that observes the external interaction, so the

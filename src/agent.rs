@@ -1879,13 +1879,10 @@ impl Harness {
             .await
             {
                 Ok(result) => (result, true),
-                Err(error) if error.code == agent_client_protocol::ErrorCode::RequestCancelled => {
-                    return Err(error);
-                }
-                Err(error) => (
-                    crate::tools::error_result("Unable to request user input", &error),
-                    false,
-                ),
+                // Only the turn's own cancellation ends it: a Client that
+                // cancels the elicitation answers -32800 too.
+                Err(_) if cancellation.is_cancelled() => return Err(Error::request_cancelled()),
+                Err(error) => (crate::tools::ask_user_failed(&error), false),
             };
             send_tool_finished(access, session_id, call, &title, &result, success, None)?;
             return Ok(result);
@@ -2507,14 +2504,9 @@ async fn ask_user(
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("elicit-{}", uuid::Uuid::new_v4().simple()));
-        if !store
+        store
             .reserve_url_elicitation(&session_id.to_string(), &elicitation_id)
-            .await
-        {
-            return Err(Error::invalid_params().data(format!(
-                "elicitation ID {elicitation_id} is still in use by a URL elicitation that was not reported complete; omit elicitation_id to generate a new one"
-            )));
-        }
+            .await?;
         url_elicitation_id = Some(elicitation_id.clone());
         ElicitationMode::Url(ElicitationUrlMode::new(scope, elicitation_id, url))
     } else {

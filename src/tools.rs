@@ -458,6 +458,21 @@ pub fn error_result(context: &str, error: &agent_client_protocol::Error) -> Tool
     }
 }
 
+/// The failed result of an `ask_user` request that was refused before it was
+/// sent, or that the Client answered with an error. A Client that cancels the
+/// request itself answers `-32800`, which names no reason; that fails only
+/// this call, because only the turn's own cancellation ends the turn.
+pub fn ask_user_failed(error: &agent_client_protocol::Error) -> ToolResult {
+    if error.code == agent_client_protocol::ErrorCode::RequestCancelled {
+        let reason = "the client cancelled the request";
+        return ToolResult {
+            text: format!("Unable to request user input: {reason}"),
+            raw: json!({"error": reason}),
+        };
+    }
+    error_result("Unable to request user input", error)
+}
+
 /// Run `complete_url_elicitation`: take the session's accepted URL
 /// elicitation with the given ID and `send` its `elicitation/complete`. An ID
 /// that is unknown, already completed, or another session's fails the call

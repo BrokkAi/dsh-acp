@@ -130,6 +130,11 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   completion." Both versions now fail just that tool call with the reason, for
   example that the URL must use HTTPS, and the turn continues. In ACP v2, a
   request refused before it is sent no longer reports `requires_action`.
+- A Client that cancelled an `ask_user` elicitation itself, answering `-32800`,
+  ended the whole turn as `cancelled` although nobody cancelled the turn. Only
+  the turn's own cancellation (`session/cancel`, or a v1 `$/cancel_request` for
+  the prompt) now ends it; a Client-side cancel fails only that tool call, and
+  the model is told the client cancelled the request.
 
 ## 0.4.0 - 2026-10-25
 

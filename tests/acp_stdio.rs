@@ -3864,6 +3864,113 @@ async fn a_url_elicitation_cancelled_before_its_answer_keeps_its_id_reserved() {
 }
 
 #[tokio::test]
+async fn a_client_cancelling_an_elicitation_fails_only_that_tool_call() {
+    for version in [1, 2] {
+        let temp = tempfile::tempdir().unwrap();
+        let Some((base_url, server)) = mock_sequence_server(vec![
+            ask_url_stream("call-ask", "oauth-9"),
+            // The Client's cancel answered the request, so the ID is free.
+            ask_url_stream("call-ask-again", "oauth-9"),
+            mock_text_stream(),
+        ])
+        .await
+        else {
+            eprintln!("skipping client-cancel test: loopback networking is unavailable");
+            return;
+        };
+        let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+        let initialize = if version == 1 {
+            json!({"protocolVersion": 1, "clientCapabilities": {"elicitation": {"url": {}}}})
+        } else {
+            json!({
+                "protocolVersion": 2,
+                "info": {"name": "v2-test-client", "version": "1.0.0"},
+                "capabilities": {"elicitation": {"url": {}}}
+            })
+        };
+        peer.request("initialize", initialize).await;
+        let session = peer
+            .request(
+                "session/new",
+                json!({"cwd": temp.path().to_string_lossy(), "mcpServers": []}),
+            )
+            .await;
+        let prompt_id = peer.next_id;
+        peer.next_id += 1;
+        peer.write(json!({
+            "jsonrpc": "2.0",
+            "id": prompt_id,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": session["sessionId"],
+                "prompt": [{"type": "text", "text": "Connect the repository"}]
+            }
+        }))
+        .await;
+        peer.elicitation_answer = None;
+        // v2 accepts the prompt first; an idle before that is the new
+        // session's initial state.
+        let mut accepted = false;
+        let stop_reason = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let message = peer.next_message().await;
+                if message["method"] == "elicitation/create" {
+                    // The Client dismisses its own dialog: no session/cancel
+                    // was sent, so the turn must go on.
+                    peer.write(json!({
+                        "jsonrpc": "2.0",
+                        "id": message["id"],
+                        "error": {"code": -32800, "message": "Request cancelled"}
+                    }))
+                    .await;
+                    peer.elicitation_answer = Some("accept");
+                    continue;
+                }
+                if message["id"] == prompt_id {
+                    if version == 1 {
+                        return message["result"]["stopReason"].clone();
+                    }
+                    accepted = true;
+                    continue;
+                }
+                if accepted && message["params"]["update"]["state"] == "idle" {
+                    return message["params"]["update"]["stopReason"].clone();
+                }
+                peer.updates.push(message);
+            }
+        })
+        .await
+        .expect("the turn should finish");
+        assert_eq!(stop_reason, "end_turn", "v{version}");
+        assert_eq!(
+            final_tool_update(&peer, "call-ask")["status"],
+            "failed",
+            "v{version}"
+        );
+        assert_eq!(
+            final_tool_update(&peer, "call-ask-again")["status"],
+            "completed",
+            "v{version}"
+        );
+        assert_eq!(peer.elicitation_requests.len(), 2, "v{version}");
+        assert_eq!(
+            peer.elicitation_requests[1]["params"]["elicitationId"], "oauth-9",
+            "v{version}"
+        );
+
+        drop(peer.stdin);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 3, "v{version}");
+        let cancelled = tool_message(&requests[1], "call-ask");
+        assert!(
+            cancelled.contains("the client cancelled the request"),
+            "v{version}: {cancelled}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_fork_does_not_inherit_pending_url_elicitations() {
     let temp = tempfile::tempdir().unwrap();
     let Some((base_url, server)) = mock_sequence_server(vec![

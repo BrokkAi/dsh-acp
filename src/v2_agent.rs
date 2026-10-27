@@ -1849,16 +1849,12 @@ impl V2Harness {
                 Err(error) => Err(error),
             };
             // Like other tool failures, a refused or failed request tells the
-            // model why and the turn goes on; only cancellation ends it.
+            // model why and the turn goes on. Only the turn's own cancellation
+            // ends it: a Client that cancels the elicitation answers -32800 too.
             let (result, success) = match result {
                 Ok(result) => (result, true),
-                Err(error) if error.code == agent_client_protocol::ErrorCode::RequestCancelled => {
-                    return Err(error);
-                }
-                Err(error) => (
-                    crate::tools::error_result("Unable to request user input", &error),
-                    false,
-                ),
+                Err(_) if cancellation.is_cancelled() => return Err(Error::request_cancelled()),
+                Err(error) => (crate::tools::ask_user_failed(&error), false),
             };
             send_tool_result(connection, session_id, call, &result, success)?;
             return Ok(result);
@@ -2050,59 +2046,52 @@ impl V2Harness {
         let scope = v2::ElicitationSessionScope::new(session_id.clone())
             .tool_call_id(Some(v2::ToolCallId::new(call.id.clone())));
         let mut url_elicitation_id = None;
-        let mode = if let Some(url) = arguments.get("url").and_then(Value::as_str) {
-            if !capabilities
-                .elicitation
-                .as_ref()
-                .is_some_and(|capabilities| capabilities.supports_url())
-            {
-                return Err(
-                    Error::invalid_request().data("the Client does not support URL elicitation")
-                );
-            }
-            let parsed = reqwest::Url::parse(url)
-                .map_err(|error| Error::invalid_params().data(error.to_string()))?;
-            if parsed.username() != "" || parsed.password().is_some() {
-                return Err(Error::invalid_params()
-                    .data("URL elicitations must not contain embedded credentials"));
-            }
-            if parsed.scheme() != "https" && parsed.host_str() != Some("localhost") {
-                return Err(Error::invalid_params()
-                    .data("URL elicitations require HTTPS outside localhost"));
-            }
-            let elicitation_id = arguments
-                .get("elicitation_id")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| format!("elicit-{}", uuid::Uuid::new_v4().simple()));
-            if !self
-                .base
-                .store
-                .reserve_url_elicitation(&session_id.to_string(), &elicitation_id)
-                .await
-            {
-                return Err(Error::invalid_params().data(format!(
-                    "elicitation ID {elicitation_id} is still in use by a URL elicitation that was not reported complete; omit elicitation_id to generate a new one"
-                )));
-            }
-            url_elicitation_id = Some(elicitation_id.clone());
-            v2::ElicitationMode::Url(v2::ElicitationUrlMode::new(scope, elicitation_id, url))
-        } else {
-            if !capabilities
-                .elicitation
-                .as_ref()
-                .is_some_and(|capabilities| capabilities.supports_form())
-            {
-                return Err(
-                    Error::invalid_request().data("the Client does not support form elicitation")
-                );
-            }
-            let schema = v2::ElicitationSchema::new()
-                .title("User input")
-                .description("Provide the requested information.")
-                .string("response", true);
-            v2::ElicitationMode::Form(v2::ElicitationFormMode::new(scope, schema))
-        };
+        let mode =
+            if let Some(url) = arguments.get("url").and_then(Value::as_str) {
+                if !capabilities
+                    .elicitation
+                    .as_ref()
+                    .is_some_and(|capabilities| capabilities.supports_url())
+                {
+                    return Err(Error::invalid_request()
+                        .data("the Client does not support URL elicitation"));
+                }
+                let parsed = reqwest::Url::parse(url)
+                    .map_err(|error| Error::invalid_params().data(error.to_string()))?;
+                if parsed.username() != "" || parsed.password().is_some() {
+                    return Err(Error::invalid_params()
+                        .data("URL elicitations must not contain embedded credentials"));
+                }
+                if parsed.scheme() != "https" && parsed.host_str() != Some("localhost") {
+                    return Err(Error::invalid_params()
+                        .data("URL elicitations require HTTPS outside localhost"));
+                }
+                let elicitation_id = arguments
+                    .get("elicitation_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| format!("elicit-{}", uuid::Uuid::new_v4().simple()));
+                self.base
+                    .store
+                    .reserve_url_elicitation(&session_id.to_string(), &elicitation_id)
+                    .await?;
+                url_elicitation_id = Some(elicitation_id.clone());
+                v2::ElicitationMode::Url(v2::ElicitationUrlMode::new(scope, elicitation_id, url))
+            } else {
+                if !capabilities
+                    .elicitation
+                    .as_ref()
+                    .is_some_and(|capabilities| capabilities.supports_form())
+                {
+                    return Err(Error::invalid_request()
+                        .data("the Client does not support form elicitation"));
+                }
+                let schema = v2::ElicitationSchema::new()
+                    .title("User input")
+                    .description("Provide the requested information.")
+                    .string("response", true);
+                v2::ElicitationMode::Form(v2::ElicitationFormMode::new(scope, schema))
+            };
         Ok((
             v2::CreateElicitationRequest::new(mode, message),
             url_elicitation_id,
