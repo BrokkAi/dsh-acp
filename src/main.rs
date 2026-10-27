@@ -40,7 +40,8 @@ struct Cli {
     #[arg(long, env = "DSH_ACP_PERMISSION_MODE", default_value = "ask")]
     permission_mode: String,
 
-    /// Extra system instructions appended to the built-in harness prompt.
+    /// Extra system instructions added after the built-in harness prompt, or
+    /// after a client prompt that overrides it.
     #[arg(long, env = "DSH_ACP_SYSTEM_PROMPT")]
     system_prompt: Option<String>,
 

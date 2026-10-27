@@ -43,6 +43,7 @@ version's lifecycle and payload shapes.
 | Delete | Implemented | Advertised capability |
 | Additional directories | Implemented | Advertised capability |
 | System prompt append | Implemented | Advertised capability |
+| System prompt override | Implemented | Advertised `mode.override` |
 | Provider configuration | Implemented | Advertised provider capability |
 | MCP stdio | Implemented | Advertised transport |
 | MCP streamable HTTP | Implemented | Advertised transport |
@@ -75,6 +76,30 @@ is sent to DeepSeek as `reasoning_effort`.
 The v1 prompt response and the v2 idle state report only the completed turn's
 token usage, with `_meta["mjolnir.dev/usage-scope"] = "turn"`. Session
 `usage_update` notifications continue to report the cumulative session total.
+
+## Client system prompts
+
+Both protocol versions advertise the unstable `systemPrompt` session
+capability with `mode.override`: `agentCapabilities.sessionCapabilities` in v1
+and `capabilities.session` in v2. The client's prompt is accepted on
+`session/new`, `session/resume`, and `session/fork`, and in v1 also on
+`session/load`.
+
+- `append` adds the client's text at the end of the system prompt, after the
+  built-in harness guidance, the `--system-prompt` text, and the `AGENTS.md`
+  files.
+- `override` replaces the built-in harness guidance and nothing else. The
+  `--system-prompt` text and the `AGENTS.md` files still follow the client's
+  text, and plan mode still adds its instructions. Tools, MCP servers,
+  permissions, and session configuration are unchanged.
+
+Only text content blocks are accepted. A request with another block type or a
+mode other than `append` or `override`, including `_`-prefixed modes, fails
+with `-32602` (Invalid params) and creates, loads, resumes, or forks nothing.
+
+The prompt and its mode are stored with the session. A load, resume, or fork
+that carries `systemPrompt` uses that prompt and mode. One that omits it keeps
+the stored ones, and a fork inherits its source's.
 
 ## Prompt lifecycle
 

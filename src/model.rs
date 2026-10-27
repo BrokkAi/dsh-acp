@@ -316,6 +316,25 @@ pub struct PendingUserMessage {
     pub blocks: Vec<serde_json::Value>,
 }
 
+/// How a client-provided system prompt combines with the harness's own
+/// instructions.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientPromptMode {
+    /// After the built-in harness prompt, launch configuration, and AGENTS.md.
+    #[default]
+    Append,
+    /// In place of the built-in harness prompt.
+    Override,
+}
+
+/// The text of a client-provided ACP system prompt and its mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientSystemPrompt {
+    pub mode: ClientPromptMode,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub id: String,
@@ -329,6 +348,10 @@ pub struct SessionRecord {
     pub config: SessionConfig,
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// How `system_prompt` applies. Records stored before override support
+    /// have no mode and append.
+    #[serde(default)]
+    pub system_prompt_mode: ClientPromptMode,
     #[serde(default)]
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
@@ -356,7 +379,7 @@ impl SessionRecord {
         default_model: String,
         permission_mode: crate::config::PermissionMode,
         reasoning_effort: crate::config::ReasoningEffort,
-        system_prompt: Option<String>,
+        system_prompt: Option<ClientSystemPrompt>,
         parent_session_id: Option<String>,
     ) -> Self {
         let now = chrono::Utc::now();
@@ -374,7 +397,11 @@ impl SessionRecord {
                 network: true,
                 reasoning_effort,
             },
-            system_prompt,
+            system_prompt_mode: system_prompt
+                .as_ref()
+                .map(|prompt| prompt.mode)
+                .unwrap_or_default(),
+            system_prompt: system_prompt.map(|prompt| prompt.text),
             messages: Vec::new(),
             prompt_blocks: BTreeMap::new(),
             message_ids: BTreeMap::new(),
@@ -385,6 +412,18 @@ impl SessionRecord {
             context_used: 0,
             parent_session_id,
         }
+    }
+
+    pub fn client_system_prompt(&self) -> Option<ClientSystemPrompt> {
+        self.system_prompt.clone().map(|text| ClientSystemPrompt {
+            mode: self.system_prompt_mode,
+            text,
+        })
+    }
+
+    pub fn set_client_system_prompt(&mut self, prompt: ClientSystemPrompt) {
+        self.system_prompt_mode = prompt.mode;
+        self.system_prompt = Some(prompt.text);
     }
 
     pub fn install_system_prompt(&mut self, prompt: String) {

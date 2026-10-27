@@ -34,9 +34,9 @@ use crate::{
     config::ReasoningEffort,
     deepseek::{Completion, StreamEvent},
     model::{
-        ChatMessage, ContentPart, ImageUrl, MessageContent, PendingUserMessage,
-        PersistedCompaction, PersistedDiff, Role, SessionRecord, SessionRuntime, TokenUsage,
-        ToolOutcomeStatus, ensure_session_unique_tool_call_ids,
+        ChatMessage, ClientPromptMode, ClientSystemPrompt, ContentPart, ImageUrl, MessageContent,
+        PendingUserMessage, PersistedCompaction, PersistedDiff, Role, SessionRecord,
+        SessionRuntime, TokenUsage, ToolOutcomeStatus, ensure_session_unique_tool_call_ids,
     },
     session::session_title,
     tools::{
@@ -301,7 +301,12 @@ impl V2Harness {
             .delete(v2::SessionDeleteCapabilities::new())
             .additional_directories(v2::SessionAdditionalDirectoriesCapabilities::new())
             .fork(v2::SessionForkCapabilities::new())
-            .system_prompt(v2::SessionSystemPromptCapabilities::new());
+            .system_prompt(
+                v2::SessionSystemPromptCapabilities::new().mode(
+                    v2::SessionSystemPromptModeCapabilities::new()
+                        .override_(v2::SessionSystemPromptOverrideCapabilities::new()),
+                ),
+            );
         let capabilities = AgentCapabilities::new()
             .session(session_capabilities)
             .providers(ProvidersCapabilities::new());
@@ -429,7 +434,7 @@ impl V2Harness {
         if !self.initialized.load(Ordering::Acquire) {
             return responder.respond_with_error(Error::invalid_request().data("initialize first"));
         }
-        let system_prompt = match v2_system_prompt_text(request.system_prompt.as_ref()) {
+        let system_prompt = match v2_client_system_prompt(request.system_prompt.as_ref()) {
             Ok(prompt) => prompt,
             Err(error) => return responder.respond_with_error(error),
         };
@@ -513,7 +518,7 @@ impl V2Harness {
             return responder
                 .respond_with_error(Error::invalid_params().data("unsupported replay cursor"));
         }
-        let system_prompt = match v2_system_prompt_text(request.system_prompt.as_ref()) {
+        let system_prompt = match v2_client_system_prompt(request.system_prompt.as_ref()) {
             Ok(prompt) => prompt,
             Err(error) => return responder.respond_with_error(error),
         };
@@ -606,8 +611,8 @@ impl V2Harness {
                 request.cwd.0.display()
             )));
         }
-        let system_prompt = match v2_system_prompt_text(request.system_prompt.as_ref()) {
-            Ok(prompt) => prompt.or(source.system_prompt.clone()),
+        let system_prompt = match v2_client_system_prompt(request.system_prompt.as_ref()) {
+            Ok(prompt) => prompt.or_else(|| source.client_system_prompt()),
             Err(error) => return responder.respond_with_error(error),
         };
         let runtime = match self
@@ -2614,15 +2619,22 @@ fn absolute_paths(paths: Vec<v2::AbsolutePath>) -> Vec<PathBuf> {
         .collect()
 }
 
-fn v2_system_prompt_text(prompt: Option<&v2::SystemPrompt>) -> Result<Option<String>, Error> {
+fn v2_client_system_prompt(
+    prompt: Option<&v2::SystemPrompt>,
+) -> Result<Option<ClientSystemPrompt>, Error> {
     let Some(prompt) = prompt else {
         return Ok(None);
     };
-    if !matches!(prompt.mode, v2::SystemPromptMode::Append) {
-        return Err(
-            Error::invalid_params().data("only append mode is supported for client system prompts")
-        );
-    }
+    let mode = match &prompt.mode {
+        v2::SystemPromptMode::Append => ClientPromptMode::Append,
+        v2::SystemPromptMode::Override => ClientPromptMode::Override,
+        mode => {
+            return Err(Error::invalid_params().data(format!(
+                "unsupported client system prompt mode {}; this agent supports append and override",
+                serde_json::to_string(mode).unwrap_or_default()
+            )));
+        }
+    };
     let text = prompt
         .content
         .iter()
@@ -2632,7 +2644,7 @@ fn v2_system_prompt_text(prompt: Option<&v2::SystemPrompt>) -> Result<Option<Str
         })
         .collect::<Result<Vec<_>, _>>()?
         .join("\n\n");
-    Ok(Some(text))
+    Ok(Some(ClientSystemPrompt { mode, text }))
 }
 
 struct V2PromptPayload {

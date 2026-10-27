@@ -9,8 +9,8 @@ use agent_client_protocol::Error;
 use tokio::sync::Mutex;
 
 use crate::{
-    config::Config,
-    model::{Role, SessionRecord, SessionRuntime},
+    config::{BUILT_IN_SYSTEM_PROMPT, Config},
+    model::{ClientPromptMode, ClientSystemPrompt, Role, SessionRecord, SessionRuntime},
 };
 
 const MAX_INSTRUCTION_BYTES: u64 = 1024 * 1024;
@@ -22,7 +22,7 @@ pub struct SessionStore {
     sessions: Arc<Mutex<HashMap<String, SessionRuntime>>>,
     deleted: Arc<Mutex<std::collections::HashSet<String>>>,
     write_lock: Arc<Mutex<()>>,
-    system_prompt: Arc<str>,
+    configured_prompt: Option<Arc<str>>,
     default_model: Arc<str>,
     default_permission: crate::config::PermissionMode,
     default_reasoning_effort: crate::config::ReasoningEffort,
@@ -47,7 +47,7 @@ impl SessionStore {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             deleted: Arc::new(Mutex::new(std::collections::HashSet::new())),
             write_lock: Arc::new(Mutex::new(())),
-            system_prompt: Arc::from(config.built_in_system_prompt()),
+            configured_prompt: config.configured_system_prompt().map(Arc::from),
             default_model: Arc::from(config.default_model.as_str()),
             default_permission: config.permission_mode,
             default_reasoning_effort: config.reasoning_effort,
@@ -58,7 +58,7 @@ impl SessionStore {
         &self,
         cwd: PathBuf,
         additional_directories: Vec<PathBuf>,
-        system_prompt: Option<String>,
+        system_prompt: Option<ClientSystemPrompt>,
         parent_session_id: Option<String>,
     ) -> Result<SessionRuntime, Error> {
         validate_roots(&cwd, &additional_directories)?;
@@ -195,7 +195,28 @@ impl SessionStore {
     }
 
     pub fn effective_system_prompt(&self, record: &SessionRecord) -> Result<String, Error> {
-        let mut prompt = self.system_prompt.to_string();
+        // An override replaces only the harness's own text. Launch
+        // configuration and AGENTS.md files still follow it.
+        let (mut prompt, appended) = match record.client_system_prompt() {
+            Some(ClientSystemPrompt {
+                mode: ClientPromptMode::Override,
+                mut text,
+            }) => {
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                (text, None)
+            }
+            client => (
+                BUILT_IN_SYSTEM_PROMPT.to_string(),
+                client.map(|prompt| prompt.text),
+            ),
+        };
+        if let Some(extra) = &self.configured_prompt {
+            prompt.push_str("\nAdditional user-configured instructions:\n");
+            prompt.push_str(extra);
+            prompt.push('\n');
+        }
         let mut seen = std::collections::HashSet::new();
         let roots = std::iter::once(self.data_dir.as_path())
             .chain(std::iter::once(record.cwd.as_path()))
@@ -214,9 +235,9 @@ impl SessionStore {
                 prompt.push('\n');
             }
         }
-        if let Some(system_prompt) = &record.system_prompt {
+        if let Some(appended) = appended {
             prompt.push_str("\nClient-provided system instructions:\n");
-            prompt.push_str(system_prompt);
+            prompt.push_str(&appended);
             prompt.push('\n');
         }
         Ok(prompt)
@@ -226,12 +247,12 @@ impl SessionStore {
         &self,
         record: &mut SessionRecord,
         additional_directories: Vec<PathBuf>,
-        system_prompt: Option<String>,
+        system_prompt: Option<ClientSystemPrompt>,
     ) -> Result<(), Error> {
         let mut candidate = record.clone();
         candidate.additional_directories = additional_directories;
         if let Some(system_prompt) = system_prompt {
-            candidate.system_prompt = Some(system_prompt);
+            candidate.set_client_system_prompt(system_prompt);
         }
         self.rebuild_system_prompt(&mut candidate)?;
         *record = candidate;
@@ -482,7 +503,10 @@ mod tests {
             .create(
                 workspace.clone(),
                 vec![extra],
-                Some("client instructions".to_string()),
+                Some(ClientSystemPrompt {
+                    mode: ClientPromptMode::Append,
+                    text: "client instructions".to_string(),
+                }),
                 None,
             )
             .await
@@ -509,6 +533,97 @@ mod tests {
         let refreshed = store.effective_system_prompt(&record).unwrap();
         assert!(refreshed.contains("workspace instructions v2"));
         assert!(!refreshed.contains("workspace instructions v1"));
+    }
+
+    #[tokio::test]
+    async fn an_override_replaces_only_the_built_in_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(data_dir.join("AGENTS.md"), "user-level instructions\n").unwrap();
+        std::fs::write(workspace.join("AGENTS.md"), "workspace instructions\n").unwrap();
+        let config = Config {
+            api_key: None,
+            base_url: "http://localhost".to_string(),
+            default_model: "deepseek-flash".to_string(),
+            models: vec!["deepseek-flash".to_string()],
+            data_dir,
+            permission_mode: PermissionMode::Ask,
+            system_prompt: Some("launch instructions".to_string()),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::High,
+            context_chars: 1000,
+            tool_output_bytes: 1000,
+            http_timeout: std::time::Duration::from_secs(1),
+            disable_web: true,
+            trace: false,
+        };
+        let store = SessionStore::open(&config).await.unwrap();
+        let runtime = store
+            .create(
+                workspace,
+                Vec::new(),
+                Some(ClientSystemPrompt {
+                    mode: ClientPromptMode::Override,
+                    text: "client persona".to_string(),
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        let record = runtime.snapshot().await;
+        let prompt = record.messages[0].text_content().unwrap();
+        assert!(prompt.starts_with("client persona\n"), "{prompt}");
+        assert!(!prompt.contains(BUILT_IN_SYSTEM_PROMPT), "{prompt}");
+        assert!(!prompt.contains("Client-provided system instructions"));
+        let positions = [
+            prompt.find("launch instructions").unwrap(),
+            prompt.find("user-level instructions").unwrap(),
+            prompt.find("workspace instructions").unwrap(),
+        ];
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let mut appended = record.clone();
+        store
+            .update_session_instructions(
+                &mut appended,
+                Vec::new(),
+                Some(ClientSystemPrompt {
+                    mode: ClientPromptMode::Append,
+                    text: "client persona".to_string(),
+                }),
+            )
+            .unwrap();
+        let prompt = appended.messages[0].text_content().unwrap();
+        assert!(prompt.starts_with(BUILT_IN_SYSTEM_PROMPT), "{prompt}");
+        assert!(prompt.ends_with("Client-provided system instructions:\nclient persona\n"));
+    }
+
+    #[test]
+    fn a_stored_client_prompt_without_a_mode_appends() {
+        let record: SessionRecord = serde_json::from_value(serde_json::json!({
+            "id": "dsh-1",
+            "cwd": "/tmp",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "config": {
+                "model": "deepseek-flash",
+                "mode": "agent",
+                "permission_mode": "ask",
+                "network": true
+            },
+            "system_prompt": "client instructions"
+        }))
+        .unwrap();
+        assert_eq!(
+            record.client_system_prompt(),
+            Some(ClientSystemPrompt {
+                mode: ClientPromptMode::Append,
+                text: "client instructions".to_string(),
+            })
+        );
     }
 
     #[cfg(unix)]
@@ -615,7 +730,10 @@ mod tests {
             .create(
                 workspace.clone(),
                 Vec::new(),
-                Some("client instructions v1".to_string()),
+                Some(ClientSystemPrompt {
+                    mode: ClientPromptMode::Append,
+                    text: "client instructions v1".to_string(),
+                }),
                 None,
             )
             .await
@@ -629,7 +747,10 @@ mod tests {
                 .update_session_instructions(
                     &mut record,
                     vec![extra],
-                    Some("client instructions v2".to_string()),
+                    Some(ClientSystemPrompt {
+                        mode: ClientPromptMode::Override,
+                        text: "client instructions v2".to_string(),
+                    }),
                 )
                 .is_err()
         );
@@ -640,6 +761,7 @@ mod tests {
                 .unwrap()
                 .contains("client instructions v1")
         );
+        assert_eq!(record.system_prompt_mode, ClientPromptMode::Append);
         assert!(record.additional_directories.is_empty());
         assert_eq!(record.messages[0], original_prompt);
     }
