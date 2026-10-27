@@ -30,7 +30,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    agent::{Harness, with_extra_capabilities},
+    agent::{Harness, steering_params, with_extra_capabilities},
     auth_status,
     config::ReasoningEffort,
     deepseek::{Completion, StreamEvent},
@@ -968,34 +968,10 @@ impl V2Harness {
         responder: agent_client_protocol::Responder<Value>,
         connection: V2ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
-        let session_id = params
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .filter(|session_id| !session_id.is_empty())
-            .ok_or_else(|| {
-                Error::invalid_params().data("steering requires a non-empty sessionId")
-            })?;
-        let prompt = params
-            .get("prompt")
-            .cloned()
-            .ok_or_else(|| Error::invalid_params().data("steering requires prompt content"))?;
-        let prompt = serde_json::from_value::<Vec<ContentBlock>>(prompt)
-            .map_err(|error| Error::invalid_params().data(error.to_string()))?;
-        if prompt.is_empty() {
-            return responder.respond_with_error(
-                Error::invalid_params().data("steering prompt must not be empty"),
-            );
-        }
-        let idle_behavior = params
-            .pointer("/_meta/steering/idleBehavior")
-            .and_then(Value::as_str);
-        if let Some(idle_behavior) = idle_behavior
-            && idle_behavior != "promptRequired"
-        {
-            return responder.respond_with_error(
-                Error::invalid_params().data("unsupported steering idleBehavior"),
-            );
-        }
+        let (session_id, prompt, idle_behavior) = match steering_params::<ContentBlock>(&params) {
+            Ok(params) => params,
+            Err(error) => return responder.respond_with_error(error),
+        };
         let session_id = v2::SessionId::new(session_id.to_string());
         let runtime = match self.base.store.get(&session_id.to_string()).await {
             Ok(runtime) => runtime,

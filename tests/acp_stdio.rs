@@ -1015,6 +1015,155 @@ async fn malformed_session_status_params_are_answered_and_the_connection_keeps_s
     }
 }
 
+/// The `initialize` params for ACP `version` 1 or 2.
+fn initialize_params(version: u64) -> Value {
+    if version == 1 {
+        json!({"protocolVersion": 1, "clientCapabilities": {}})
+    } else {
+        json!({
+            "protocolVersion": 2,
+            "info": {"name": "rejection-test-client", "version": "1.0.0"},
+            "capabilities": {}
+        })
+    }
+}
+
+/// Requests with invalid params, each answered with `-32602`: typed methods
+/// the SDK rejects while parsing their params, and every `_session/steering`
+/// check the agent makes itself. The session ID is never looked up.
+fn rejected_requests(version: u64) -> Vec<(&'static str, Value)> {
+    let session_methods: &[&str] = if version == 1 {
+        &["session/new", "session/load", "session/resume"]
+    } else {
+        &["session/new", "session/resume"]
+    };
+    let mut requests: Vec<_> = session_methods
+        .iter()
+        .map(|method| (*method, json!({"cwd": 5})))
+        .collect();
+    let text = json!([{"type": "text", "text": "steer"}]);
+    for params in [
+        json!({}),
+        json!({"sessionId": ""}),
+        json!({"sessionId": "dsh-x"}),
+        json!({"sessionId": "dsh-x", "prompt": "steer"}),
+        json!({"sessionId": "dsh-x", "prompt": []}),
+        json!({
+            "sessionId": "dsh-x",
+            "prompt": text,
+            "_meta": {"steering": {"idleBehavior": "queue"}}
+        }),
+    ] {
+        requests.push(("_session/steering", params));
+    }
+    requests
+}
+
+#[tokio::test]
+async fn rejected_requests_log_little_and_the_connection_keeps_serving() {
+    for version in [1, 2] {
+        let temp = tempfile::tempdir().unwrap();
+        let stderr_path = temp.path().join("stderr.log");
+        let stderr = std::fs::File::create(&stderr_path).unwrap();
+        let mut peer = spawn_peer_with_stderr(temp.path(), None, &[], stderr.into()).await;
+        peer.request("initialize", initialize_params(version)).await;
+        let requests = rejected_requests(version);
+        for (method, params) in &requests {
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                peer.request_error(method, params.clone()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("v{version}: no reply to {method} {params}"));
+            assert_eq!(
+                error["code"], -32602,
+                "v{version}: {method} {params}: {error}"
+            );
+        }
+        let list = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            peer.request("session/list", json!({})),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("v{version}: session/list went unanswered"));
+        assert!(list["sessions"].is_array(), "v{version}: {list}");
+
+        drop(peer.stdin);
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait())
+            .await
+            .expect("server exits on EOF")
+            .unwrap();
+        assert!(exit.success(), "v{version}: server exited with {exit}");
+
+        // Each rejection used to log about 1 MB: the SDK's warning for a
+        // handler that returned an error describes the whole handler chain,
+        // escaped again at every link (#53). The SDK's warning for the error
+        // response it sends stays, so the rejections are still logged.
+        let logged = std::fs::read_to_string(&stderr_path).unwrap();
+        assert!(
+            logged.len() < 16 * 1024,
+            "v{version}: {} rejections logged {} bytes",
+            requests.len(),
+            logged.len()
+        );
+        for (method, _) in &requests {
+            assert!(logged.contains(method), "v{version}: {method}: {logged}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_burst_of_rejected_requests_does_not_fill_an_unread_stderr_pipe() {
+    // Each rejection still logs one warning of a few hundred bytes. Linux
+    // pipes hold 64 KiB, but macOS and Windows pipes can hold much less, so
+    // the burst is smaller there. Before #53 a single rejection logged about
+    // 1 MB, which filled any pipe and stalled the connection.
+    let burst = if cfg!(target_os = "linux") { 50 } else { 6 };
+    for version in [1, 2] {
+        let temp = tempfile::tempdir().unwrap();
+        // Piped and never read, like a client that ignores stderr.
+        let mut peer = spawn_peer_with_stderr(temp.path(), None, &[], Stdio::piped()).await;
+        peer.request("initialize", initialize_params(version)).await;
+        let first_id = peer.next_id;
+        let requests: Vec<Value> = rejected_requests(version)
+            .into_iter()
+            .cycle()
+            .take(burst)
+            .zip(first_id..)
+            .map(|((method, params), id)| {
+                json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+            })
+            .collect();
+        peer.next_id += burst as u64;
+        peer.write_together(&requests).await;
+        let mut unanswered: std::collections::BTreeSet<u64> = (first_id..peer.next_id).collect();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !unanswered.is_empty() {
+                let reply = peer.next_message().await;
+                let id = reply["id"].as_u64().expect("a response");
+                assert_eq!(reply["error"]["code"], -32602, "v{version}: {reply}");
+                assert!(unanswered.remove(&id), "v{version}: {reply}");
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("v{version}: unanswered: {unanswered:?}"));
+        let list = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            peer.request("session/list", json!({})),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("v{version}: session/list went unanswered"));
+        assert!(list["sessions"].is_array(), "v{version}: {list}");
+
+        drop(peer.stdin);
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait())
+            .await
+            .expect("server exits on EOF")
+            .unwrap();
+        assert!(exit.success(), "v{version}: server exited with {exit}");
+    }
+}
+
 #[tokio::test]
 async fn v2_session_status_answers_while_an_mcp_call_is_in_flight() {
     let temp = tempfile::tempdir().unwrap();
@@ -1439,7 +1588,10 @@ async fn spawn_peer_with_options(
         .args(extra_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(stderr);
+        .stderr(stderr)
+        // The default log filter, whatever the test's environment: tests that
+        // pipe stderr depend on how much the server logs.
+        .env_remove("RUST_LOG");
     if let Some(base_url) = base_url {
         command
             .arg("--base-url")

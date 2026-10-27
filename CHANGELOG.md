@@ -144,6 +144,17 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   turn: an ACP v1 `session/prompt` failed with `-32603`, and an ACP v2 turn
   ended with stop reason `error`. In both versions it now fails like a call to
   any other unknown MCP tool, and the turn continues.
+- Each request or notification rejected for invalid params, such as
+  `session/new` with a non-string `cwd` or `_session/steering` without a
+  `sessionId`, wrote about 1 MB to stderr. The SDK's `Handler errored` warning
+  describes every registered handler, escaped again for each one. A client
+  that piped stderr without reading it stalled after the first rejection: the
+  server blocked writing the log and stopped answering. The default log filter
+  now drops the SDK's warnings that describe its handler chain, so a rejection
+  logs one line of a few hundred bytes, the SDK's warning for the error
+  response it sends. `_session/steering` now answers invalid params itself,
+  like the other hand-rolled methods. A `RUST_LOG` setting still replaces the
+  default filter.
 
 ## 0.4.0 - 2026-10-25
 

@@ -112,14 +112,31 @@ impl ProviderRouting {
     }
 }
 
-pub async fn run(config: Config) -> agent_client_protocol::Result<()> {
-    let filter = if config.trace {
-        tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("dsh_acp=trace,info"))
+/// Drops the SDK's events that carry a `handler` field, such as the `Handler
+/// errored` warning it logs whenever a handler returns an error, including
+/// when it rejects a request's params. The field describes the whole handler
+/// chain, escaped again at each link, so it comes to about 1 MB per rejected
+/// message: enough to fill a stderr pipe the client does not drain and stall
+/// the connection (#53). The SDK's other warnings still pass, including the
+/// `Sending error response` warning with the method, id, and error code of
+/// each rejected request.
+const HANDLER_CHAIN_FILTER: &str =
+    "agent_client_protocol::jsonrpc::incoming_actor[{handler}]=error";
+
+/// The log filter used when `RUST_LOG` is unset. `RUST_LOG` replaces it
+/// entirely, so it can still enable the SDK's handler-chain events.
+fn default_log_filter(trace: bool) -> String {
+    let levels = if trace {
+        "dsh_acp=trace,info"
     } else {
-        tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("dsh_acp=info,warn"))
+        "dsh_acp=info,warn"
     };
+    format!("{levels},{HANDLER_CHAIN_FILTER}")
+}
+
+pub async fn run(config: Config) -> agent_client_protocol::Result<()> {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_log_filter(config.trace)));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
@@ -405,6 +422,38 @@ pub(crate) fn with_extra_capabilities(
             .insert((*name).to_string(), value.clone());
     }
     Ok(response)
+}
+
+/// The session ID, prompt, and idle behavior of a `_session/steering`
+/// request, in either protocol version's content blocks.
+///
+/// Handlers answer the error with `respond_with_error`. Returning it from the
+/// handler instead also gets it answered, but the SDK then logs its oversized
+/// `Handler errored` warning (#53).
+pub(crate) fn steering_params<Block: serde::de::DeserializeOwned>(
+    params: &Value,
+) -> Result<(&str, Vec<Block>, Option<&str>), Error> {
+    let session_id = params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|session_id| !session_id.is_empty())
+        .ok_or_else(|| Error::invalid_params().data("steering requires a non-empty sessionId"))?;
+    let prompt = params
+        .get("prompt")
+        .cloned()
+        .ok_or_else(|| Error::invalid_params().data("steering requires prompt content"))?;
+    let prompt = serde_json::from_value::<Vec<Block>>(prompt)
+        .map_err(|error| Error::invalid_params().data(error.to_string()))?;
+    if prompt.is_empty() {
+        return Err(Error::invalid_params().data("steering prompt must not be empty"));
+    }
+    let idle_behavior = params
+        .pointer("/_meta/steering/idleBehavior")
+        .and_then(Value::as_str);
+    if idle_behavior.is_some_and(|idle_behavior| idle_behavior != "promptRequired") {
+        return Err(Error::invalid_params().data("unsupported steering idleBehavior"));
+    }
+    Ok((session_id, prompt, idle_behavior))
 }
 
 /// Stdio as a transport the protocol router can finish.
@@ -1124,34 +1173,10 @@ impl Harness {
         responder: agent_client_protocol::Responder<Value>,
         connection: ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
-        let session_id = params
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .filter(|session_id| !session_id.is_empty())
-            .ok_or_else(|| {
-                Error::invalid_params().data("steering requires a non-empty sessionId")
-            })?;
-        let prompt = params
-            .get("prompt")
-            .cloned()
-            .ok_or_else(|| Error::invalid_params().data("steering requires prompt content"))?;
-        let prompt = serde_json::from_value::<Vec<ContentBlock>>(prompt)
-            .map_err(|error| Error::invalid_params().data(error.to_string()))?;
-        if prompt.is_empty() {
-            return responder.respond_with_error(
-                Error::invalid_params().data("steering prompt must not be empty"),
-            );
-        }
-        let idle_behavior = params
-            .pointer("/_meta/steering/idleBehavior")
-            .and_then(Value::as_str);
-        if let Some(idle_behavior) = idle_behavior
-            && idle_behavior != "promptRequired"
-        {
-            return responder.respond_with_error(
-                Error::invalid_params().data("unsupported steering idleBehavior"),
-            );
-        }
+        let (session_id, prompt, idle_behavior) = match steering_params::<ContentBlock>(&params) {
+            Ok(params) => params,
+            Err(error) => return responder.respond_with_error(error),
+        };
         let session_id = SessionId::new(session_id.to_string());
         let runtime = match self.store.get(&session_id.to_string()).await {
             Ok(runtime) => runtime,
@@ -3132,4 +3157,83 @@ fn truncate_text(value: &str, max_bytes: usize) -> String {
         boundary -= 1;
     }
     format!("{}\n[...truncated...]", &value[..boundary])
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    /// A `tracing` writer that keeps what it is given.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What the default filter writes for warnings like the SDK's own.
+    fn logged_by_default_filter(trace: bool) -> String {
+        let filter = tracing_subscriber::EnvFilter::try_new(default_log_filter(trace))
+            .expect("the default log filter parses");
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer({
+                let captured = captured.clone();
+                move || captured.clone()
+            })
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(
+                target: "agent_client_protocol::jsonrpc::incoming_actor",
+                method = "session/new",
+                handler = "(chain)",
+                "handler-chain warning"
+            );
+            tracing::warn!(
+                target: "agent_client_protocol::jsonrpc::incoming_actor",
+                id = 7,
+                "other incoming warning"
+            );
+            tracing::error!(
+                target: "agent_client_protocol::jsonrpc::incoming_actor",
+                handler = "(chain)",
+                "handler-chain error"
+            );
+            tracing::warn!(
+                target: "agent_client_protocol::jsonrpc::outgoing_actor",
+                method = "session/new",
+                "error response warning"
+            );
+            tracing::info!(target: "dsh_acp::agent", "own info");
+        });
+        let logged = captured.0.lock().unwrap().clone();
+        String::from_utf8(logged).unwrap()
+    }
+
+    #[test]
+    fn the_default_log_filter_drops_only_sdk_handler_chain_warnings() {
+        for trace in [false, true] {
+            let logged = logged_by_default_filter(trace);
+            assert!(!logged.contains("handler-chain warning"), "{logged}");
+            for kept in [
+                "other incoming warning",
+                "handler-chain error",
+                "error response warning",
+                "own info",
+            ] {
+                assert!(logged.contains(kept), "trace {trace}: {kept}: {logged}");
+            }
+        }
+    }
 }
