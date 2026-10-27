@@ -75,8 +75,9 @@ struct Cli {
     #[arg(long, env = "DSH_ACP_HTTP_TIMEOUT_SECS", default_value_t = 180)]
     http_timeout_secs: u64,
 
-    /// Seconds each MCP server has to start, finish the MCP handshake, and
-    /// list its tools when a session is created, loaded, resumed, or forked.
+    /// Seconds each stdio or HTTP MCP server has to start, finish the MCP
+    /// handshake, and list its tools when a session is created, loaded,
+    /// resumed, or forked.
     #[arg(long, env = "DSH_ACP_MCP_CONNECT_TIMEOUT_SECS", default_value_t = 60)]
     mcp_connect_timeout_secs: u64,
 

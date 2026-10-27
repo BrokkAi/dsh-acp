@@ -61,7 +61,7 @@ version's lifecycle and payload shapes.
 | Compaction | Implemented | Baseline v2; negotiated in v1 |
 | Notices | Implemented for MCP refresh failures | v2 baseline; negotiated in v1 |
 | Subagents | Not implemented | Draft |
-| MCP-over-ACP | Not implemented | Draft |
+| MCP-over-ACP | Implemented (draft RFD) | Advertised transport |
 | ACP Streamable HTTP transport | Not implemented | Draft |
 
 Audio is intentionally not advertised because the DeepSeek input API used by
@@ -289,8 +289,8 @@ A command that runs in the client's terminal puts that terminal in its tool
 call as soon as the client creates it. The final update keeps the terminal and
 adds the result text only if the command failed; replay after `session/load`
 shows the result text, because the terminal has been released.
-ACP v2 has no client filesystem or terminal execution methods; use an MCP server
-for client-provided tools.
+ACP v2 has no client filesystem or terminal execution methods; use an MCP server,
+such as an MCP-over-ACP server, for client-provided tools.
 
 ## Elicitation
 
@@ -329,3 +329,55 @@ Pending and reserved IDs are dropped without a completion when the session is
 closed or deleted, or when the process exits. Replay does not resend
 `elicitation/complete`, and a fork does not inherit the source session's
 pending IDs.
+
+## MCP-over-ACP
+
+MCP-over-ACP lets the client serve MCP tools over the ACP connection itself.
+It follows the [MCP-over-ACP RFD](https://agentclientprotocol.com/rfds/mcp-over-acp),
+which is a draft and may still change. Both protocol versions advertise it:
+`agentCapabilities.mcpCapabilities.acp: true` in v1 and
+`capabilities.session.mcp.acp: {}` in v2.
+
+The client declares a server with `"type": "acp"`, a `name`, and the
+`serverId` it generated, in `session/new`, `session/resume`, `session/fork`,
+or v1 `session/load`. A request that declares one `serverId` twice fails with
+`-32602`. The client of the connection that sent the declaration serves the
+server. A later load or resume uses the servers that request declares, as for
+other transports. A v2 `session/resume` that omits `mcpServers` keeps the
+session's current servers.
+
+Each MCP operation is one `mcp/message` request to the client, in the
+connection's protocol version. It targets MCP revision 2026-07-28 only and
+carries a fresh `requestId` and its own `_meta`: the protocol version, empty
+`clientCapabilities`, and `clientInfo`. There is no MCP `initialize`. The agent
+sends `tools/list`, following `nextCursor`, and `tools/call`.
+
+The server is not contacted while a session is set up. A lifecycle request is
+answered from the connection's ordered dispatch, so the client's reply to a
+`tools/list` could not be read until the request had returned. Instead, the
+tools are listed at the start of each model round, as other MCP servers' tools
+are refreshed. `--mcp-connect-timeout-secs` therefore does not apply. The tools
+are named `mcp__<name>__<tool>`, hidden in plan mode unless they are marked
+`annotations.readOnlyHint: true`, and ask permission like other MCP tools.
+
+Tools are listed server by server. A server whose listing fails keeps the
+tools its last listing found, or none if it was never listed, so it cannot
+hide other servers' tools. A server the client reports it no longer serves
+(`-33001`) loses its tools. The refresh notice names each server that failed.
+
+Each of these fails only the tool call, or that server's tool listing, which
+is reported as a notice. None ends the turn:
+
+- an ACP error response to `mcp/message`, such as `-33001` for a `serverId`
+  the client does not serve;
+- an MCP error inside a successful response. Its code is MCP's, so a code
+  that equals an ACP one, such as `-32800` or `-32000`, means nothing to ACP;
+- an `input_required` result. The agent declares no MCP client capabilities
+  and does not answer multi round-trip requests.
+
+A tool result with `isError: true` is reported as a failed tool call.
+
+Cancelling the turn withdraws an outstanding `mcp/message` with
+`$/cancel_request` for its ACP request ID, and the turn ends without waiting
+for the client to answer. The agent sends no progress token. It ignores
+`mcp/message` notifications from the client.
