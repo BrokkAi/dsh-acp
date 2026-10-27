@@ -3340,24 +3340,22 @@ async fn cancel_request_withdraws_a_pending_permission_and_fails_its_tool_call()
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
     assert_eq!(server.await.unwrap().len(), 1);
 
-    // The failed tool call was saved: a new process replays it as failed.
-    let mut peer = spawn_peer(temp.path(), None).await;
-    peer_raw_initialize(&mut peer).await;
-    peer.request(
-        "session/load",
-        json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []}),
+    // The turn itself saved the failed outcome. Reading the record from disk
+    // matters: loading a session also marks unanswered tool calls failed, so
+    // replay would look the same if nothing had been saved.
+    let saved: Value = serde_json::from_slice(
+        &std::fs::read(
+            temp.path()
+                .join("sessions-data/sessions")
+                .join(format!("{session_id}.json")),
+        )
+        .unwrap(),
     )
-    .await;
-    let replayed = peer
-        .updates
-        .iter()
-        .map(|update| &update["params"]["update"])
-        .rfind(|update| update["toolCallId"] == "call-1")
-        .unwrap();
-    assert_eq!(replayed["status"], "failed");
-
-    drop(peer.stdin);
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    .unwrap();
+    assert_eq!(
+        saved["tool_outcomes"]["call-1"]["status"], "failed",
+        "{saved}"
+    );
 }
 
 #[tokio::test]
