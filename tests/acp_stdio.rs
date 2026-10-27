@@ -2766,43 +2766,64 @@ async fn a_blank_api_key_fails_locally_without_calling_the_model() {
         }
     }
 
-    // A provider Authorization header still stands in for a blank key.
-    let temp = tempfile::tempdir().unwrap();
-    let mut peer = spawn_peer_with_api_key(temp.path(), Some(&base_url), Some("   "), &[]).await;
-    peer.request("initialize", json!({"protocolVersion": 1}))
-        .await;
-    peer.request(
-        "providers/set",
-        json!({
-            "providerId": "deepseek",
-            "apiType": "openai",
-            "baseUrl": base_url,
-            "headers": {"Authorization": "Bearer provider-key"}
-        }),
-    )
-    .await;
-    let session = peer
-        .request(
-            "session/new",
-            json!({"cwd": temp.path().to_string_lossy(), "mcpServers": []}),
-        )
-        .await;
-    let response = peer
-        .request(
-            "session/prompt",
-            json!({
-                "sessionId": session["sessionId"],
-                "prompt": [{"type": "text", "text": "hello"}]
-            }),
-        )
-        .await;
-    assert_eq!(response["stopReason"], "end_turn");
-    drop(peer.stdin);
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
-    assert_eq!(
-        authorizations.try_recv().unwrap(),
-        Some("Bearer provider-key".to_string())
-    );
+    // A non-blank key is sent unchanged, and a provider Authorization header
+    // still stands in for a blank key.
+    let cases = [
+        (
+            "non-blank DEEPSEEK_API_KEY",
+            "test-key",
+            None,
+            "Bearer test-key",
+        ),
+        (
+            "provider Authorization header",
+            "   ",
+            Some("Bearer provider-key"),
+            "Bearer provider-key",
+        ),
+    ];
+    for (case, api_key, provider_authorization, expected) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let mut peer =
+            spawn_peer_with_api_key(temp.path(), Some(&base_url), Some(api_key), &[]).await;
+        peer.request("initialize", json!({"protocolVersion": 1}))
+            .await;
+        if let Some(authorization) = provider_authorization {
+            peer.request(
+                "providers/set",
+                json!({
+                    "providerId": "deepseek",
+                    "apiType": "openai",
+                    "baseUrl": base_url,
+                    "headers": {"Authorization": authorization}
+                }),
+            )
+            .await;
+        }
+        let session = peer
+            .request(
+                "session/new",
+                json!({"cwd": temp.path().to_string_lossy(), "mcpServers": []}),
+            )
+            .await;
+        let response = peer
+            .request(
+                "session/prompt",
+                json!({
+                    "sessionId": session["sessionId"],
+                    "prompt": [{"type": "text", "text": "hello"}]
+                }),
+            )
+            .await;
+        assert_eq!(response["stopReason"], "end_turn", "{case}");
+        drop(peer.stdin);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+        assert_eq!(
+            authorizations.try_recv().ok(),
+            Some(Some(expected.to_string())),
+            "{case}"
+        );
+    }
 }
 
 #[tokio::test]
