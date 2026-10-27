@@ -614,6 +614,56 @@ async fn stdio_negotiates_acp_v2_and_uses_async_prompt_lifecycle() {
     assert!(status.success(), "server exited with {status}");
 }
 
+#[tokio::test]
+async fn a_rejected_initialize_is_answered_before_the_server_exits() {
+    let temp = tempfile::tempdir().unwrap();
+    let cases = [
+        (Some(json!(0)), -32022),
+        (None, -32602),
+        (Some(json!("2")), -32602),
+        (Some(Value::Null), -32602),
+        (Some(json!(-1)), -32602),
+        (Some(json!(65536)), -32602),
+    ];
+    for (protocol_version, code) in cases {
+        let case = format!("protocolVersion {protocol_version:?}");
+        let mut peer = spawn_peer(temp.path(), None).await;
+        let mut params = json!({"info": {"name": "tck", "version": "0"}, "capabilities": {}});
+        if let Some(protocol_version) = &protocol_version {
+            params["protocolVersion"] = protocol_version.clone();
+        }
+        // Stdin stays open, which is where the response was most often lost.
+        peer.write(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params}))
+            .await;
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            peer.stdout.read_line(&mut line),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("no reply to {case}"))
+        .unwrap();
+        assert!(!line.is_empty(), "server exited without answering {case}");
+        let reply: Value = serde_json::from_str(&line)
+            .unwrap_or_else(|error| panic!("{case}: invalid JSON-RPC: {error}"));
+        assert_eq!(reply["id"], 1, "{case}");
+        let error = &reply["error"];
+        assert_eq!(error["code"], code, "{case}");
+        if code == -32022 {
+            assert_eq!(
+                error["data"],
+                json!({"requested": 0, "supported": [1, 2]}),
+                "{case}"
+            );
+        }
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait())
+            .await
+            .unwrap_or_else(|_| panic!("server did not exit after rejecting {case}"))
+            .unwrap();
+        assert!(status.success(), "{case}: server exited with {status}");
+    }
+}
+
 async fn spawn_peer(data_dir: &std::path::Path, base_url: Option<&str>) -> Peer {
     spawn_peer_with_args(data_dir, base_url, &[]).await
 }
