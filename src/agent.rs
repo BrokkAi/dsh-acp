@@ -1140,8 +1140,10 @@ impl Harness {
             runtime.state.lock().await.mcp = None;
             return Ok(());
         }
-        let cancellation = runtime.state.lock().await.cancellation.clone();
-        let mcp = McpSession::connect(servers, &cancellation).await?;
+        // Connecting belongs to this lifecycle request, not to a turn. The
+        // session token is the last turn's, which stays cancelled after
+        // `session/cancel` until the next turn replaces it.
+        let mcp = McpSession::connect(servers, &CancellationToken::new()).await?;
         runtime.state.lock().await.mcp = Some(mcp);
         Ok(())
     }
