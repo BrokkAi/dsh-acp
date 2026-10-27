@@ -86,7 +86,8 @@ The request takes a `sessionId` and reports where that session is:
 A missing or non-string `sessionId` is rejected with `-32602`. In v2, an
 `active` result also carries `state`, the same `running`, `requires_action`,
 or `idle` snapshot that `session/resume` sends. v1 has no foreground state, so
-its result has no `state`.
+its result has no `state`. The probe does not wait for a session's work, so it
+answers promptly even while that session is in a tool or MCP call.
 
 The request does not load, resume, or change the session. As the RFD says,
 `active` only means the session is in memory, so a client still sends

@@ -36,8 +36,7 @@ use crate::{
     model::{
         ChatMessage, ClientPromptMode, ClientSystemPrompt, ContentPart, ImageUrl, MessageContent,
         PendingUserMessage, PersistedCompaction, PersistedDiff, Role, SessionRecord,
-        SessionRuntime, SessionState, TokenUsage, ToolOutcomeStatus,
-        ensure_session_unique_tool_call_ids,
+        SessionRuntime, TokenUsage, ToolOutcomeStatus, ensure_session_unique_tool_call_ids,
     },
     session::{SessionPresence, session_title},
     session_status,
@@ -582,7 +581,10 @@ impl V2Harness {
             send_update(
                 &connection,
                 &v2_session_id(&record.id),
-                SessionUpdate::StateUpdate(foreground_state(&state)),
+                SessionUpdate::StateUpdate(foreground_state(
+                    &state.active_prompt,
+                    &state.requires_action,
+                )),
             )?;
         }
         responder.respond(
@@ -749,7 +751,9 @@ impl V2Harness {
         };
         match self.base.store.presence(session_id).await {
             Ok(SessionPresence::Active(runtime)) => {
-                let state = foreground_state(&*runtime.state.lock().await);
+                // Without the state lock, which can be held across an MCP
+                // call while every other request on the connection waits.
+                let state = foreground_state(&runtime.active_prompt, &runtime.requires_action);
                 responder.respond(json!({"status": "active", "state": state}))
             }
             Ok(SessionPresence::Inactive) => responder.respond(json!({"status": "inactive"})),
@@ -1236,6 +1240,10 @@ impl V2Harness {
                 if matches!(&stop_reason, StopReason::EndTurn) && pending_steering {
                     (true, flushed_steering)
                 } else {
+                    // Before the update: `session/status` reads the flags
+                    // without this lock.
+                    state.active_prompt.store(false, Ordering::Release);
+                    state.requires_action.store(false, Ordering::Release);
                     let _ = send_update(
                         &connection,
                         &session_id,
@@ -1245,8 +1253,6 @@ impl V2Harness {
                                 .usage(Some(v2_turn_usage(&usage, &initial_usage))),
                         )),
                     );
-                    state.active_prompt.store(false, Ordering::Release);
-                    state.requires_action.store(false, Ordering::Release);
                     state.activity_notify.notify_waiters();
                     (false, flushed_steering)
                 }
@@ -2140,10 +2146,13 @@ impl V2Harness {
 
 /// The foreground state snapshot that `session/resume` and `session/status`
 /// report.
-fn foreground_state(state: &SessionState) -> StateUpdate {
-    if state.requires_action.load(Ordering::Acquire) {
+///
+/// Every transition sets these flags before it sends its `state_update`, so a
+/// snapshot read after the client has seen an update is at least that new.
+fn foreground_state(active_prompt: &AtomicBool, requires_action: &AtomicBool) -> StateUpdate {
+    if requires_action.load(Ordering::Acquire) {
         StateUpdate::RequiresAction(RequiresActionStateUpdate::new())
-    } else if state.active_prompt.load(Ordering::Acquire) {
+    } else if active_prompt.load(Ordering::Acquire) {
         StateUpdate::Running(RunningStateUpdate::new())
     } else {
         StateUpdate::Idle(IdleStateUpdate::new())

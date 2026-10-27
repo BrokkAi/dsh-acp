@@ -925,6 +925,110 @@ async fn v2_session_status_reports_a_running_turn() {
 }
 
 #[tokio::test]
+async fn v2_session_status_answers_while_an_mcp_call_is_in_flight() {
+    let temp = tempfile::tempdir().unwrap();
+    let (started, call_started) = tokio::sync::oneshot::channel();
+    let (release_call, release) = tokio::sync::oneshot::channel();
+    // initialize, notifications/initialized, and tools/list when the server
+    // connects, a tools/list refresh before each model request, and the call.
+    let held = HeldMcpCall { started, release };
+    let Some((mcp_url, mcp_server)) = mock_http_mcp_server(6, Some(held)).await else {
+        eprintln!("skipping v2 MCP status test: loopback networking is unavailable");
+        return;
+    };
+    let Some((base_url, model_server)) = mock_sequence_server(vec![
+        mock_named_tool_call_stream("mcp__review__report"),
+        mock_text_stream(),
+    ])
+    .await
+    else {
+        eprintln!("skipping v2 MCP status test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request(
+        "initialize",
+        json!({
+            "protocolVersion": 2,
+            "info": {"name": "v2-test-client", "version": "1.0.0"},
+            "capabilities": {}
+        }),
+    )
+    .await;
+    let cwd = temp.path().to_string_lossy().to_string();
+    let session = peer
+        .request(
+            "session/new",
+            json!({
+                "cwd": cwd,
+                "mcpServers": [{"type":"http", "name":"review", "url":mcp_url, "headers":[]}]
+            }),
+        )
+        .await;
+    let busy_id = session["sessionId"].as_str().unwrap().to_string();
+    let idle_id = peer_new_session(&mut peer, &cwd).await;
+    peer.request(
+        "session/prompt",
+        json!({"sessionId": busy_id, "prompt": [{"type": "text", "text": "report"}]}),
+    )
+    .await;
+    // Reading answers the permission request on the way.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let message = peer.next_message().await;
+            let update = &message["params"]["update"];
+            if update["sessionUpdate"] == "tool_call_update" && update["status"] == "in_progress" {
+                return;
+            }
+            peer.updates.push(message);
+        }
+    })
+    .await
+    .expect("the MCP tool call should start");
+    tokio::time::timeout(std::time::Duration::from_secs(5), call_started)
+        .await
+        .expect("the MCP call should reach the server")
+        .unwrap();
+
+    // The mock holds the call's reply, so the turn keeps the session state
+    // lock until `release_call`. Status must not wait for it, for this
+    // session or another one on the connection.
+    for (session_id, state) in [(&busy_id, "running"), (&idle_id, "idle")] {
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            peer.request("session/status", json!({"sessionId": session_id})),
+        )
+        .await
+        .expect("session/status waited for the MCP call");
+        assert_eq!(
+            status,
+            json!({"status": "active", "state": {"state": state}}),
+            "{state}"
+        );
+    }
+    release_call.send(()).unwrap();
+    let idle = next_v2_idle(&mut peer).await;
+    assert_eq!(idle["params"]["update"]["stopReason"], "end_turn");
+
+    drop(peer.stdin);
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait())
+        .await
+        .expect("server exits on EOF")
+        .unwrap();
+    assert!(exit.success(), "server exited with {exit}");
+    let mcp_requests = served_mcp_requests(mcp_server).await;
+    assert_eq!(
+        mcp_requests
+            .iter()
+            .filter(|request| request["method"] == "tools/call")
+            .count(),
+        1,
+        "MCP requests: {mcp_requests:?}"
+    );
+    assert_eq!(model_server.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn a_rejected_initialize_is_answered_before_the_server_exits() {
     let temp = tempfile::tempdir().unwrap();
     let cases = [
@@ -2644,7 +2748,7 @@ async fn plan_mode_tells_the_model_and_refuses_writes_without_asking() {
 #[tokio::test]
 async fn plan_mode_allows_only_read_only_http_mcp_tools() {
     let temp = tempfile::tempdir().unwrap();
-    let Some((mcp_url, mcp_server)) = mock_http_mcp_server(5).await else {
+    let Some((mcp_url, mcp_server)) = mock_http_mcp_server(5, None).await else {
         eprintln!("skipping plan mode MCP test: loopback networking is unavailable");
         return;
     };
@@ -2738,7 +2842,7 @@ async fn resume_and_load_connect_mcp_servers_after_a_cancel() {
     let temp = tempfile::tempdir().unwrap();
     // Three connections send initialize, notifications/initialized, and
     // tools/list each, and the cancelled turn refreshes tools/list once.
-    let Some((mcp_url, mcp_server)) = mock_http_mcp_server(10).await else {
+    let Some((mcp_url, mcp_server)) = mock_http_mcp_server(10, None).await else {
         eprintln!("skipping MCP after cancel test: loopback networking is unavailable");
         return;
     };
@@ -2835,7 +2939,7 @@ async fn v2_resume_connects_mcp_servers_after_a_cancel() {
     let temp = tempfile::tempdir().unwrap();
     // Two connections send initialize, notifications/initialized, and
     // tools/list each, and the cancelled turn refreshes tools/list once.
-    let Some((mcp_url, mcp_server)) = mock_http_mcp_server(7).await else {
+    let Some((mcp_url, mcp_server)) = mock_http_mcp_server(7, None).await else {
         eprintln!("skipping v2 MCP after cancel test: loopback networking is unavailable");
         return;
     };
@@ -4890,8 +4994,16 @@ async fn mock_sequence_server(
     Some((format!("http://{address}"), task))
 }
 
+/// Holds the reply to the first `tools/call`: `started` fires when the call
+/// arrives, and the reply waits for `release`.
+struct HeldMcpCall {
+    started: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
 async fn mock_http_mcp_server(
     request_count: usize,
+    mut held_call: Option<HeldMcpCall>,
 ) -> Option<(String, tokio::task::JoinHandle<Vec<Value>>)> {
     let listener = loopback_listener().await?;
     let address = listener.local_addr().unwrap();
@@ -4900,6 +5012,12 @@ async fn mock_http_mcp_server(
         for _ in 0..request_count {
             let (mut socket, _) = listener.accept().await.unwrap();
             let request = read_http_json_body(&mut socket).await;
+            if request["method"] == "tools/call"
+                && let Some(held) = held_call.take()
+            {
+                held.started.send(()).unwrap();
+                held.release.await.unwrap();
+            }
             answer_mock_mcp_request(&mut socket, &request).await;
             requests.push(request);
         }
