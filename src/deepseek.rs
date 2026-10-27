@@ -93,7 +93,9 @@ impl DeepSeekClient {
                 .map_err(|error| Error::invalid_params().data(error.to_string()))?;
             header_map.insert(name, value);
         }
-        let api_key = config.api_key.clone();
+        // A blank key counts as no key, so it is never sent as an empty
+        // bearer token.
+        let api_key = config.api_key().ok().map(str::to_owned);
         if api_key.is_none() && !header_map.contains_key(reqwest::header::AUTHORIZATION) {
             return Err(Error::auth_required().data(
                 "Set DEEPSEEK_API_KEY, pass --api-key, or configure an Authorization provider header",
@@ -671,10 +673,9 @@ pub fn sanitize_tool_calls(mut completion: Completion) -> Completion {
 mod tests {
     use super::*;
 
-    #[test]
-    fn request_carries_thinking_effort() {
-        let config = Config {
-            api_key: Some("key".to_string()),
+    fn config_with_key(api_key: Option<&str>) -> Config {
+        Config {
+            api_key: api_key.map(str::to_string),
             base_url: "http://localhost".to_string(),
             default_model: "deepseek-flash".to_string(),
             models: vec!["deepseek-flash".to_string()],
@@ -689,7 +690,12 @@ mod tests {
             mcp_connect_timeout: std::time::Duration::from_secs(1),
             disable_web: true,
             trace: false,
-        };
+        }
+    }
+
+    #[test]
+    fn request_carries_thinking_effort() {
+        let config = config_with_key(Some("key"));
         let client = DeepSeekClient::new(&config).unwrap();
         let request = client.request(
             "deepseek-flash",
@@ -728,6 +734,31 @@ mod tests {
                 .get("temperature")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_blank_api_key_counts_as_no_key() {
+        for api_key in ["", "   "] {
+            let config = config_with_key(Some(api_key));
+            let error = DeepSeekClient::new(&config)
+                .err()
+                .expect("a blank key is not a key");
+            assert_eq!(error.code, agent_client_protocol::ErrorCode::AuthRequired);
+            assert_eq!(
+                error.data,
+                Some(json!(
+                    "Set DEEPSEEK_API_KEY, pass --api-key, or configure an Authorization provider header"
+                ))
+            );
+
+            let headers = std::collections::HashMap::from([(
+                "Authorization".to_string(),
+                "Bearer provider-key".to_string(),
+            )]);
+            let client =
+                DeepSeekClient::with_routing(&config, config.base_url.clone(), headers).unwrap();
+            assert!(client.api_key.is_none(), "{api_key:?} must not be sent");
+        }
     }
 
     #[test]
