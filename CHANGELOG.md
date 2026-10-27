@@ -17,9 +17,12 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   handshake. The server is not contacted during session setup; its tools are
   listed at the start of each model round and named, filtered in plan mode,
   and permission-checked like other MCP tools. An ACP or MCP error fails only
-  the tool call or refresh, and cancelling the turn withdraws an outstanding
-  request with `$/cancel_request`. Declaring one `serverId` twice in a request
-  fails with `-32602`.
+  the tool call or that server's tool listing, and cancelling the turn
+  withdraws an outstanding request with `$/cancel_request`. Declaring one
+  `serverId` twice in a request fails with `-32602`.
+- MCP tools are now refreshed server by server. A server whose `tools/list`
+  fails keeps its last listed tools instead of hiding every server's tools
+  for that round, and the refresh notice names the servers that failed.
 - ACP clients can now replace the built-in harness prompt instead of only
   appending to it: both protocol versions advertise
   `systemPrompt.mode.override` and accept `mode: "override"` on session

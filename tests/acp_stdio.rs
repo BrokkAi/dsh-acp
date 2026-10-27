@@ -6647,6 +6647,129 @@ async fn mcp_over_acp_unknown_server(version: u64) {
 }
 
 #[tokio::test]
+async fn v1_an_unknown_mcp_over_acp_server_hides_only_its_own_tools() {
+    mcp_over_acp_one_unknown_server(1).await;
+}
+
+#[tokio::test]
+async fn v2_an_unknown_mcp_over_acp_server_hides_only_its_own_tools() {
+    mcp_over_acp_one_unknown_server(2).await;
+}
+
+/// A session with a served MCP-over-ACP server and one its client does not
+/// know still offers the served server's tools, and the refresh notice names
+/// the unknown one.
+async fn mcp_over_acp_one_unknown_server(version: u64) {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, model_server)) = mock_sequence_server(vec![mock_text_stream()]).await
+    else {
+        eprintln!("skipping MCP-over-ACP mixed server test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    initialize_version(&mut peer, version).await;
+    let session = peer
+        .request(
+            "session/new",
+            json!({
+                "cwd": temp.path().to_string_lossy(),
+                "mcpServers": [
+                    acp_mcp_server(ACP_MCP_SERVER_ID),
+                    {"type": "acp", "name": "ghost", "serverId": "unregistered:1"}
+                ],
+                "additionalDirectories": []
+            }),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+    let stop_reason = prompt_turn(&mut peer, version, &session_id, "report").await;
+    assert_eq!(stop_reason, "end_turn");
+    let notice = peer
+        .updates
+        .iter()
+        .map(|update| &update["params"]["update"])
+        .find(|update| {
+            update["sessionUpdate"] == "notice" && update["title"] == "MCP tool refresh failed"
+        })
+        .unwrap_or_else(|| panic!("no refresh notice: {:?}", peer.updates));
+    let description = notice["description"].as_str().unwrap();
+    assert!(
+        description.contains("`ghost`") && !description.contains("`review`"),
+        "{description}"
+    );
+
+    let requests = model_server.await.unwrap();
+    let offered = offered_tool_names(&requests[0]);
+    assert!(offered.contains(&"mcp__review__report"), "{offered:?}");
+    assert!(
+        offered.iter().all(|name| !name.starts_with("mcp__ghost")),
+        "{offered:?}"
+    );
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+}
+
+/// Like `serve_acp_mcp`, but every `tools/call` asks for more input, a
+/// multi round-trip request this agent does not support.
+fn input_required_acp_mcp_calls(request: &Value) -> Option<Value> {
+    if request["params"]["method"] != "tools/call" {
+        return serve_acp_mcp(request);
+    }
+    Some(json!({"result": {"result": {
+        "resultType": "input_required",
+        "requestState": "opaque-state",
+        "inputRequests": {}
+    }}}))
+}
+
+#[tokio::test]
+async fn an_mcp_over_acp_call_that_needs_more_input_fails_without_a_retry() {
+    for version in [1, 2] {
+        let temp = tempfile::tempdir().unwrap();
+        let Some((base_url, model_server)) = mock_sequence_server(vec![
+            mock_tool_calls_stream(&[("call-report", "mcp__review__report")]),
+            mock_text_stream(),
+        ])
+        .await
+        else {
+            eprintln!("skipping MCP-over-ACP input test: loopback networking is unavailable");
+            return;
+        };
+        let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+        peer.mcp_provider = input_required_acp_mcp_calls;
+        initialize_version(&mut peer, version).await;
+        let session_id = new_acp_mcp_session(&mut peer, temp.path(), ACP_MCP_SERVER_ID).await;
+        let stop_reason = prompt_turn(&mut peer, version, &session_id, "report").await;
+        assert_eq!(stop_reason, "end_turn", "v{version}");
+        assert_eq!(
+            final_tool_status(&peer, "call-report"),
+            Some("failed"),
+            "v{version}"
+        );
+        let calls = peer
+            .mcp_requests
+            .iter()
+            .filter(|request| request["params"]["method"] == "tools/call")
+            .count();
+        assert_eq!(calls, 1, "v{version}: no retry");
+
+        let requests = model_server.await.unwrap();
+        let results = tool_results(&requests[1]);
+        assert!(
+            // v1 shows the data and v2 the message until #60 makes them agree.
+            results[0].starts_with("MCP tool failed")
+                && (results[0].contains("input_required")
+                    || results[0].contains("asked for more input")),
+            "v{version}: {results:?}"
+        );
+
+        drop(peer.stdin);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    }
+}
+
+#[tokio::test]
 async fn v1_session_cancel_withdraws_a_running_mcp_over_acp_call() {
     mcp_over_acp_cancel(1, "tools/call").await;
 }

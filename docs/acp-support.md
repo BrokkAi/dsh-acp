@@ -343,7 +343,8 @@ The client declares a server with `"type": "acp"`, a `name`, and the
 or v1 `session/load`. A request that declares one `serverId` twice fails with
 `-32602`. The client of the connection that sent the declaration serves the
 server. A later load or resume uses the servers that request declares, as for
-other transports.
+other transports. A v2 `session/resume` that omits `mcpServers` keeps the
+session's current servers.
 
 Each MCP operation is one `mcp/message` request to the client, in the
 connection's protocol version. It targets MCP revision 2026-07-28 only and
@@ -359,8 +360,13 @@ are refreshed. `--mcp-connect-timeout-secs` therefore does not apply. The tools
 are named `mcp__<name>__<tool>`, hidden in plan mode unless they are marked
 `annotations.readOnlyHint: true`, and ask permission like other MCP tools.
 
-Each of these fails only the tool call, or the tool refresh, which is reported
-as a notice. None ends the turn:
+Tools are listed server by server. A server whose listing fails keeps the
+tools its last listing found, or none if it was never listed, so it cannot
+hide other servers' tools. A server the client reports it no longer serves
+(`-33001`) loses its tools. The refresh notice names each server that failed.
+
+Each of these fails only the tool call, or that server's tool listing, which
+is reported as a notice. None ends the turn:
 
 - an ACP error response to `mcp/message`, such as `-33001` for a `serverId`
   the client does not serve;

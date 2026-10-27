@@ -7,6 +7,7 @@ use std::{
 
 use agent_client_protocol::{
     Client, ConnectionTo, Error, V2ConnectionTo,
+    mcp_server::MCP_SERVER_UNAVAILABLE,
     schema::{
         v1::{self, EnvVariable, HttpHeader, McpServer},
         v2,
@@ -165,15 +166,49 @@ impl McpSession {
         Ok(())
     }
 
+    /// Lists every server's tools again. A server that fails keeps the tools
+    /// its last listing found, none if it was never listed, so it cannot hide
+    /// the other servers' tools. An MCP-over-ACP server whose client no longer
+    /// serves it (`-33001`) loses its tools instead, because calling them
+    /// could only fail. The error names each server that failed, after the
+    /// others' tools are stored.
     pub async fn refresh(&self, cancellation: &CancellationToken) -> Result<(), Error> {
         let mut tools = Vec::new();
+        let mut failures = Vec::new();
         for client in &self.clients {
-            for tool in client.list_tools(cancellation).await? {
-                tools.push(McpToolMetadata::new(client.name(), tool));
+            match client.list_tools(cancellation).await {
+                Ok(listed) => tools.extend(
+                    listed
+                        .into_iter()
+                        .map(|tool| McpToolMetadata::new(client.name(), tool)),
+                ),
+                Err(error) if error.code == agent_client_protocol::ErrorCode::RequestCancelled => {
+                    return Err(error);
+                }
+                Err(error) => {
+                    if !registration_unavailable(&error) {
+                        tools.extend(
+                            self.tools()
+                                .iter()
+                                .filter(|tool| tool.server_name == client.name())
+                                .cloned(),
+                        );
+                    }
+                    failures.push(format!(
+                        "MCP server `{}` could not list its tools: {}",
+                        client.name(),
+                        error_detail(&error)
+                    ));
+                }
             }
         }
         *self.tools.write().unwrap_or_else(PoisonError::into_inner) = tools;
-        Ok(())
+        if failures.is_empty() {
+            return Ok(());
+        }
+        let mut error = Error::internal_error().data(json!(failures));
+        error.message = failures.join("; ");
+        Err(error)
     }
 
     fn tools(&self) -> RwLockReadGuard<'_, Vec<McpToolMetadata>> {
@@ -235,6 +270,27 @@ impl McpSession {
         client
             .call_tool(&original_name, arguments, cancellation)
             .await
+    }
+}
+
+/// Whether the client answered that it no longer serves an MCP-over-ACP
+/// server, rather than failing one request.
+fn registration_unavailable(error: &Error) -> bool {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.pointer("/acpError/code"))
+        .and_then(Value::as_i64)
+        == Some(i64::from(MCP_SERVER_UNAVAILABLE))
+}
+
+/// What went wrong, for a message that names the server. Stdio and HTTP
+/// failures carry their detail in `data`, under a generic message.
+fn error_detail(error: &Error) -> String {
+    match &error.data {
+        Some(Value::String(detail)) => detail.clone(),
+        Some(data) if error.message == Error::internal_error().message => data.to_string(),
+        _ => error.message.clone(),
     }
 }
 
@@ -385,7 +441,6 @@ impl McpClient {
                     ))
                 })?,
                 server_id: config.server_id.0.clone(),
-                server_name: name.clone(),
             }),
             _ => return Err(Error::invalid_params().data("unsupported MCP server transport")),
         };
@@ -479,7 +534,6 @@ impl McpClient {
 struct AcpTransport {
     connection: AcpConnection,
     server_id: Arc<str>,
-    server_name: String,
 }
 
 /// The inner MCP outcome a successful `mcp/message` response carries.
@@ -559,8 +613,7 @@ impl AcpTransport {
             AcpMcpOutcome::Result(result) => self.complete_result(result),
             AcpMcpOutcome::Error(error) => Err(failure(
                 format!(
-                    "MCP server `{}` returned error {}: {}",
-                    self.server_name,
+                    "MCP server returned error {}: {}",
                     error.get("code").unwrap_or(&Value::Null),
                     error
                         .get("message")
@@ -580,17 +633,11 @@ impl AcpTransport {
             None => Ok(result),
             Some(Value::String(kind)) if kind == "complete" => Ok(result),
             Some(Value::String(kind)) if kind == "input_required" => Err(failure(
-                format!(
-                    "MCP server `{}` asked for more input, which dsh-acp does not support",
-                    self.server_name
-                ),
+                "MCP server asked for more input, which dsh-acp does not support".to_string(),
                 result,
             )),
             Some(_) => Err(failure(
-                format!(
-                    "MCP server `{}` returned an unrecognized resultType",
-                    self.server_name
-                ),
+                "MCP server returned an unrecognized resultType".to_string(),
                 result,
             )),
         }
@@ -601,23 +648,17 @@ impl AcpTransport {
     /// client that cancels the request itself.
     fn binding_failure(&self, error: Error) -> Error {
         failure(
-            format!(
-                "MCP-over-ACP server `{}` failed the request: {}",
-                self.server_name, error.message
-            ),
-            json!({
+            format!("MCP-over-ACP client failed the request: {}", error.message),
+            json!({"acpError": {
                 "code": i32::from(error.code),
                 "message": error.message,
                 "data": error.data
-            }),
+            }}),
         )
     }
 
     fn unrecognized_response(&self) -> Error {
-        let message = format!(
-            "MCP-over-ACP server `{}` sent an unrecognized response",
-            self.server_name
-        );
+        let message = "MCP-over-ACP client sent an unrecognized response".to_string();
         failure(message.clone(), Value::String(message))
     }
 }
