@@ -238,10 +238,12 @@ are supported; a session can declare multiple servers.
 
 Each server has `--mcp-connect-timeout-secs` seconds (default 60) to start,
 complete the MCP handshake, and list its tools when a session is created,
-loaded, resumed, or forked. A server that misses the deadline fails that
-request with an error naming the server, and the stdio server processes
-started for the request are killed. The limit does not apply to tool calls or
-to the tool list refresh during a turn.
+loaded, resumed, or forked. Servers connect one after another, so a request
+that declares several servers can take up to that many times the limit. A
+server that misses the deadline fails that request with an error naming the
+server, and the stdio server processes started for the request are killed.
+The limit does not apply to tool calls or to the tool list refresh during a
+turn.
 
 ## DeepSeek behavior
 

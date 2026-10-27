@@ -886,12 +886,27 @@ mod tests {
         );
     }
 
+    /// A stdio server that runs `script` with `/bin/sh`, with `args` as `$1`
+    /// onwards.
     #[cfg(unix)]
-    fn shell_server(name: &str, script: &str) -> McpServer {
+    fn shell_server(name: &str, script: &str, args: &[&str]) -> McpServer {
+        let mut argv = vec!["-c".to_string(), script.to_string(), "sh".to_string()];
+        argv.extend(args.iter().map(ToString::to_string));
         McpServer::Stdio(
-            agent_client_protocol::schema::v1::McpServerStdio::new(name, "/bin/sh")
-                .args(vec!["-c".to_string(), script.to_string()]),
+            agent_client_protocol::schema::v1::McpServerStdio::new(name, "/bin/sh").args(argv),
         )
+    }
+
+    /// Whether the process whose PID a test server wrote still exists.
+    /// `kill -0` also succeeds for an exited process nobody has reaped.
+    #[cfg(unix)]
+    fn process_exists(pid_file: &std::path::Path) -> bool {
+        let pid = std::fs::read_to_string(pid_file).expect("the MCP server should have started");
+        std::process::Command::new("/bin/sh")
+            .args(["-c", "kill -0 \"$1\" 2>/dev/null", "sh", pid.trim()])
+            .status()
+            .unwrap()
+            .success()
     }
 
     /// Connects with a short setup timeout, failing the test instead of
@@ -930,7 +945,7 @@ mod tests {
             while read -r line; do :; done
         "#;
         let session = McpSession::connect(
-            &[shell_server("ok", script)],
+            &[shell_server("ok", script, &[])],
             Duration::from_secs(10),
             &CancellationToken::new(),
         )
@@ -948,7 +963,7 @@ mod tests {
             echo '{"jsonrpc":"2.0","id":1,"result":{}}'
             while read -r line; do :; done
         "#;
-        let message = connect_error(shell_server("slow", script)).await;
+        let message = connect_error(shell_server("slow", script, &[])).await;
         assert!(message.contains("MCP server `slow`"), "{message}");
     }
 
@@ -962,8 +977,61 @@ mod tests {
                 echo '{"jsonrpc":"2.0","id":99,"result":{}}'
             done
         "#;
-        let message = connect_error(shell_server("chatty", script)).await;
+        let message = connect_error(shell_server("chatty", script, &[])).await;
         assert!(message.contains("MCP server `chatty`"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_setup_kills_and_reaps_every_stdio_server_before_returning() {
+        let temp = tempfile::tempdir().unwrap();
+        let ready_pid = temp.path().join("ready.pid");
+        let silent_pid = temp.path().join("silent.pid");
+        let ready = r#"
+            echo $$ > "$1"
+            read -r line
+            echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+            read -r line
+            read -r line
+            echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}'
+            while read -r line; do :; done
+        "#;
+        let servers = [
+            shell_server("ready", ready, &[ready_pid.to_str().unwrap()]),
+            shell_server(
+                "silent",
+                r#"echo $$ > "$1"; exec sleep 60"#,
+                &[silent_pid.to_str().unwrap()],
+            ),
+        ];
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            McpSession::connect(
+                &servers,
+                Duration::from_millis(500),
+                &CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("MCP setup should time out")
+        .expect_err("the silent server should fail setup");
+        // Nothing is awaited between the error and these checks. The test
+        // runtime has one thread, so tokio's background reaper cannot run
+        // first: only an explicit kill-and-wait removes both processes.
+        assert!(
+            !process_exists(&ready_pid),
+            "the connected server is still running"
+        );
+        assert!(
+            !process_exists(&silent_pid),
+            "the silent server is still running"
+        );
+        let message = error
+            .data
+            .as_ref()
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(message.contains("MCP server `silent`"), "{message}");
     }
 
     #[tokio::test]

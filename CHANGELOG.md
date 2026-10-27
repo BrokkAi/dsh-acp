@@ -30,6 +30,20 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   a `$/cancel_request` for it arrives as well. ACP v2 is unchanged:
   `session/prompt` is answered when the message is inserted, so stopping the
   work it started still takes `session/cancel`.
+- `--mcp-connect-timeout-secs` (`DSH_ACP_MCP_CONNECT_TIMEOUT_SECS`, default
+  60) sets how long each MCP server may take to start, complete the MCP
+  handshake, and list its tools when a session is created, loaded, resumed, or
+  forked. Servers connect one after another, so a request that declares
+  several servers can take up to that many times the limit. Tool calls and the
+  tool list refresh during a turn are not bounded by it.
+
+### Changed
+
+- HTTP MCP server setup is now bounded by `--mcp-connect-timeout-secs`, 60
+  seconds in total by default. It was bounded only by a fixed 180-second
+  timeout on each request (`initialize`, `notifications/initialized`, and each
+  `tools/list` page), so an HTTP MCP server that takes more than 60 seconds to
+  connect now fails session setup unless the limit is raised.
 
 ### Fixed
 
@@ -51,14 +65,10 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   Both versions now install them only after the MCP servers connect.
 - A stdio MCP server that started but never answered the MCP handshake or its
   first `tools/list` hung `session/new`, `session/load`, `session/resume`, or
-  `session/fork`, and with it every later message on the connection. Each MCP
-  server now has `--mcp-connect-timeout-secs`
-  (`DSH_ACP_MCP_CONNECT_TIMEOUT_SECS`, default 60) to connect and list its
-  tools; a server that misses it fails the request with an error naming the
-  server, and the stdio server processes started for the request are killed.
-  The limit also covers HTTP MCP servers, whose setup could take up to 180
-  seconds per request. Tool calls and the tool list refresh during a turn are
-  not affected.
+  `session/fork`, and with it every later message on the connection. Such a
+  server now fails the request once `--mcp-connect-timeout-secs` passes, with
+  an error naming the server, and the stdio server processes started for the
+  request are killed.
 
 ## 0.4.0 - 2026-10-25
 

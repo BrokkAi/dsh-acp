@@ -79,7 +79,9 @@ lossy text reconstruction.
 - MCP calls are serialized per server.
 - Session lifecycle requests run in the SDK's dispatch loop, so no other
   incoming message is handled until they answer. Connecting their MCP servers
-  is bounded per server by `--mcp-connect-timeout-secs`.
+  is bounded per server by `--mcp-connect-timeout-secs`. Servers connect one
+  after another, so a request with N servers can wait up to N times that
+  limit.
 - Session-store writes are serialized process-wide.
 
 ## Security boundaries
