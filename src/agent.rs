@@ -79,6 +79,15 @@ pub(crate) struct ProviderRouting {
 }
 
 pub async fn run(config: Config) -> agent_client_protocol::Result<()> {
+    init_tracing(&config);
+    let store = SessionStore::open(&config).await?;
+    component(Harness::new(config, store))
+        .connect_to(stdio_transport())
+        .await
+}
+
+/// Send diagnostics to stderr, which never carries ACP traffic.
+pub(crate) fn init_tracing(config: &Config) {
     let filter = if config.trace {
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("dsh_acp=trace,info"))
@@ -91,22 +100,40 @@ pub async fn run(config: Config) -> agent_client_protocol::Result<()> {
         .with_writer(std::io::stderr)
         .with_target(false)
         .try_init();
+}
 
-    let store = SessionStore::open(&config).await?;
-    let provider = ProviderRouting {
-        enabled: true,
-        base_url: config.base_url.clone(),
-        headers: std::collections::HashMap::new(),
-    };
-    let harness = Harness {
-        config,
-        store,
-        client_capabilities: Arc::new(tokio::sync::RwLock::new(ClientCapabilities::default())),
-        initialized: Arc::new(AtomicBool::new(false)),
-        provider: Arc::new(tokio::sync::RwLock::new(provider)),
-    };
+impl Harness {
+    /// The state of one ACP connection. Everything except `config` and the
+    /// store's directory belongs to that connection: its client capabilities,
+    /// its provider routing, and, through `store`, the sessions it has in
+    /// memory.
+    pub(crate) fn new(config: Config, store: SessionStore) -> Self {
+        let provider = ProviderRouting {
+            enabled: true,
+            base_url: config.base_url.clone(),
+            headers: std::collections::HashMap::new(),
+        };
+        Self {
+            config,
+            store,
+            client_capabilities: Arc::new(tokio::sync::RwLock::new(ClientCapabilities::default())),
+            initialized: Arc::new(AtomicBool::new(false)),
+            provider: Arc::new(tokio::sync::RwLock::new(provider)),
+        }
+    }
+}
 
-    let v1_agent = Agent
+/// The ACP agent for one connection: the protocol router in front of the v1
+/// and v2 implementations, which share `harness`.
+pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> {
+    Agent
+        .protocol_router()
+        .with_v1(v1_component(harness.clone()))
+        .with_v2(crate::v2_agent::component(harness))
+}
+
+fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
+    Agent
         .builder()
         .name("dsh-acp")
         .on_receive_request(
@@ -334,14 +361,7 @@ pub async fn run(config: Config) -> agent_client_protocol::Result<()> {
                 }
             },
             agent_client_protocol::on_receive_notification!(),
-        );
-
-    Agent
-        .protocol_router()
-        .with_v1(v1_agent)
-        .with_v2(crate::v2_agent::component(harness.clone()))
-        .connect_to(stdio_transport())
-        .await
+        )
 }
 
 /// Stdio as a transport the protocol router can finish.

@@ -10,8 +10,9 @@
 [![ACP](https://img.shields.io/badge/ACP-v1%20%7C%20v2-blue.svg)](https://agentclientprotocol.com/)
 
 `dsh-acp` is a DeepSeek-powered coding agent and ACP server built on
-`agent-client-protocol` 3.4. It negotiates ACP v2 when the client requests it
-and falls back to ACP v1 for older clients.
+`agent-client-protocol` 3.5. It negotiates ACP v2 when the client requests it
+and falls back to ACP v1 for older clients. It serves ACP over stdio, or over
+streamable HTTP and WebSocket with `--listen`.
 
 It is not a chat-only adapter. The agent can stream reasoning and responses,
 call filesystem and terminal operations through the ACP client, run local
@@ -26,7 +27,8 @@ sessions, switch modes and models, and report token usage.
 
 - **ACP v1 and v2:** version negotiation, asynchronous v2 prompt acceptance,
   foreground state, replay cursors, structured diffs, agent-owned terminals,
-  and v1 compatibility in one stdio binary.
+  and v1 compatibility in one binary, over stdio or, opt-in, authenticated
+  HTTP and WebSocket.
 - **Real coding tools:** workspace-confined file reads and edits, command
   execution, regex search, web fetch, planning, user questions, and MCP tools.
 - **Durable sessions:** atomic JSON persistence, resume, replay, fork, list,
@@ -100,7 +102,8 @@ Requirements:
 
 - Rust 1.89 or newer
 - A DeepSeek API key, or compatible provider headers
-- An ACP client or another process capable of speaking ACP over stdio
+- An ACP client or another process capable of speaking ACP over stdio, or
+  over HTTP or WebSocket with `--listen`
 
 ```bash
 cargo build --release
@@ -122,10 +125,68 @@ The binary is `target/release/dsh-acp`.
 --tool-output-bytes <N>          Per-tool output cap
 --disable-web                    Disable web_fetch
 --trace                          Detailed diagnostics on stderr
+--listen <ADDR>                  Serve HTTP and WebSocket at ADDR instead of stdio
+--listen-allow-remote            Let --listen use a non-loopback address
 ```
 
 Every option has an environment fallback; run `dsh-acp --help` for the complete
-list.
+list. The `--listen` token is the exception: it is read only from
+`DSH_ACP_LISTEN_TOKEN`.
+
+## HTTP and WebSocket
+
+By default `dsh-acp` speaks ACP over stdio to the client that launched it. With
+`--listen` (or `DSH_ACP_LISTEN`) it instead serves ACP at `/acp` over
+streamable HTTP and WebSocket, following the
+[Streamable HTTP & WebSocket Transport RFD](https://agentclientprotocol.com/rfds/streamable-http-websocket-transport).
+That RFD is not stable: it is in the RFD process's Active stage and may still
+change. The transport is the SDK's `agent-client-protocol-http` server.
+
+```bash
+export DEEPSEEK_API_KEY="..."
+dsh-acp --listen 127.0.0.1:8787
+# dsh-acp: serving ACP at http://127.0.0.1:8787/acp and ws://127.0.0.1:8787/acp; send "Authorization: Bearer 3f9c…"
+```
+
+Port 0 picks a free port. The line above goes to stderr, and nothing is written
+to stdout.
+
+- **Bearer token on every request.** Every HTTP request and WebSocket upgrade
+  must send `Authorization: Bearer <token>`. A request without the right
+  token gets `401`, and ACP never sees it. Set the token in `DSH_ACP_LISTEN_TOKEN` (at least 16 visible
+  ASCII characters, for example from `openssl rand -hex 32`). Without it,
+  `dsh-acp` generates a 256-bit token and prints it once, in the line above. The
+  token is never accepted as a command-line argument, in a query string, or in
+  a WebSocket subprotocol. It is not stored, and it is removed from the
+  environment that commands and MCP servers inherit.
+- **Loopback only by default.** `--listen` refuses an address that is not
+  loopback unless `--listen-allow-remote` (or `DSH_ACP_LISTEN_ALLOW_REMOTE`) is
+  also given.
+- **Host and Origin checks.** A request must name `localhost`, `127.0.0.1`,
+  `[::1]`, or the bound address in its `Host`; with `--listen-allow-remote`, the
+  host name given to `--listen` is accepted too. This stops DNS rebinding, where
+  a web page reaches a local server under the page's own domain name. Any
+  request with an `Origin` header is refused, so browser pages cannot use the
+  server. Both get `403`. The port in `Host` is not checked, so an SSH port
+  forward to a different local port works.
+- **One connection at a time.** A second connection, by `initialize` POST or
+  WebSocket upgrade, gets `409 Conflict` while one is active. A connection ends
+  with `DELETE`, when its WebSocket closes, or, for HTTP, after 30 seconds
+  with no event stream open, since a client receives everything through one.
+  Each connection starts with nothing in memory, as a new stdio process would:
+  sessions it creates are saved as usual and a later connection can load or
+  resume them.
+- There is no health endpoint. Streamable HTTP is served over HTTP/1.1 and
+  over HTTP/2 with prior knowledge (cleartext). There is no TLS.
+
+`--listen-allow-remote` gives anyone who can reach the port and has the token
+control of the agent: it reads and writes your files and runs commands as you.
+Traffic is plain HTTP, so the token, your prompts, and the agent's output cross
+the network unencrypted. To reach the agent from another machine, keep it on
+loopback and forward the port instead, for example `ssh -L
+8787:127.0.0.1:8787 host`. If you do allow remote connections, bind the
+address or host name your clients use: with a wildcard such as `0.0.0.0`, only
+loopback host names pass the `Host` check.
 
 ## Instructions
 
@@ -302,7 +363,7 @@ router:
 
 ```mermaid
 flowchart LR
-    C[ACP Client] <-->|stdio JSON-RPC| R[v1 / v2 router]
+    C[ACP Client] <-->|JSON-RPC over stdio, or HTTP / WebSocket| R[v1 / v2 router]
     R <--> V1[ACP v1 adapter]
     R <--> V2[ACP v2 adapter]
     V1 --> S[Session runtime and replay store]
@@ -331,6 +392,9 @@ security boundaries, and concurrency model.
   redirect targets.
 - Credentials are read from launch configuration or provider requests and are
   not written to session transcripts.
+- `--listen` is opt-in, loopback-only unless `--listen-allow-remote` is given,
+  and requires a bearer token on every request; see
+  [HTTP and WebSocket](#http-and-websocket).
 
 Report vulnerabilities privately according to [SECURITY.md](SECURITY.md).
 
@@ -346,7 +410,8 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 node scripts/smoke_npm.cjs target/debug/dsh-acp
 ```
 
-The integration suite performs real ACP v1 and v2 stdio handshakes and runs
+The integration suite performs real ACP v1 and v2 handshakes over stdio, HTTP,
+and WebSocket, and runs
 mocked DeepSeek streams through complete tool round trips, permissions, and
 cancellation. Binding its loopback mock server may require network permission
 in heavily sandboxed environments.

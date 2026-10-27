@@ -2,9 +2,37 @@
 
 ## Process model
 
-`dsh-acp` is one stdio ACP server. It owns session state, the DeepSeek HTTP
-client, MCP connections, and tool execution. ACP stdout carries JSON-RPC only;
-logs and tracing go to stderr.
+`dsh-acp` is an ACP server for one connection at a time. It owns session
+state, the DeepSeek HTTP client, MCP connections, and tool execution. Logs and
+tracing go to stderr.
+
+By default the connection is stdio: stdout carries JSON-RPC only, and the
+process ends with it. With `--listen`, the process instead serves the SDK's
+streamable HTTP and WebSocket server (`agent-client-protocol-http`) at `/acp`
+until it is stopped, and serves the connections it accepts one after another.
+A middleware in front of the SDK router checks `Host`, refuses any `Origin`,
+and requires the bearer token before a request reaches the SDK; ACP traffic
+never sees a request that fails.
+
+Each connection gets its own `Harness`: client capabilities, the initialized
+flag, provider routing (`providers/set`, `providers/disable`, logout), and a
+session store with nothing in memory over the shared session files. A
+connection therefore starts exactly as a new stdio process would, and its
+memory is its own: loaded sessions, running turns, MCP servers, "allow always"
+approvals, and pending steering. When a connection ends, its turns, commands,
+and MCP servers are dropped and killed with it; what it saved stays on disk
+for the next connection to load or resume.
+
+The server holds one connection slot. An `initialize` POST without an
+`Acp-Connection-Id`, or a WebSocket upgrade, waits up to two seconds for a
+closing connection to release it and otherwise gets `409 Conflict`. The SDK
+creates the connection through a factory that claims the slot, so two requests
+that pass that check together cannot both connect: the second gets an agent
+that answers every request with an error. A connection releases the slot when
+it ends: on `DELETE`, when its WebSocket closes, when `initialize` fails, or,
+for HTTP, after 30 seconds without an open event stream. An HTTP client
+receives everything through those streams, so one without any for that long is
+gone; the SDK does not detect that by itself.
 
 The SDK protocol router selects the v1 or v2 implementation from the first
 `initialize` request. Shared application logic lives behind that boundary so
@@ -63,12 +91,16 @@ lossy text reconstruction.
 
 ## Concurrency
 
+- One ACP connection is served at a time, so a session's updates and
+  agent-to-client requests go only to the connection that runs its turn, and
+  no two connections run turns on one session. Two processes sharing a data
+  directory are not coordinated.
 - A session has one active foreground turn.
 - Session transitions and final idle reporting use a per-session turn lock.
 - Steering requests for a session serialize through that same lock.
 - Closing prevents new prompt insertion and waits for active work to settle.
 - MCP calls are serialized per server.
-- Session-store writes are serialized process-wide.
+- Session-store writes are serialized per connection.
 
 ## Security boundaries
 
@@ -78,3 +110,13 @@ private and local destinations, including via redirects. Provider and MCP
 headers are supplied by configuration and are not persisted as session data.
 Instruction files are canonicalized against their source root, limited to
 regular files, and capped at 1 MiB.
+
+`--listen` binds loopback unless `--listen-allow-remote` is given. Every request
+needs the bearer token, compared in constant time. The token comes from
+`DSH_ACP_LISTEN_TOKEN` or is generated from the operating system's random
+source; it is printed once to stderr only when generated, and is removed from
+the process environment before any thread starts, so commands and MCP servers
+do not inherit it. `Host` must be a loopback name, the bound address, or, with
+`--listen-allow-remote`, the configured host name. Requests carrying `Origin`
+are refused, the SDK's CORS support stays disabled, and its health endpoint is
+off. There is no TLS.

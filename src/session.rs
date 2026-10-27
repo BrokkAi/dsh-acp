@@ -54,6 +54,25 @@ impl SessionStore {
         })
     }
 
+    /// A store over the same session files with nothing in memory, the way a
+    /// new process opens it. Each ACP connection served over `--listen` gets
+    /// one, so sessions, turns, MCP servers, and "allow always" approvals in
+    /// memory always belong to the connection that loaded them, as they do
+    /// for a stdio process.
+    pub fn fresh(&self) -> Self {
+        Self {
+            directory: self.directory.clone(),
+            data_dir: self.data_dir.clone(),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            deleted: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            write_lock: Arc::new(Mutex::new(())),
+            configured_prompt: self.configured_prompt.clone(),
+            default_model: self.default_model.clone(),
+            default_permission: self.default_permission,
+            default_reasoning_effort: self.default_reasoning_effort,
+        }
+    }
+
     pub async fn create(
         &self,
         cwd: PathBuf,

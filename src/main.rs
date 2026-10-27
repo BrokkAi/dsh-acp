@@ -1,5 +1,9 @@
 use clap::Parser;
-use dsh_acp::{Config, run};
+use dsh_acp::{
+    Config,
+    listen::{ListenOptions, TOKEN_ENV, serve},
+    run,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -82,6 +86,27 @@ struct Cli {
     /// Include protocol traffic diagnostics on stderr (never writes stdout).
     #[arg(long, env = "DSH_ACP_TRACE", default_value_t = false)]
     trace: bool,
+
+    /// Serve ACP over streamable HTTP and WebSocket at http://ADDR/acp
+    /// instead of stdio, e.g. 127.0.0.1:8787 (port 0 picks a free port).
+    ///
+    /// Every request must send "Authorization: Bearer <token>". The token is
+    /// DSH_ACP_LISTEN_TOKEN (at least 16 visible ASCII characters); without
+    /// it, a random token is generated and printed to stderr with the
+    /// endpoint. It is never accepted as an argument, since other local users
+    /// can read a process's arguments. One ACP connection is served at a time.
+    #[arg(long, env = "DSH_ACP_LISTEN", value_name = "ADDR")]
+    listen: Option<String>,
+
+    /// Let --listen use an address that other machines can reach.
+    ///
+    /// Anyone who can reach the port and has the token controls this agent:
+    /// it reads and writes your files and runs commands as you. Traffic is
+    /// plain HTTP, so the token and everything the agent sends cross the
+    /// network unencrypted. Prefer listening on loopback and forwarding the
+    /// port over SSH.
+    #[arg(long, env = "DSH_ACP_LISTEN_ALLOW_REMOTE", default_value_t = false)]
+    listen_allow_remote: bool,
 }
 
 impl TryFrom<Cli> for Config {
@@ -130,10 +155,44 @@ impl TryFrom<Cli> for Config {
     }
 }
 
-#[tokio::main]
-async fn main() -> agent_client_protocol::Result<()> {
+fn main() -> agent_client_protocol::Result<()> {
     let cli = Cli::parse();
+    // Commands and MCP servers inherit this process's environment, and the
+    // model can read what they print. Take the token out of it while no other
+    // thread exists, which is why the runtime is built by hand.
+    let token = std::env::var_os(TOKEN_ENV);
+    // SAFETY: the runtime is not built yet, so no other thread can be reading
+    // the environment.
+    unsafe { std::env::remove_var(TOKEN_ENV) };
+    let listen = match (cli.listen.clone(), cli.listen_allow_remote) {
+        (Some(address), allow_remote) => Some(ListenOptions {
+            address,
+            allow_remote,
+            token: token
+                .map(|token| {
+                    token.into_string().map_err(|_| {
+                        agent_client_protocol::Error::invalid_params()
+                            .data(format!("{TOKEN_ENV} must be valid UTF-8"))
+                    })
+                })
+                .transpose()?,
+        }),
+        (None, true) => {
+            return Err(agent_client_protocol::Error::invalid_params()
+                .data("--listen-allow-remote has no effect without --listen"));
+        }
+        (None, false) => None,
+    };
     let config = Config::try_from(cli)?;
     config.validate()?;
-    run(config).await
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(agent_client_protocol::Error::into_internal_error)?
+        .block_on(async move {
+            match listen {
+                Some(listen) => serve(config, listen).await,
+                None => run(config).await,
+            }
+        })
 }

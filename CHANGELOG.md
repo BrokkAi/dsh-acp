@@ -18,6 +18,16 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   the session, so a load, resume, or fork that omits `systemPrompt` keeps it.
   Append mode behaves as before, and sessions stored by earlier versions keep
   appending.
+- `--listen <ADDR>` (`DSH_ACP_LISTEN`) serves ACP over streamable HTTP and
+  WebSocket at `/acp` instead of stdio, using the SDK's server for the
+  Streamable HTTP & WebSocket Transport RFD, which is not yet stable. Stdio
+  stays the default. Every request needs `Authorization: Bearer <token>`, with
+  the token from `DSH_ACP_LISTEN_TOKEN` or generated and printed once to
+  stderr. Only loopback addresses are allowed unless `--listen-allow-remote`
+  is given, and requests naming another `Host` or carrying a browser `Origin`
+  are refused. One ACP connection is served at a time; each starts with
+  nothing in memory, like a new stdio process, and can load or resume saved
+  sessions.
 
 ### Fixed
 
