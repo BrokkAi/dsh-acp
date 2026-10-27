@@ -6,6 +6,16 @@
 client, MCP connections, and tool execution. ACP stdout carries JSON-RPC only;
 logs and tracing go to stderr.
 
+Without `RUST_LOG`, the log filter is `dsh_acp=info,warn`, or
+`dsh_acp=trace,info` with `--trace`, and it drops the SDK's events that carry
+a `handler` field. Those describe the SDK's whole handler chain, about 1 MB
+for each rejected message, which can fill a stderr pipe the client does not
+drain. The SDK still logs each error response it sends, with its method and
+id. `RUST_LOG` replaces the default filter entirely. Hand-rolled request
+handlers answer invalid params with `respond_with_error`. Returning the error
+gets it answered too, but through the SDK's handler-error path, which logs
+that warning.
+
 The SDK protocol router selects the v1 or v2 implementation from the first
 `initialize` request. Shared application logic lives behind that boundary so
 wire-specific behavior does not leak across versions.
