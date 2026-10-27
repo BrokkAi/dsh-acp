@@ -69,6 +69,18 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   server now fails the request once `--mcp-connect-timeout-secs` passes, with
   an error naming the server, and the stdio server processes started for the
   request are killed.
+- `session/cancel` now stops a turn that is waiting on an MCP server. The turn
+  held the session's state lock during an MCP `tools/call` and during the
+  `tools/list` refresh at the start of each round, and `session/cancel` needs
+  that lock, so the cancel waited until the MCP server answered: up to the
+  180-second HTTP timeout, or indefinitely for a stdio server that never
+  replies. The connection handles messages in order, so every later message
+  waited too, and requests that use the session's state, such as
+  `session/set_mode`, waited even without a cancel. The turn now takes the lock
+  only to look up the session's MCP servers, so the cancel stops the MCP
+  request at once. An interrupted MCP tool call is reported as failed, an ACP
+  v1 prompt ends with `stopReason: "cancelled"`, and ACP v2 settles to idle
+  with `cancelled`.
 
 ## 0.4.0 - 2026-10-25
 

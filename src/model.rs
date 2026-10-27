@@ -585,7 +585,9 @@ pub struct SessionState {
     /// Keys of the tool calls allowed for this session
     /// (`crate::tools::session_approval_key`).
     pub session_approvals: std::collections::HashSet<String>,
-    pub mcp: Option<crate::mcp::McpSession>,
+    /// Cloned out before any MCP request, so the state lock is never held
+    /// while waiting on an MCP server and `session/cancel` can reach the turn.
+    pub mcp: Option<Arc<crate::mcp::McpSession>>,
 }
 
 impl SessionRuntime {

@@ -3330,6 +3330,344 @@ async fn v2_cancel_settles_foreground_work_to_idle_cancelled() {
 }
 
 #[tokio::test]
+async fn session_cancel_ends_a_turn_waiting_on_an_mcp_tool_call() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((mcp_url, call_arrived, mcp_server)) =
+        mock_stalled_http_mcp_server("tools/call").await
+    else {
+        eprintln!("skipping MCP cancellation test: loopback networking is unavailable");
+        return;
+    };
+    let Some((base_url, model_server)) =
+        mock_sequence_server(vec![mock_named_tool_call_stream("mcp__review__report")]).await
+    else {
+        eprintln!("skipping MCP cancellation test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request("initialize", json!({"protocolVersion": 1}))
+        .await;
+    let session = peer
+        .request(
+            "session/new",
+            json!({
+                "cwd": temp.path().to_string_lossy(),
+                "mcpServers": [{"type":"http", "name":"review", "url":mcp_url, "headers":[]}],
+                "additionalDirectories": []
+            }),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+    let prompt_id = peer.next_id;
+    peer.next_id += 1;
+    peer.write(json!({
+        "jsonrpc": "2.0",
+        "id": prompt_id,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "report"}]
+        }
+    }))
+    .await;
+    wait_for_stalled_mcp_call(&mut peer, call_arrived).await;
+
+    // A request that needs the session's state is answered while the MCP
+    // server still holds the call.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        peer.request(
+            "session/set_mode",
+            json!({"sessionId": session_id, "modeId": "agent"}),
+        ),
+    )
+    .await
+    .expect("session/set_mode should not wait for the MCP call");
+
+    peer.write(json!({
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": {"sessionId": session_id}
+    }))
+    .await;
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let message = peer.next_message().await;
+            if message.get("id").and_then(Value::as_u64) == Some(prompt_id) {
+                return message;
+            }
+            peer.updates.push(message);
+        }
+    })
+    .await
+    .expect("session/cancel should end the turn without waiting for the MCP call");
+    assert_eq!(response["result"]["stopReason"], "cancelled");
+    assert_eq!(final_tool_status(&peer, "call-mcp"), Some("failed"));
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    model_server.abort();
+    mcp_server.abort();
+}
+
+#[tokio::test]
+async fn v2_cancel_ends_work_waiting_on_an_mcp_tool_call() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((mcp_url, call_arrived, mcp_server)) =
+        mock_stalled_http_mcp_server("tools/call").await
+    else {
+        eprintln!("skipping v2 MCP cancellation test: loopback networking is unavailable");
+        return;
+    };
+    let Some((base_url, model_server)) =
+        mock_sequence_server(vec![mock_named_tool_call_stream("mcp__review__report")]).await
+    else {
+        eprintln!("skipping v2 MCP cancellation test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request(
+        "initialize",
+        json!({
+            "protocolVersion": 2,
+            "info": {"name": "v2-test-client", "version": "1.0.0"},
+            "capabilities": {}
+        }),
+    )
+    .await;
+    let session = peer
+        .request(
+            "session/new",
+            json!({
+                "cwd": temp.path().to_string_lossy(),
+                "mcpServers": [{"type":"http", "name":"review", "url":mcp_url, "headers":[]}],
+                "additionalDirectories": []
+            }),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+    peer.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "report"}]
+        }),
+    )
+    .await;
+    wait_for_stalled_mcp_call(&mut peer, call_arrived).await;
+
+    // A request that needs the session's state is answered while the MCP
+    // server still holds the call.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        peer.request(
+            "session/set_config_option",
+            json!({
+                "sessionId": session_id,
+                "configId": "mode",
+                "type": "id",
+                "value": "agent"
+            }),
+        ),
+    )
+    .await
+    .expect("session/set_config_option should not wait for the MCP call");
+
+    peer.write(json!({
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": {"sessionId": session_id}
+    }))
+    .await;
+    let idle = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let message = peer.next_message().await;
+            if message["params"]["update"]["sessionUpdate"] == "state_update"
+                && message["params"]["update"]["state"] == "idle"
+            {
+                return message;
+            }
+            peer.updates.push(message);
+        }
+    })
+    .await
+    .expect("session/cancel should settle the work without waiting for the MCP call");
+    assert_eq!(idle["params"]["update"]["stopReason"], "cancelled");
+    assert_eq!(final_tool_status(&peer, "call-mcp"), Some("failed"));
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    model_server.abort();
+    mcp_server.abort();
+}
+
+#[tokio::test]
+async fn session_cancel_ends_a_turn_waiting_on_an_mcp_tool_refresh() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((mcp_url, refresh_arrived, mcp_server)) =
+        mock_stalled_http_mcp_server("tools/list").await
+    else {
+        eprintln!("skipping MCP refresh cancellation test: loopback networking is unavailable");
+        return;
+    };
+    // The turn is cancelled before it asks the model anything.
+    let Some((base_url, model_server)) = mock_slow_deepseek_server().await else {
+        eprintln!("skipping MCP refresh cancellation test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request("initialize", json!({"protocolVersion": 1}))
+        .await;
+    let session = peer
+        .request(
+            "session/new",
+            json!({
+                "cwd": temp.path().to_string_lossy(),
+                "mcpServers": [{"type":"http", "name":"review", "url":mcp_url, "headers":[]}],
+                "additionalDirectories": []
+            }),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+    let prompt_id = peer.next_id;
+    peer.next_id += 1;
+    peer.write(json!({
+        "jsonrpc": "2.0",
+        "id": prompt_id,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "report"}]
+        }
+    }))
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), refresh_arrived)
+        .await
+        .expect("the turn should refresh its MCP tools")
+        .unwrap();
+
+    peer.write(json!({
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": {"sessionId": session_id}
+    }))
+    .await;
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let message = peer.next_message().await;
+            if message.get("id").and_then(Value::as_u64) == Some(prompt_id) {
+                return message;
+            }
+            peer.updates.push(message);
+        }
+    })
+    .await
+    .expect("session/cancel should end the turn without waiting for tools/list");
+    assert_eq!(response["result"]["stopReason"], "cancelled");
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    model_server.abort();
+    mcp_server.abort();
+}
+
+#[tokio::test]
+async fn v2_cancel_ends_work_waiting_on_an_mcp_tool_refresh() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((mcp_url, refresh_arrived, mcp_server)) =
+        mock_stalled_http_mcp_server("tools/list").await
+    else {
+        eprintln!("skipping v2 MCP refresh cancellation test: loopback networking is unavailable");
+        return;
+    };
+    // The work is cancelled before it asks the model anything.
+    let Some((base_url, model_server)) = mock_slow_deepseek_server().await else {
+        eprintln!("skipping v2 MCP refresh cancellation test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request(
+        "initialize",
+        json!({
+            "protocolVersion": 2,
+            "info": {"name": "v2-test-client", "version": "1.0.0"},
+            "capabilities": {}
+        }),
+    )
+    .await;
+    let session = peer
+        .request(
+            "session/new",
+            json!({
+                "cwd": temp.path().to_string_lossy(),
+                "mcpServers": [{"type":"http", "name":"review", "url":mcp_url, "headers":[]}],
+                "additionalDirectories": []
+            }),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+    peer.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "report"}]
+        }),
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), refresh_arrived)
+        .await
+        .expect("the work should refresh its MCP tools")
+        .unwrap();
+
+    peer.write(json!({
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": {"sessionId": session_id}
+    }))
+    .await;
+    let idle = next_v2_idle(&mut peer).await;
+    assert_eq!(idle["params"]["update"]["stopReason"], "cancelled");
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    model_server.abort();
+    mcp_server.abort();
+}
+
+/// Reads updates until the model's MCP tool call is running, then waits for it
+/// to reach `mock_stalled_http_mcp_server`.
+async fn wait_for_stalled_mcp_call(
+    peer: &mut Peer,
+    call_arrived: tokio::sync::oneshot::Receiver<()>,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let message = peer.next_message().await;
+            let running = message["params"]["update"]["sessionUpdate"] == "tool_call_update"
+                && message["params"]["update"]["toolCallId"] == "call-mcp"
+                && message["params"]["update"]["status"] == "in_progress";
+            peer.updates.push(message);
+            if running {
+                break;
+            }
+        }
+        call_arrived.await.unwrap();
+    })
+    .await
+    .expect("the model's MCP tool call should reach the MCP server");
+}
+
+/// The status in the last update for the tool call that has one.
+fn final_tool_status<'a>(peer: &'a Peer, tool_call_id: &str) -> Option<&'a str> {
+    peer.updates
+        .iter()
+        .rev()
+        .map(|update| &update["params"]["update"])
+        .filter(|update| update["toolCallId"] == tool_call_id)
+        .find_map(|update| update["status"].as_str())
+}
+
+#[tokio::test]
 async fn cancel_request_ends_an_in_flight_prompt_with_request_cancelled() {
     let temp = tempfile::tempdir().unwrap();
     let Some((base_url, server)) = mock_slow_deepseek_server().await else {
@@ -4261,43 +4599,83 @@ async fn mock_http_mcp_server(
         for _ in 0..request_count {
             let (mut socket, _) = listener.accept().await.unwrap();
             let request = read_http_json_body(&mut socket).await;
-            let response = match request["method"].as_str().unwrap() {
-                "initialize" => json!({"jsonrpc":"2.0", "id":request["id"], "result":{
-                    "protocolVersion":"2025-06-18", "capabilities":{"tools":{}},
-                    "serverInfo":{"name":"mock", "version":"1"}
-                }}),
-                "notifications/initialized" => Value::Null,
-                "tools/list" => json!({"jsonrpc":"2.0", "id":request["id"], "result":{"tools":[
-                    {"name":"report", "description":"Report findings", "inputSchema":{"type":"object"}, "annotations":{"readOnlyHint":true}},
-                    {"name":"mutate", "description":"Change state", "inputSchema":{"type":"object"}}
-                ]}}),
-                "tools/call" => {
-                    json!({"jsonrpc":"2.0", "id":request["id"], "result":{"content":[{"type":"text","text":"reported"}]}})
-                }
-                method => panic!("unexpected MCP method: {method}"),
-            };
-            requests.push(request.clone());
-            if request.get("id").is_none() {
-                socket
-                    .write_all(
-                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    )
-                    .await
-                    .unwrap();
-            } else {
-                let body = serde_json::to_vec(&response).unwrap();
-                let headers = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: test-session\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                socket.write_all(headers.as_bytes()).await.unwrap();
-                socket.write_all(&body).await.unwrap();
-            }
-            socket.shutdown().await.unwrap();
+            answer_mock_mcp_request(&mut socket, &request).await;
+            requests.push(request);
         }
         requests
     });
     Some((format!("http://{address}"), task))
+}
+
+/// How long `mock_stalled_http_mcp_server` holds the request it stalls: far
+/// longer than a test waits for a cancelled turn to end.
+const STALLED_MCP_REQUEST: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Serves MCP like `mock_http_mcp_server`, but answers the first `method`
+/// request after the connection handshake only after `STALLED_MCP_REQUEST`.
+/// The receiver fires once that request has arrived.
+async fn mock_stalled_http_mcp_server(
+    method: &'static str,
+) -> Option<(
+    String,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let listener = loopback_listener().await?;
+    let address = listener.local_addr().unwrap();
+    let (arrived, stalled) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut arrived = Some(arrived);
+        // initialize, notifications/initialized, and tools/list.
+        let mut handshake = 3;
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_json_body(&mut socket).await;
+            if handshake > 0 {
+                handshake -= 1;
+            } else if request["method"] == method
+                && let Some(arrived) = arrived.take()
+            {
+                let _ = arrived.send(());
+                tokio::time::sleep(STALLED_MCP_REQUEST).await;
+            }
+            answer_mock_mcp_request(&mut socket, &request).await;
+        }
+    });
+    Some((format!("http://{address}"), stalled, task))
+}
+
+async fn answer_mock_mcp_request(socket: &mut tokio::net::TcpStream, request: &Value) {
+    let response = match request["method"].as_str().unwrap() {
+        "initialize" => json!({"jsonrpc":"2.0", "id":request["id"], "result":{
+            "protocolVersion":"2025-06-18", "capabilities":{"tools":{}},
+            "serverInfo":{"name":"mock", "version":"1"}
+        }}),
+        "notifications/initialized" => Value::Null,
+        "tools/list" => json!({"jsonrpc":"2.0", "id":request["id"], "result":{"tools":[
+            {"name":"report", "description":"Report findings", "inputSchema":{"type":"object"}, "annotations":{"readOnlyHint":true}},
+            {"name":"mutate", "description":"Change state", "inputSchema":{"type":"object"}}
+        ]}}),
+        "tools/call" => {
+            json!({"jsonrpc":"2.0", "id":request["id"], "result":{"content":[{"type":"text","text":"reported"}]}})
+        }
+        method => panic!("unexpected MCP method: {method}"),
+    };
+    if request.get("id").is_none() {
+        socket
+            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    } else {
+        let body = serde_json::to_vec(&response).unwrap();
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: test-session\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(headers.as_bytes()).await.unwrap();
+        socket.write_all(&body).await.unwrap();
+    }
+    socket.shutdown().await.unwrap();
 }
 
 /// Waits for the mock MCP server to serve every request it expects, so a

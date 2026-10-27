@@ -1,4 +1,8 @@
-use std::{process::Stdio, sync::Arc, time::Duration};
+use std::{
+    process::Stdio,
+    sync::{Arc, PoisonError, RwLock, RwLockReadGuard},
+    time::Duration,
+};
 
 use agent_client_protocol::{
     Error,
@@ -45,9 +49,13 @@ impl McpToolMetadata {
     }
 }
 
+/// The MCP servers of a session. Sessions share it through an `Arc` so a call
+/// or refresh runs without the session state lock; each client serializes its
+/// own requests.
 pub struct McpSession {
     clients: Vec<Arc<McpClient>>,
-    tools: Vec<McpToolMetadata>,
+    /// Its lock is never held across an await.
+    tools: RwLock<Vec<McpToolMetadata>>,
 }
 
 impl std::fmt::Debug for McpSession {
@@ -73,7 +81,7 @@ impl McpSession {
     ) -> Result<Self, Error> {
         let mut session = Self {
             clients: Vec::new(),
-            tools: Vec::new(),
+            tools: RwLock::new(Vec::new()),
         };
         for server in servers {
             if let Err(error) = session
@@ -119,27 +127,34 @@ impl McpSession {
                     setup_timeout.as_secs()
                 ))
             })??;
-        self.tools.extend(
-            tools
-                .into_iter()
-                .map(|tool| McpToolMetadata::new(client.name(), tool)),
-        );
+        self.tools
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(
+                tools
+                    .into_iter()
+                    .map(|tool| McpToolMetadata::new(client.name(), tool)),
+            );
         Ok(())
     }
 
-    pub async fn refresh(&mut self, cancellation: &CancellationToken) -> Result<(), Error> {
+    pub async fn refresh(&self, cancellation: &CancellationToken) -> Result<(), Error> {
         let mut tools = Vec::new();
         for client in &self.clients {
             for tool in client.list_tools(cancellation).await? {
                 tools.push(McpToolMetadata::new(client.name(), tool));
             }
         }
-        self.tools = tools;
+        *self.tools.write().unwrap_or_else(PoisonError::into_inner) = tools;
         Ok(())
     }
 
+    fn tools(&self) -> RwLockReadGuard<'_, Vec<McpToolMetadata>> {
+        self.tools.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub fn definitions(&self) -> Vec<Value> {
-        self.tools
+        self.tools()
             .iter()
             .map(|tool| {
                 function_tool(
@@ -152,19 +167,19 @@ impl McpSession {
     }
 
     pub fn has_tool(&self, qualified_name: &str) -> bool {
-        self.tools
+        self.tools()
             .iter()
             .any(|tool| tool.qualified_name == qualified_name)
     }
 
     pub fn is_read_only(&self, qualified_name: &str) -> bool {
-        self.tools
+        self.tools()
             .iter()
             .any(|tool| tool.qualified_name == qualified_name && tool.read_only)
     }
 
     pub fn read_only_names(&self) -> Vec<String> {
-        self.tools
+        self.tools()
             .iter()
             .filter(|tool| tool.read_only)
             .map(|tool| tool.qualified_name.clone())
@@ -177,18 +192,21 @@ impl McpSession {
         arguments: Value,
         cancellation: &CancellationToken,
     ) -> Result<Value, Error> {
-        let metadata = self
-            .tools
-            .iter()
-            .find(|tool| tool.qualified_name == qualified_name)
-            .ok_or_else(|| Error::invalid_params().data("unknown MCP tool"))?;
+        let (server_name, original_name) = {
+            let tools = self.tools();
+            let metadata = tools
+                .iter()
+                .find(|tool| tool.qualified_name == qualified_name)
+                .ok_or_else(|| Error::invalid_params().data("unknown MCP tool"))?;
+            (metadata.server_name.clone(), metadata.original_name.clone())
+        };
         let client = self
             .clients
             .iter()
-            .find(|client| client.name() == metadata.server_name)
+            .find(|client| client.name() == server_name)
             .ok_or_else(|| Error::internal_error().data("MCP server route is missing"))?;
         client
-            .call_tool(&metadata.original_name, arguments, cancellation)
+            .call_tool(&original_name, arguments, cancellation)
             .await
     }
 }
