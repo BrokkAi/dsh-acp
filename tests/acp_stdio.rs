@@ -1144,6 +1144,226 @@ async fn a_rejected_initialize_is_answered_before_the_server_exits() {
     }
 }
 
+/// The protocol version under test and its names for the auth methods.
+struct AuthProtocol {
+    version: u64,
+    login: &'static str,
+    logout: &'static str,
+}
+
+const AUTH_PROTOCOLS: [AuthProtocol; 2] = [
+    AuthProtocol {
+        version: 1,
+        login: "authenticate",
+        logout: "logout",
+    },
+    AuthProtocol {
+        version: 2,
+        login: "auth/login",
+        logout: "auth/logout",
+    },
+];
+
+/// Initializes `peer` and checks that its auth capabilities are exactly the
+/// existing ones plus the `auth/status` marker for this protocol version.
+async fn initialize_advertising_auth_status(peer: &mut Peer, protocol: &AuthProtocol) {
+    let v = protocol.version;
+    let (auth, expected) = if v == 1 {
+        let result = peer
+            .request(
+                "initialize",
+                json!({"protocolVersion": 1, "clientCapabilities": {}}),
+            )
+            .await;
+        // The RFD's v1 example uses a boolean.
+        (
+            result["agentCapabilities"]["auth"].clone(),
+            json!({"logout": {}, "status": true}),
+        )
+    } else {
+        let result = peer
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": 2,
+                    "info": {"name": "auth-status-test", "version": "1.0.0"},
+                    "capabilities": {}
+                }),
+            )
+            .await;
+        // v2 capability markers are objects, and v2 has no logout marker.
+        (
+            result["capabilities"]["auth"].clone(),
+            json!({"status": {}}),
+        )
+    };
+    assert_eq!(auth, expected, "v{v}: auth capabilities");
+}
+
+/// Asks for the auth state and checks that the answer leaks no credential.
+async fn auth_status(peer: &mut Peer, secrets: &[&str]) -> (bool, String) {
+    let status = peer.request("auth/status", json!({})).await;
+    let text = status.to_string();
+    for secret in secrets {
+        assert!(
+            !text.contains(secret),
+            "auth/status leaked a credential: {text}"
+        );
+    }
+    (
+        status["authenticated"]
+            .as_bool()
+            .expect("authenticated is a boolean"),
+        status["message"]
+            .as_str()
+            .expect("message is a string")
+            .to_string(),
+    )
+}
+
+#[tokio::test]
+async fn auth_status_reports_the_configured_key_until_sign_out() {
+    let secrets = ["test-key", "header-secret"];
+    for protocol in &AUTH_PROTOCOLS {
+        let v = protocol.version;
+        let temp = tempfile::tempdir().unwrap();
+        // The base URL is never contacted: the state is local.
+        let mut peer = spawn_peer(temp.path(), Some("http://127.0.0.1:9")).await;
+        initialize_advertising_auth_status(&mut peer, protocol).await;
+
+        let (authenticated, message) = auth_status(&mut peer, &secrets).await;
+        assert!(authenticated, "v{v}: a configured key: {message}");
+        assert!(message.contains("DEEPSEEK_API_KEY"), "v{v}: {message}");
+        assert_eq!(
+            auth_status(&mut peer, &secrets).await,
+            (authenticated, message),
+            "v{v}: asking again changes nothing"
+        );
+
+        peer.request(protocol.logout, json!({})).await;
+        let (authenticated, message) = auth_status(&mut peer, &secrets).await;
+        assert!(!authenticated, "v{v}: after {}: {message}", protocol.logout);
+        assert!(message.contains("disabled"), "v{v}: {message}");
+
+        peer.request(protocol.login, json!({"methodId": "deepseek-api-key"}))
+            .await;
+        let (authenticated, message) = auth_status(&mut peer, &secrets).await;
+        assert!(authenticated, "v{v}: after {}: {message}", protocol.login);
+
+        peer.request("providers/disable", json!({"providerId": "deepseek"}))
+            .await;
+        let (authenticated, message) = auth_status(&mut peer, &secrets).await;
+        assert!(!authenticated, "v{v}: after providers/disable: {message}");
+        assert!(message.contains("disabled"), "v{v}: {message}");
+
+        peer.request(
+            "providers/set",
+            json!({
+                "providerId": "deepseek",
+                "apiType": "openai",
+                "baseUrl": "http://127.0.0.1:9",
+                "headers": {"Authorization": "Bearer header-secret"}
+            }),
+        )
+        .await;
+        let (authenticated, message) = auth_status(&mut peer, &secrets).await;
+        assert!(authenticated, "v{v}: after providers/set: {message}");
+        assert!(message.contains("Authorization header"), "v{v}: {message}");
+
+        // `_meta` is the only request field, and it changes nothing.
+        let status = peer
+            .request("auth/status", json!({"_meta": {"trace": "abc"}}))
+            .await;
+        assert_eq!(status["authenticated"], true, "v{v}: with _meta");
+    }
+}
+
+#[tokio::test]
+async fn auth_status_reports_missing_credentials() {
+    let secrets = ["header-secret"];
+    for protocol in &AUTH_PROTOCOLS {
+        let v = protocol.version;
+        let temp = tempfile::tempdir().unwrap();
+        let mut peer = spawn_peer(temp.path(), None).await;
+        initialize_advertising_auth_status(&mut peer, protocol).await;
+
+        // Params are optional.
+        peer.write(json!({"jsonrpc": "2.0", "id": 900, "method": "auth/status"}))
+            .await;
+        let reply = peer.next_message().await;
+        assert_eq!(reply["id"], 900, "v{v}: {reply}");
+        assert_eq!(reply["result"]["authenticated"], false, "v{v}: {reply}");
+
+        let (authenticated, message) = auth_status(&mut peer, &secrets).await;
+        assert!(!authenticated, "v{v}: no key: {message}");
+        assert!(
+            message.contains("No DeepSeek credentials"),
+            "v{v}: {message}"
+        );
+
+        let login = peer
+            .request_error(protocol.login, json!({"methodId": "deepseek-api-key"}))
+            .await;
+        assert_eq!(login["code"], -32000, "v{v}: {login}");
+        assert_eq!(
+            auth_status(&mut peer, &secrets).await,
+            (authenticated, message),
+            "v{v}: a failed {} changes nothing",
+            protocol.login
+        );
+
+        peer.request(
+            "providers/set",
+            json!({
+                "providerId": "deepseek",
+                "apiType": "openai",
+                "baseUrl": "http://127.0.0.1:9",
+                "headers": {"X-Trace": "1"}
+            }),
+        )
+        .await;
+        let (authenticated, message) = auth_status(&mut peer, &secrets).await;
+        assert!(
+            !authenticated,
+            "v{v}: headers without Authorization: {message}"
+        );
+        assert!(
+            message.contains("No DeepSeek credentials"),
+            "v{v}: {message}"
+        );
+
+        peer.request(
+            "providers/set",
+            json!({
+                "providerId": "deepseek",
+                "apiType": "openai",
+                "baseUrl": "http://127.0.0.1:9",
+                "headers": {"authorization": "Bearer header-secret"}
+            }),
+        )
+        .await;
+        let (authenticated, message) = auth_status(&mut peer, &secrets).await;
+        assert!(
+            authenticated,
+            "v{v}: provider Authorization header: {message}"
+        );
+        assert!(message.contains("Authorization header"), "v{v}: {message}");
+
+        peer.request(protocol.logout, json!({})).await;
+        let (authenticated, message) = auth_status(&mut peer, &secrets).await;
+        assert!(!authenticated, "v{v}: after {}: {message}", protocol.logout);
+        assert!(message.contains("disabled"), "v{v}: {message}");
+
+        peer.request(protocol.login, json!({"methodId": "deepseek-api-key"}))
+            .await;
+        let (authenticated, message) = auth_status(&mut peer, &secrets).await;
+        assert!(authenticated, "v{v}: after {}: {message}", protocol.login);
+
+        let unknown = peer.request_error("auth/unknown", json!({})).await;
+        assert_eq!(unknown["code"], -32601, "v{v}: {unknown}");
+    }
+}
+
 async fn spawn_peer(data_dir: &std::path::Path, base_url: Option<&str>) -> Peer {
     spawn_peer_with_args(data_dir, base_url, &[]).await
 }

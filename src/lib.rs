@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod auth_status;
 pub mod config;
 pub mod deepseek;
 pub mod mcp;

@@ -42,6 +42,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    auth_status,
     config::{Config, PermissionMode, ReasoningEffort},
     deepseek::{Completion, DeepSeekClient, StreamEvent},
     mcp::{McpSession, mcp_result_text},
@@ -77,6 +78,38 @@ pub(crate) struct ProviderRouting {
     pub(crate) enabled: bool,
     pub(crate) base_url: String,
     pub(crate) headers: std::collections::HashMap<String, String>,
+}
+
+/// Where the credential for DeepSeek requests comes from.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Credential {
+    /// An `Authorization` header from the provider configuration. It takes
+    /// precedence over the API key.
+    ProviderHeader,
+    /// `DEEPSEEK_API_KEY` or `--api-key`.
+    ApiKey,
+}
+
+impl ProviderRouting {
+    /// The credential DeepSeek requests would carry, whether or not the
+    /// provider is enabled. A blank API key does not count.
+    pub(crate) fn credential(&self, config: &Config) -> Option<Credential> {
+        if self
+            .headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("authorization"))
+        {
+            Some(Credential::ProviderHeader)
+        } else if config
+            .api_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty())
+        {
+            Some(Credential::ApiKey)
+        } else {
+            None
+        }
+    }
 }
 
 pub async fn run(config: Config) -> agent_client_protocol::Result<()> {
@@ -303,7 +336,7 @@ pub async fn run(config: Config) -> agent_client_protocol::Result<()> {
                             connection: ConnectionTo<Client>| {
                     match request.method.as_str() {
                         // Answered as JSON: the SDK capability types cannot advertise
-                        // `session/status` yet.
+                        // `auth/status` or `session/status` yet.
                         "initialize" => {
                             match InitializeRequest::parse_message(&request.method, &request.params)
                             {
@@ -328,6 +361,7 @@ pub async fn run(config: Config) -> agent_client_protocol::Result<()> {
                                 .session_status(request.params, responder)
                                 .await
                         }
+                        auth_status::METHOD => responder.respond(harness.auth_status().await),
                         _ => responder.respond_with_error(Error::method_not_found()),
                     }
                 }
@@ -351,6 +385,26 @@ pub async fn run(config: Config) -> agent_client_protocol::Result<()> {
         .with_v2(crate::v2_agent::component(harness.clone()))
         .connect_to(stdio_transport())
         .await
+}
+
+/// Serializes an `initialize` response and adds capability markers the SDK's
+/// capability types have no field for yet. Each marker is the JSON pointer of
+/// an existing capabilities object, a field name, and its value.
+pub(crate) fn with_extra_capabilities(
+    response: impl serde::Serialize,
+    markers: &[(&str, &str, Value)],
+) -> Result<Value, Error> {
+    let mut response = serde_json::to_value(response).map_err(Error::into_internal_error)?;
+    for (pointer, name, value) in markers {
+        response
+            .pointer_mut(pointer)
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                Error::internal_error().data(format!("initialize response has no {pointer}"))
+            })?
+            .insert((*name).to_string(), value.clone());
+    }
+    Ok(response)
 }
 
 /// Stdio as a transport the protocol router can finish.
@@ -425,7 +479,17 @@ impl Harness {
                 "steering".to_string(),
                 json!({"supported": true, "idleBehaviors": ["promptRequired"]}),
             )])));
-        match session_status::advertise(response, "/agentCapabilities/sessionCapabilities") {
+        match with_extra_capabilities(
+            response,
+            &[
+                (
+                    "/agentCapabilities/sessionCapabilities",
+                    "status",
+                    json!({}),
+                ),
+                ("/agentCapabilities/auth", "status", json!(true)),
+            ],
+        ) {
             Ok(response) => responder.respond(response),
             Err(error) => responder.respond_with_error(error),
         }
@@ -440,18 +504,13 @@ impl Harness {
             return responder
                 .respond_with_error(Error::invalid_params().data("unknown authentication method"));
         }
-        let routing = self.provider.read().await.clone();
-        let has_provider_auth = routing
-            .headers
-            .keys()
-            .any(|name| name.eq_ignore_ascii_case("authorization"));
-        let has_api_key = self
-            .config
-            .api_key
-            .as_deref()
-            .is_some_and(|key| !key.trim().is_empty());
-        drop(routing);
-        if has_api_key || has_provider_auth {
+        let has_credential = self
+            .provider
+            .read()
+            .await
+            .credential(&self.config)
+            .is_some();
+        if has_credential {
             self.provider.write().await.enabled = true;
             responder.respond(AuthenticateResponse::new())
         } else {

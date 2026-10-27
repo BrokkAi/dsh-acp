@@ -45,6 +45,14 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   `sessionCapabilities.status` in v1 and `session.status` in v2. The SDK has no
   types for the method yet, so its shape follows the RFD and may change with
   it.
+- `auth/status` from the Draft Agent Authentication State Query RFD, in both
+  protocol versions. It tells a client whether a DeepSeek credential is
+  configured (`DEEPSEEK_API_KEY`, `--api-key`, or a provider `Authorization`
+  header) without logging in or changing anything, and reports `false` after a
+  logout or a disabled provider until the client authenticates again. It never
+  returns the credential. It is advertised as `agentCapabilities.auth.status`
+  in v1 and `capabilities.auth.status` in v2. The SDK has no types for the
+  method yet, so its shape follows the RFD and may change with it.
 
 ### Changed
 

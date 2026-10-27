@@ -30,7 +30,8 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    agent::Harness,
+    agent::{Harness, with_extra_capabilities},
+    auth_status,
     config::ReasoningEffort,
     deepseek::{Completion, StreamEvent},
     model::{
@@ -240,7 +241,7 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
                             connection: V2ConnectionTo<Client>| {
                     match request.method.as_str() {
                         // Answered as JSON: the SDK capability types cannot advertise
-                        // `session/status` yet.
+                        // `auth/status` or `session/status` yet.
                         "initialize" => {
                             match InitializeRequest::parse_message(&request.method, &request.params)
                             {
@@ -262,6 +263,7 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
                                 .session_status(request.params, responder)
                                 .await
                         }
+                        auth_status::METHOD => responder.respond(harness.base.auth_status().await),
                         _ => responder.respond_with_error(Error::method_not_found()),
                     }
                 }
@@ -318,6 +320,8 @@ impl V2Harness {
             );
         let capabilities = AgentCapabilities::new()
             .session(session_capabilities)
+            // Empty in the SDK; it carries the `auth/status` marker added below.
+            .auth(v2::AgentAuthCapabilities::new())
             .providers(ProvidersCapabilities::new());
         let response = InitializeResponse::new(
             request.protocol_version,
@@ -333,7 +337,13 @@ impl V2Harness {
             "steering".to_string(),
             json!({"supported": true, "idleBehaviors": ["promptRequired"]}),
         )])));
-        match session_status::advertise(response, "/capabilities/session") {
+        match with_extra_capabilities(
+            response,
+            &[
+                ("/capabilities/session", "status", json!({})),
+                ("/capabilities/auth", "status", json!({})),
+            ],
+        ) {
             Ok(response) => responder.respond(response),
             Err(error) => responder.respond_with_error(error),
         }
@@ -348,18 +358,14 @@ impl V2Harness {
             return responder
                 .respond_with_error(Error::invalid_params().data("unknown authentication method"));
         }
-        let routing = self.base.provider.read().await.clone();
-        let has_provider_auth = routing
-            .headers
-            .keys()
-            .any(|name| name.eq_ignore_ascii_case("authorization"));
-        let has_api_key = self
+        let has_credential = self
             .base
-            .config
-            .api_key
-            .as_deref()
-            .is_some_and(|key| !key.trim().is_empty());
-        if has_api_key || has_provider_auth {
+            .provider
+            .read()
+            .await
+            .credential(&self.base.config)
+            .is_some();
+        if has_credential {
             self.base.provider.write().await.enabled = true;
             responder.respond(LoginAuthResponse::new())
         } else {

@@ -45,6 +45,7 @@ version's lifecycle and payload shapes.
 | System prompt append | Implemented | Advertised capability |
 | System prompt override | Implemented | Advertised `mode.override` |
 | Provider configuration | Implemented | Advertised provider capability |
+| `auth/status` | Implemented (Draft RFD) | Advertised capability |
 | MCP stdio | Implemented | Advertised transport |
 | MCP streamable HTTP | Implemented | Advertised transport |
 | Form elicitation | Implemented | Client capability |
@@ -100,6 +101,45 @@ The request does not load, resume, or change the session. As the RFD says,
 create or resume itself. An inactive session is found by checking that its
 record file exists, without reading it, so an unreadable record is still
 reported as `inactive` and fails when resumed.
+
+## Authentication status
+
+`auth/status` follows the
+[Agent Authentication State Query RFD](https://agentclientprotocol.com/rfds/get-auth-state),
+which is still a Draft. `agent-client-protocol` 3.4 has no types for it, so
+the response and capability marker are written by hand and may change with the
+RFD. Both versions advertise it with a `status` field in the agent's auth
+capabilities. v1 sends `agentCapabilities.auth.status: true`, the boolean in
+the RFD's example. The RFD shows only v1, so v2 sends
+`capabilities.auth.status: {}`, because v2 capability markers are objects
+(the client's `auth.terminal` capability is `true` in v1 and `{}` in v2).
+
+The request takes no parameters other than an optional `_meta`, and the
+result is `authenticated` plus a `message` for the user:
+
+```json
+{
+  "authenticated": true,
+  "message": "Using the DeepSeek API key from DEEPSEEK_API_KEY or --api-key."
+}
+```
+
+| State | `authenticated` |
+| --- | --- |
+| A non-blank `DEEPSEEK_API_KEY` or `--api-key`, or a provider `Authorization` header | `true` |
+| Neither of those | `false` |
+| A credential, but after `logout` (v1), `auth/logout` (v2), or `providers/disable` | `false` until a successful `authenticate`, `auth/login`, or `providers/set` |
+
+The provider `Authorization` header takes precedence over the API key, and the
+message says which one requests will use. After a logout or a disabled
+provider, prompts fail with `auth_required` until the client authenticates
+again, so that state is reported as unauthenticated even though the key is
+still configured.
+
+As the RFD allows, `true` means a credential is configured, not that DeepSeek
+accepts it; the check is local and makes no request. The query can be sent at
+any time after `initialize`, including before authenticating. It changes
+nothing and never returns the key or header values.
 
 ## Session configuration options
 

@@ -208,6 +208,11 @@ Both protocol versions advertise the `deepseek-api-key` login method and expose
 their corresponding authentication and logout requests. Credentials still come
 from the launch environment, CLI, or provider configuration; the protocol login
 method re-enables a configured provider rather than carrying a secret inline.
+Clients can ask whether a credential is configured, without logging in, through
+`auth/status` from the Draft
+[Agent Authentication State Query RFD](https://agentclientprotocol.com/rfds/get-auth-state),
+advertised as `auth.status` in the agent's capabilities. See
+[docs/acp-support.md](docs/acp-support.md#authentication-status).
 
 Legacy SSE-only MCP transports are best effort and are not advertised.
 MCP-over-ACP requires a proxy component and is not advertised by this
