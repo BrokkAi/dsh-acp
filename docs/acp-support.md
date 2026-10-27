@@ -218,6 +218,14 @@ The session `cwd` and additional roots define the filesystem boundary. Sensitive
 tools request permission unless the session policy or an explicit remembered
 decision allows them.
 
+A permission request that the Client answers with an error grants nothing. In
+both versions the tool does not run, its call fails with the reason, and the
+turn continues, as after a denial. That includes a Client that cancels the
+permission request itself and answers `-32800`. Only the turn's own
+cancellation ends the turn: `session/cancel`, after which the Client answers
+pending permission requests with the `cancelled` outcome, or in ACP v1 a
+`$/cancel_request` for the prompt.
+
 In plan mode, read-only MCP tools marked with `annotations.readOnlyHint: true`
 remain available and may be called. Other MCP tools are hidden and refused
 before permission is requested.

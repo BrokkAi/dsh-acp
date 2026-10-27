@@ -473,6 +473,27 @@ pub fn ask_user_failed(error: &agent_client_protocol::Error) -> ToolResult {
     error_result("Unable to request user input", error)
 }
 
+/// The failed result of a tool call whose permission request the Client
+/// answered with an error. No permission was granted, so the tool does not
+/// run, as for a denial. A Client that cancels the request itself answers
+/// `-32800`, which names no reason; that fails only this call, because only
+/// the turn's own cancellation ends the turn.
+pub fn permission_request_failed(error: &agent_client_protocol::Error) -> ToolResult {
+    let reason = if error.code == agent_client_protocol::ErrorCode::RequestCancelled {
+        "the client cancelled the permission request"
+    } else {
+        error
+            .data
+            .as_ref()
+            .and_then(Value::as_str)
+            .unwrap_or(&error.message)
+    };
+    ToolResult {
+        text: format!("Permission was not granted, so the tool call did not run: {reason}"),
+        raw: json!({"denied": true, "error": reason}),
+    }
+}
+
 /// Run `complete_url_elicitation`: take the session's accepted URL
 /// elicitation with the given ID and `send` its `elicitation/complete`. An ID
 /// that is unknown, already completed, or another session's fails the call
