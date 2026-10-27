@@ -1598,10 +1598,23 @@ async fn v1_override_system_prompt_replaces_only_the_harness_prompt() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
 
     // The mode is stored with the session, so a new process that loads it
-    // without a system prompt keeps the override.
+    // without a system prompt keeps the override. A load with an unsupported
+    // mode is refused first.
     let mut peer = spawn_peer_with_args(temp.path(), Some(&base_url), &launch_args).await;
     peer.request("initialize", json!({"protocolVersion": 1}))
         .await;
+    let refused = peer
+        .request_error(
+            "session/load",
+            json!({
+                "sessionId": session_id,
+                "cwd": workspace,
+                "mcpServers": [],
+                "systemPrompt": client_system_prompt("_custom", "client persona v2")
+            }),
+        )
+        .await;
+    assert_eq!(refused["code"], -32602, "{refused}");
     peer.request(
         "session/load",
         json!({"sessionId": session_id, "cwd": workspace, "mcpServers": []}),
@@ -1636,13 +1649,32 @@ async fn v1_override_system_prompt_replaces_only_the_harness_prompt() {
         )
         .await;
     let fork_id = fork["sessionId"].as_str().unwrap().to_string();
+    // Plan mode still adds its instructions to an overridden prompt.
+    peer.request(
+        "session/set_mode",
+        json!({"sessionId": fork_id, "modeId": "plan"}),
+    )
+    .await;
     peer.request(
         "session/prompt",
         json!({"sessionId": fork_id, "prompt": [{"type": "text", "text": "third"}]}),
     )
     .await;
 
-    // Resuming with append brings the harness prompt back.
+    // A resume with an unsupported mode is refused; one with append brings
+    // the harness prompt back.
+    let refused = peer
+        .request_error(
+            "session/resume",
+            json!({
+                "sessionId": session_id,
+                "cwd": workspace,
+                "mcpServers": [],
+                "systemPrompt": client_system_prompt("_custom", "client persona v2")
+            }),
+        )
+        .await;
+    assert_eq!(refused["code"], -32602, "{refused}");
     peer.request(
         "session/resume",
         json!({
@@ -1665,6 +1697,12 @@ async fn v1_override_system_prompt_replaces_only_the_harness_prompt() {
     for request in &requests[..3] {
         assert_overridden(system_prompt_of(request), "client persona v1");
     }
+    let planned = system_prompt_of(&requests[2]);
+    assert!(
+        planned.contains("The session is in plan mode."),
+        "{planned}"
+    );
+    assert!(!system_prompt_of(&requests[1]).contains("The session is in plan mode."));
     assert_appended(system_prompt_of(&requests[3]), "client persona v2");
 }
 
@@ -1758,7 +1796,22 @@ async fn v2_override_system_prompt_replaces_only_the_harness_prompt() {
     .await;
     next_v2_idle(&mut peer).await;
 
-    // A fork applies the system prompt it carries.
+    // A fork with an unsupported mode creates nothing; one that carries a
+    // system prompt applies it.
+    let refused = peer
+        .request_error(
+            "session/fork",
+            json!({
+                "sessionId": session_id,
+                "cwd": workspace,
+                "mcpServers": [],
+                "systemPrompt": client_system_prompt("_custom", "client persona v2")
+            }),
+        )
+        .await;
+    assert_eq!(refused["code"], -32602, "{refused}");
+    let list = peer.request("session/list", json!({})).await;
+    assert_eq!(list["sessions"].as_array().unwrap().len(), 1, "{list}");
     let fork = peer
         .request(
             "session/fork",
@@ -1803,6 +1856,174 @@ async fn v2_override_system_prompt_replaces_only_the_harness_prompt() {
     assert_overridden(system_prompt_of(&requests[1]), "client persona v1");
     assert_overridden(system_prompt_of(&requests[2]), "client persona v2");
     assert_appended(system_prompt_of(&requests[3]), "client persona v3");
+}
+
+/// The client system prompt and mode stored in a session's file.
+fn stored_system_prompt(data_dir: &std::path::Path, session_id: &str) -> (Value, Value) {
+    let path = data_dir
+        .join("sessions-data")
+        .join("sessions")
+        .join(format!("{session_id}.json"));
+    let record: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    (
+        record["system_prompt"].clone(),
+        record["system_prompt_mode"].clone(),
+    )
+}
+
+#[tokio::test]
+async fn v1_a_load_or_resume_whose_mcp_server_fails_changes_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("AGENTS.md"), "workspace instructions\n").unwrap();
+    let Some((base_url, server)) = mock_sequence_server(vec![mock_text_stream(); 2]).await else {
+        eprintln!("skipping v1 MCP failure test: loopback networking is unavailable");
+        return;
+    };
+    let missing_server = json!({
+        "name": "missing",
+        "command": temp.path().join("missing-mcp-server"),
+        "args": [],
+        "env": []
+    });
+    let mut peer = spawn_peer_with_args(
+        temp.path(),
+        Some(&base_url),
+        &["--system-prompt", "launch instructions"],
+    )
+    .await;
+    peer.request("initialize", json!({"protocolVersion": 1}))
+        .await;
+    let session = peer
+        .request(
+            "session/new",
+            json!({
+                "cwd": workspace,
+                "mcpServers": [],
+                "systemPrompt": client_system_prompt("override", "client persona v1")
+            }),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+    peer.request(
+        "session/prompt",
+        json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "first"}]}),
+    )
+    .await;
+
+    peer.request_error(
+        "session/resume",
+        json!({
+            "sessionId": session_id,
+            "cwd": workspace,
+            "mcpServers": [missing_server],
+            "systemPrompt": client_system_prompt("append", "client persona v2")
+        }),
+    )
+    .await;
+    peer.request_error(
+        "session/load",
+        json!({
+            "sessionId": session_id,
+            "cwd": workspace,
+            "mcpServers": [missing_server],
+            "systemPrompt": client_system_prompt("append", "client persona v3")
+        }),
+    )
+    .await;
+    assert_eq!(
+        stored_system_prompt(temp.path(), &session_id),
+        (json!("client persona v1"), json!("override"))
+    );
+    peer.request(
+        "session/prompt",
+        json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "second"}]}),
+    )
+    .await;
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    let requests = server.await.unwrap();
+    for request in &requests {
+        assert_overridden(system_prompt_of(request), "client persona v1");
+    }
+}
+
+#[tokio::test]
+async fn v2_a_resume_whose_mcp_server_fails_changes_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("AGENTS.md"), "workspace instructions\n").unwrap();
+    let Some((base_url, server)) = mock_sequence_server(vec![mock_text_stream(); 2]).await else {
+        eprintln!("skipping v2 MCP failure test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer_with_args(
+        temp.path(),
+        Some(&base_url),
+        &["--system-prompt", "launch instructions"],
+    )
+    .await;
+    peer.request(
+        "initialize",
+        json!({
+            "protocolVersion": 2,
+            "info": {"name": "v2-test-client", "version": "1.0.0"},
+            "capabilities": {}
+        }),
+    )
+    .await;
+    let session = peer
+        .request(
+            "session/new",
+            json!({
+                "cwd": workspace,
+                "mcpServers": [],
+                "systemPrompt": client_system_prompt("override", "client persona v1")
+            }),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+    peer.request(
+        "session/prompt",
+        json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "first"}]}),
+    )
+    .await;
+    next_v2_idle(&mut peer).await;
+
+    peer.request_error(
+        "session/resume",
+        json!({
+            "sessionId": session_id,
+            "cwd": workspace,
+            "mcpServers": [{
+                "type": "stdio",
+                "name": "missing",
+                "command": temp.path().join("missing-mcp-server")
+            }],
+            "systemPrompt": client_system_prompt("append", "client persona v2")
+        }),
+    )
+    .await;
+    assert_eq!(
+        stored_system_prompt(temp.path(), &session_id),
+        (json!("client persona v1"), json!("override"))
+    );
+    peer.request(
+        "session/prompt",
+        json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "second"}]}),
+    )
+    .await;
+    next_v2_idle(&mut peer).await;
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    let requests = server.await.unwrap();
+    for request in &requests {
+        assert_overridden(system_prompt_of(request), "client persona v1");
+    }
 }
 
 #[tokio::test]

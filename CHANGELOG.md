@@ -32,6 +32,11 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   `session/cancel`. Connecting used the last turn's cancellation token, which
   stays cancelled until the next prompt, so a cancelled turn, or a cancel sent
   while the session was idle, aborted it.
+- A `session/load` or `session/resume` that failed because an MCP server did
+  not connect still applied the request's system prompt and additional
+  directories, and a v1 load had already saved them to the session file. The
+  next prompt used instructions from a request the client was told had failed.
+  Both versions now install them only after the MCP servers connect.
 
 ## 0.4.0 - 2026-10-25
 

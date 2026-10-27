@@ -587,8 +587,8 @@ impl Harness {
                 Error::invalid_params().data("invalid session workspace roots"),
             );
         }
-        {
-            let mut state = runtime.state.lock().await;
+        let instructions = {
+            let state = runtime.state.lock().await;
             if state.record.cwd != request.cwd {
                 return responder.respond_with_error(Error::invalid_params().data(format!(
                     "session cwd mismatch: stored {}, requested {}",
@@ -596,18 +596,21 @@ impl Harness {
                     request.cwd.display()
                 )));
             }
-            if let Err(error) = self.store.update_session_instructions(
-                &mut state.record,
+            match self.store.session_instructions(
+                &state.record,
                 request.additional_directories,
                 system_prompt,
             ) {
-                return responder.respond_with_error(error);
+                Ok(instructions) => instructions,
+                Err(error) => return responder.respond_with_error(error),
             }
-        }
-        if let Err(error) = self.store.save(&runtime).await {
+        };
+        // A load whose MCP servers fail to connect leaves the session as it was.
+        if let Err(error) = self.attach_mcp(&runtime, &request.mcp_servers).await {
             return responder.respond_with_error(error);
         }
-        if let Err(error) = self.attach_mcp(&runtime, &request.mcp_servers).await {
+        instructions.install(&mut runtime.state.lock().await.record);
+        if let Err(error) = self.store.save(&runtime).await {
             return responder.respond_with_error(error);
         }
         let record = runtime.snapshot().await;
@@ -655,8 +658,8 @@ impl Harness {
                 Error::invalid_request().data("cannot resume a session with active work"),
             );
         }
-        {
-            let mut state = runtime.state.lock().await;
+        let instructions = {
+            let state = runtime.state.lock().await;
             if state.record.cwd != request.cwd {
                 return responder.respond_with_error(Error::invalid_params().data(format!(
                     "session cwd mismatch: stored {}, requested {}",
@@ -669,17 +672,21 @@ impl Harness {
             {
                 return responder.respond_with_error(error);
             }
-            if let Err(error) = self.store.update_session_instructions(
-                &mut state.record,
+            match self.store.session_instructions(
+                &state.record,
                 request.additional_directories,
                 system_prompt,
             ) {
-                return responder.respond_with_error(error);
+                Ok(instructions) => instructions,
+                Err(error) => return responder.respond_with_error(error),
             }
-        }
+        };
+        // A resume whose MCP servers fail to connect leaves the session as it
+        // was.
         if let Err(error) = self.attach_mcp(&runtime, &request.mcp_servers).await {
             return responder.respond_with_error(error);
         }
+        instructions.install(&mut runtime.state.lock().await.record);
         if let Err(error) = self.store.save(&runtime).await {
             return responder.respond_with_error(error);
         }

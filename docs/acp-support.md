@@ -99,7 +99,9 @@ with `-32602` (Invalid params) and creates, loads, resumes, or forks nothing.
 
 The prompt and its mode are stored with the session. A load, resume, or fork
 that carries `systemPrompt` uses that prompt and mode. One that omits it keeps
-the stored ones, and a fork inherits its source's.
+the stored ones, and a fork inherits its source's. A load or resume whose MCP
+servers fail to connect leaves the session's prompt, mode, and additional
+directories as they were.
 
 ## Prompt lifecycle
 

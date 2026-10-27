@@ -531,8 +531,8 @@ impl V2Harness {
         {
             return responder.respond_with_error(error);
         }
-        {
-            let mut state = runtime.state.lock().await;
+        let instructions = {
+            let state = runtime.state.lock().await;
             if state.record.cwd != request.cwd.0 {
                 return responder.respond_with_error(Error::invalid_params().data(format!(
                     "session cwd mismatch: stored {}, requested {}",
@@ -540,17 +540,22 @@ impl V2Harness {
                     request.cwd.0.display()
                 )));
             }
-            if let Err(error) = self.base.store.update_session_instructions(
-                &mut state.record,
+            match self.base.store.session_instructions(
+                &state.record,
                 additional_directories,
                 system_prompt,
             ) {
-                return responder.respond_with_error(error);
+                Ok(instructions) => instructions,
+                Err(error) => return responder.respond_with_error(error),
             }
-        }
+        };
+        // A resume whose MCP servers fail to connect leaves the session as it
+        // was. Installing touches only the instructions, so a turn that is
+        // still running keeps the messages it adds meanwhile.
         if let Err(error) = self.attach_mcp(&runtime, &request.mcp_servers).await {
             return responder.respond_with_error(error);
         }
+        instructions.install(&mut runtime.state.lock().await.record);
         if let Err(error) = self.base.store.save(&runtime).await {
             return responder.respond_with_error(error);
         }

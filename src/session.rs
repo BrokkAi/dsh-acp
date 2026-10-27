@@ -243,20 +243,26 @@ impl SessionStore {
         Ok(prompt)
     }
 
-    pub fn update_session_instructions(
+    /// Build the instructions a load or resume asks for without changing the
+    /// session, so the request installs them only once its MCP servers
+    /// connect.
+    pub fn session_instructions(
         &self,
-        record: &mut SessionRecord,
+        record: &SessionRecord,
         additional_directories: Vec<PathBuf>,
         system_prompt: Option<ClientSystemPrompt>,
-    ) -> Result<(), Error> {
+    ) -> Result<SessionInstructions, Error> {
         let mut candidate = record.clone();
         candidate.additional_directories = additional_directories;
-        if let Some(system_prompt) = system_prompt {
+        if let Some(system_prompt) = system_prompt.clone() {
             candidate.set_client_system_prompt(system_prompt);
         }
-        self.rebuild_system_prompt(&mut candidate)?;
-        *record = candidate;
-        Ok(())
+        let prompt = self.effective_system_prompt(&candidate)?;
+        Ok(SessionInstructions {
+            additional_directories: candidate.additional_directories,
+            system_prompt,
+            prompt,
+        })
     }
 
     pub fn rebuild_system_prompt(&self, record: &mut SessionRecord) -> Result<(), Error> {
@@ -284,6 +290,29 @@ impl SessionStore {
                 }
             })?;
         serde_json::from_slice(&bytes).map_err(Error::into_internal_error)
+    }
+}
+
+/// The workspace roots, client system prompt, and system message a load or
+/// resume asked for, built by [`SessionStore::session_instructions`].
+#[derive(Debug)]
+pub struct SessionInstructions {
+    additional_directories: Vec<PathBuf>,
+    /// `None` keeps the session's stored client prompt.
+    system_prompt: Option<ClientSystemPrompt>,
+    prompt: String,
+}
+
+impl SessionInstructions {
+    /// Install the instructions without touching the conversation, which a
+    /// v2 turn may still be extending.
+    pub fn install(self, record: &mut SessionRecord) {
+        record.additional_directories = self.additional_directories;
+        if let Some(system_prompt) = self.system_prompt {
+            record.set_client_system_prompt(system_prompt);
+        }
+        record.install_system_prompt(self.prompt);
+        record.touch();
     }
 }
 
@@ -587,15 +616,17 @@ mod tests {
 
         let mut appended = record.clone();
         store
-            .update_session_instructions(
-                &mut appended,
+            .session_instructions(
+                &record,
                 Vec::new(),
                 Some(ClientSystemPrompt {
                     mode: ClientPromptMode::Append,
                     text: "client persona".to_string(),
                 }),
             )
-            .unwrap();
+            .unwrap()
+            .install(&mut appended);
+        assert_eq!(appended.system_prompt_mode, ClientPromptMode::Append);
         let prompt = appended.messages[0].text_content().unwrap();
         assert!(prompt.starts_with(BUILT_IN_SYSTEM_PROMPT), "{prompt}");
         assert!(prompt.ends_with("Client-provided system instructions:\nclient persona\n"));
@@ -701,7 +732,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_instruction_refresh_does_not_mutate_the_record() {
+    async fn unreadable_instructions_fail_the_refresh() {
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path().join("data");
         let workspace = temp.path().join("workspace");
@@ -738,14 +769,13 @@ mod tests {
             )
             .await
             .unwrap();
-        let mut record = runtime.snapshot().await;
-        let original_prompt = record.messages[0].clone();
+        let record = runtime.snapshot().await;
         std::fs::write(workspace.join("AGENTS.md"), [0xff, 0xfe]).unwrap();
 
         assert!(
             store
-                .update_session_instructions(
-                    &mut record,
+                .session_instructions(
+                    &record,
                     vec![extra],
                     Some(ClientSystemPrompt {
                         mode: ClientPromptMode::Override,
@@ -754,15 +784,5 @@ mod tests {
                 )
                 .is_err()
         );
-        assert!(
-            record
-                .system_prompt
-                .as_deref()
-                .unwrap()
-                .contains("client instructions v1")
-        );
-        assert_eq!(record.system_prompt_mode, ClientPromptMode::Append);
-        assert!(record.additional_directories.is_empty());
-        assert_eq!(record.messages[0], original_prompt);
     }
 }
