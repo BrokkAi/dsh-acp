@@ -75,6 +75,11 @@ struct Cli {
     #[arg(long, env = "DSH_ACP_HTTP_TIMEOUT_SECS", default_value_t = 180)]
     http_timeout_secs: u64,
 
+    /// Seconds each MCP server has to start, finish the MCP handshake, and
+    /// list its tools when a session is created, loaded, resumed, or forked.
+    #[arg(long, env = "DSH_ACP_MCP_CONNECT_TIMEOUT_SECS", default_value_t = 60)]
+    mcp_connect_timeout_secs: u64,
+
     /// Disable web_fetch even when tools are available.
     #[arg(long, env = "DSH_ACP_DISABLE_WEB", default_value_t = false)]
     disable_web: bool,
@@ -124,6 +129,7 @@ impl TryFrom<Cli> for Config {
             context_chars: cli.context_chars,
             tool_output_bytes: cli.tool_output_bytes,
             http_timeout: std::time::Duration::from_secs(cli.http_timeout_secs),
+            mcp_connect_timeout: std::time::Duration::from_secs(cli.mcp_connect_timeout_secs),
             disable_web: cli.disable_web,
             trace: cli.trace,
         })

@@ -1188,8 +1188,14 @@ impl Harness {
         }
         // Connecting belongs to this lifecycle request, not to a turn. The
         // session token is the last turn's, which stays cancelled after
-        // `session/cancel` until the next turn replaces it.
-        let mcp = McpSession::connect(servers, &CancellationToken::new()).await?;
+        // `session/cancel` until the next turn replaces it. Nothing cancels
+        // this one, so the connect timeout is what bounds the wait.
+        let mcp = McpSession::connect(
+            servers,
+            self.config.mcp_connect_timeout,
+            &CancellationToken::new(),
+        )
+        .await?;
         runtime.state.lock().await.mcp = Some(mcp);
         Ok(())
     }

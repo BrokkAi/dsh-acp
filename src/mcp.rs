@@ -1,4 +1,4 @@
-use std::{process::Stdio, sync::Arc};
+use std::{process::Stdio, sync::Arc, time::Duration};
 
 use agent_client_protocol::{
     Error,
@@ -25,6 +25,26 @@ pub struct McpToolMetadata {
     pub read_only: bool,
 }
 
+impl McpToolMetadata {
+    fn new(server_name: &str, tool: McpToolDescription) -> Self {
+        let qualified_name = qualify_tool_name(server_name, &tool.name);
+        let description = tool
+            .description
+            .unwrap_or_else(|| format!("MCP tool {} from {}", tool.name, server_name));
+        let input_schema = tool
+            .input_schema
+            .unwrap_or_else(|| json!({"type": "object", "additionalProperties": true}));
+        Self {
+            qualified_name,
+            server_name: server_name.to_string(),
+            original_name: tool.name,
+            description,
+            input_schema,
+            read_only: tool.read_only,
+        }
+    }
+}
+
 pub struct McpSession {
     clients: Vec<Arc<McpClient>>,
     tools: Vec<McpToolMetadata>,
@@ -41,50 +61,77 @@ impl std::fmt::Debug for McpSession {
 }
 
 impl McpSession {
+    /// Connects each server and lists its tools. A server gets
+    /// `setup_timeout` for its handshake and first `tools/list`, because the
+    /// lifecycle request waiting on it holds up every later message on the
+    /// connection. If any server fails, the stdio processes started so far
+    /// are killed and reaped before the error is returned.
     pub async fn connect(
         servers: &[McpServer],
+        setup_timeout: Duration,
         cancellation: &CancellationToken,
     ) -> Result<Self, Error> {
-        let mut clients = Vec::new();
-        for server in servers {
-            let requested_name = match server {
-                McpServer::Stdio(config) => &config.name,
-                McpServer::Http(config) => &config.name,
-                McpServer::Sse(config) => &config.name,
-                McpServer::Acp(config) => &config.name,
-                _ => "mcp",
-            };
-            let name = unique_server_name(requested_name, clients.as_slice());
-            let client = Arc::new(McpClient::connect(server, name, cancellation).await?);
-            clients.push(client);
-        }
         let mut session = Self {
-            clients,
+            clients: Vec::new(),
             tools: Vec::new(),
         };
-        session.refresh(cancellation).await?;
+        for server in servers {
+            if let Err(error) = session
+                .add_server(server, setup_timeout, cancellation)
+                .await
+            {
+                for client in &session.clients {
+                    client.shutdown().await;
+                }
+                return Err(error);
+            }
+        }
         Ok(session)
+    }
+
+    async fn add_server(
+        &mut self,
+        server: &McpServer,
+        setup_timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<(), Error> {
+        let requested_name = match server {
+            McpServer::Stdio(config) => &config.name,
+            McpServer::Http(config) => &config.name,
+            McpServer::Sse(config) => &config.name,
+            McpServer::Acp(config) => &config.name,
+            _ => "mcp",
+        };
+        let name = unique_server_name(requested_name, self.clients.as_slice());
+        let client = Arc::new(McpClient::start(server, name)?);
+        self.clients.push(client.clone());
+        // One deadline for the whole setup rather than per read, so a server
+        // that keeps writing unrelated lines cannot extend it.
+        let setup = async {
+            client.initialize(requested_name, cancellation).await?;
+            client.list_tools(cancellation).await
+        };
+        let tools = tokio::time::timeout(setup_timeout, setup)
+            .await
+            .map_err(|_| {
+                Error::internal_error().data(format!(
+                    "MCP server `{requested_name}` did not connect and list its tools within {} seconds. If it needs longer to start, raise DSH_ACP_MCP_CONNECT_TIMEOUT_SECS (or --mcp-connect-timeout-secs).",
+                    setup_timeout.as_secs()
+                ))
+            })??;
+        self.tools.extend(
+            tools
+                .into_iter()
+                .map(|tool| McpToolMetadata::new(client.name(), tool)),
+        );
+        Ok(())
     }
 
     pub async fn refresh(&mut self, cancellation: &CancellationToken) -> Result<(), Error> {
         let mut tools = Vec::new();
         for client in &self.clients {
             for tool in client.list_tools(cancellation).await? {
-                let qualified_name = qualify_tool_name(client.name(), &tool.name);
-                let description = tool
-                    .description
-                    .unwrap_or_else(|| format!("MCP tool {} from {}", tool.name, client.name()));
-                let input_schema = tool
-                    .input_schema
-                    .unwrap_or_else(|| json!({"type": "object", "additionalProperties": true}));
-                tools.push(McpToolMetadata {
-                    qualified_name,
-                    server_name: client.name().to_string(),
-                    original_name: tool.name,
-                    description,
-                    input_schema,
-                    read_only: tool.read_only,
-                });
+                tools.push(McpToolMetadata::new(client.name(), tool));
             }
         }
         self.tools = tools;
@@ -248,46 +295,51 @@ enum McpTransport {
 }
 
 impl McpClient {
-    async fn connect(
-        server: &McpServer,
-        name: String,
-        cancellation: &CancellationToken,
-    ) -> Result<Self, Error> {
-        match server {
-            McpServer::Stdio(config) => {
-                let mut transport = StdioTransport::spawn(
-                    &config.command,
-                    &config.args,
-                    &config.env,
-                )?;
-                transport.initialize(&config.name, cancellation).await?;
-                Ok(Self {
-                    name,
-                    transport: McpTransport::Stdio(Mutex::new(transport)),
-                })
-            }
-            McpServer::Http(config) => {
-                let mut transport = HttpTransport::new(&config.url, &config.headers)?;
-                transport.initialize(&config.name, cancellation).await?;
-                Ok(Self {
-                    name,
-                    transport: McpTransport::Http(Mutex::new(transport)),
-                })
-            }
+    /// Spawns a stdio server or prepares an HTTP client, without talking to
+    /// the server yet.
+    fn start(server: &McpServer, name: String) -> Result<Self, Error> {
+        let transport = match server {
+            McpServer::Stdio(config) => McpTransport::Stdio(Mutex::new(StdioTransport::spawn(
+                &config.command,
+                &config.args,
+                &config.env,
+            )?)),
+            McpServer::Http(config) => McpTransport::Http(Mutex::new(HttpTransport::new(
+                &config.url,
+                &config.headers,
+            )?)),
             McpServer::Sse(config) => {
                 let mut transport = HttpTransport::new(&config.url, &config.headers)?;
                 transport.prefer_streamable_http = true;
-                transport.initialize(&config.name, cancellation).await?;
-                Ok(Self {
-                    name,
-                    transport: McpTransport::Http(Mutex::new(transport)),
-                })
+                McpTransport::Http(Mutex::new(transport))
             }
-            McpServer::Acp(config) => Err(Error::invalid_params().data(format!(
-                "MCP-over-ACP server `{}` requires proxy attachment support, which this standalone agent does not provide",
-                config.name
-            ))),
-            _ => Err(Error::invalid_params().data("unsupported MCP server transport")),
+            McpServer::Acp(config) => {
+                return Err(Error::invalid_params().data(format!(
+                    "MCP-over-ACP server `{}` requires proxy attachment support, which this standalone agent does not provide",
+                    config.name
+                )));
+            }
+            _ => return Err(Error::invalid_params().data("unsupported MCP server transport")),
+        };
+        Ok(Self { name, transport })
+    }
+
+    async fn initialize(&self, name: &str, cancellation: &CancellationToken) -> Result<(), Error> {
+        match &self.transport {
+            McpTransport::Stdio(transport) => {
+                transport.lock().await.initialize(name, cancellation).await
+            }
+            McpTransport::Http(transport) => {
+                transport.lock().await.initialize(name, cancellation).await
+            }
+        }
+    }
+
+    /// Kills a stdio server and waits for it to exit. Dropping the transport
+    /// only starts the kill.
+    async fn shutdown(&self) {
+        if let McpTransport::Stdio(transport) = &self.transport {
+            let _ = transport.lock().await.child.kill().await;
         }
     }
 
@@ -832,5 +884,179 @@ mod tests {
             tools.iter().map(|tool| tool.read_only).collect::<Vec<_>>(),
             [true, false, false, false, false]
         );
+    }
+
+    /// A stdio server that runs `script` with `/bin/sh`, with `args` as `$1`
+    /// onwards.
+    #[cfg(unix)]
+    fn shell_server(name: &str, script: &str, args: &[&str]) -> McpServer {
+        let mut argv = vec!["-c".to_string(), script.to_string(), "sh".to_string()];
+        argv.extend(args.iter().map(ToString::to_string));
+        McpServer::Stdio(
+            agent_client_protocol::schema::v1::McpServerStdio::new(name, "/bin/sh").args(argv),
+        )
+    }
+
+    /// Whether the process whose PID a test server wrote still exists.
+    /// `kill -0` also succeeds for an exited process nobody has reaped.
+    #[cfg(unix)]
+    fn process_exists(pid_file: &std::path::Path) -> bool {
+        let pid = std::fs::read_to_string(pid_file).expect("the MCP server should have started");
+        std::process::Command::new("/bin/sh")
+            .args(["-c", "kill -0 \"$1\" 2>/dev/null", "sh", pid.trim()])
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    /// Connects with a short setup timeout, failing the test instead of
+    /// hanging it if that timeout does not fire.
+    async fn connect_error(server: McpServer) -> String {
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            McpSession::connect(
+                &[server],
+                Duration::from_millis(300),
+                &CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("MCP setup should time out")
+        .expect_err("MCP setup should fail");
+        error
+            .data
+            .as_ref()
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stdio_server_lists_tools_past_unrelated_output() {
+        let script = r#"
+            read -r line
+            echo 'starting up'
+            echo '{"jsonrpc":"2.0","method":"notifications/message","params":{}}'
+            echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+            read -r line
+            read -r line
+            echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo"}]}}'
+            while read -r line; do :; done
+        "#;
+        let session = McpSession::connect(
+            &[shell_server("ok", script, &[])],
+            Duration::from_secs(10),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(session.has_tool("mcp__ok__echo"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn setup_timeout_covers_the_first_tool_list() {
+        // Answers initialize, then keeps reading without answering again.
+        let script = r#"
+            read -r line
+            echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+            while read -r line; do :; done
+        "#;
+        let message = connect_error(shell_server("slow", script, &[])).await;
+        assert!(message.contains("MCP server `slow`"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_that_never_answers_does_not_extend_the_setup_timeout() {
+        let script = r#"
+            while :; do
+                echo 'not JSON-RPC'
+                echo '{"jsonrpc":"2.0","method":"notifications/message","params":{}}'
+                echo '{"jsonrpc":"2.0","id":99,"result":{}}'
+            done
+        "#;
+        let message = connect_error(shell_server("chatty", script, &[])).await;
+        assert!(message.contains("MCP server `chatty`"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_setup_kills_and_reaps_every_stdio_server_before_returning() {
+        let temp = tempfile::tempdir().unwrap();
+        let ready_pid = temp.path().join("ready.pid");
+        let silent_pid = temp.path().join("silent.pid");
+        let ready = r#"
+            echo $$ > "$1"
+            read -r line
+            echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+            read -r line
+            read -r line
+            echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}'
+            while read -r line; do :; done
+        "#;
+        let servers = [
+            shell_server("ready", ready, &[ready_pid.to_str().unwrap()]),
+            shell_server(
+                "silent",
+                r#"echo $$ > "$1"; exec sleep 60"#,
+                &[silent_pid.to_str().unwrap()],
+            ),
+        ];
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            McpSession::connect(
+                &servers,
+                Duration::from_millis(500),
+                &CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("MCP setup should time out")
+        .expect_err("the silent server should fail setup");
+        // Nothing is awaited between the error and these checks. The test
+        // runtime has one thread, so tokio's background reaper cannot run
+        // first: only an explicit kill-and-wait removes both processes.
+        assert!(
+            !process_exists(&ready_pid),
+            "the connected server is still running"
+        );
+        assert!(
+            !process_exists(&silent_pid),
+            "the silent server is still running"
+        );
+        let message = error
+            .data
+            .as_ref()
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(message.contains("MCP server `silent`"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn setup_timeout_also_bounds_http_servers() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping HTTP MCP timeout test: loopback networking is unavailable");
+                return;
+            }
+            Err(error) => panic!("failed to bind loopback MCP server: {error}"),
+        };
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        // Accept connections and hold them open without answering.
+        let server = tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                sockets.push(socket);
+            }
+        });
+        let message = connect_error(McpServer::Http(
+            agent_client_protocol::schema::v1::McpServerHttp::new("remote", url),
+        ))
+        .await;
+        assert!(message.contains("MCP server `remote`"), "{message}");
+        server.abort();
     }
 }
