@@ -87,7 +87,12 @@ A missing or non-string `sessionId` is rejected with `-32602`. In v2, an
 `active` result also carries `state`, the same `running`, `requires_action`,
 or `idle` snapshot that `session/resume` sends. v1 has no foreground state, so
 its result has no `state`. The probe does not wait for a session's work, so it
-answers promptly even while that session is in a tool or MCP call.
+answers promptly even while that session is in a tool or MCP call. Requests
+are handled one at a time, though, and some others do wait on the session.
+Until [#46](https://github.com/BrokkAi/dsh-acp/issues/46) is fixed, a
+`session/cancel` or `session/resume` sent during an MCP call waits for the call
+to finish, and every later request on the connection waits behind it,
+including `session/status`.
 
 The request does not load, resume, or change the session. As the RFD says,
 `active` only means the session is in memory, so a client still sends

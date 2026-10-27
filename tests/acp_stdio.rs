@@ -925,6 +925,72 @@ async fn v2_session_status_reports_a_running_turn() {
 }
 
 #[tokio::test]
+async fn malformed_session_status_params_are_answered_and_the_connection_keeps_serving() {
+    let temp = tempfile::tempdir().unwrap();
+    let initializes = [
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+        json!({
+            "protocolVersion": 2,
+            "info": {"name": "v2-test-client", "version": "1.0.0"},
+            "capabilities": {}
+        }),
+    ];
+    for initialize in initializes {
+        let version = initialize["protocolVersion"].clone();
+        // Stderr is piped and never read, like a client that ignores it. A
+        // handler that returned its params error instead of answering it
+        // logs a large warning, which fills the pipe and stalls the
+        // connection (#53).
+        let mut peer = spawn_peer_with_stderr(temp.path(), None, &[], Stdio::piped()).await;
+        peer.request("initialize", initialize).await;
+        let malformed = [
+            None,
+            Some(Value::Null),
+            Some(json!([])),
+            Some(json!({})),
+            Some(json!({"sessionId": 7})),
+            Some(json!({"sessionId": {"id": "dsh-x"}})),
+        ];
+        for params in malformed {
+            let case = format!("v{version} params {params:?}");
+            let id = peer.next_id;
+            peer.next_id += 1;
+            let mut request = json!({"jsonrpc": "2.0", "id": id, "method": "session/status"});
+            if let Some(params) = params {
+                request["params"] = params;
+            }
+            peer.write(request).await;
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let message = peer.next_message().await;
+                    if message["id"] == id {
+                        return message;
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("no reply to {case}"));
+            assert_eq!(reply["error"]["code"], -32602, "{case}: {reply}");
+        }
+        // The connection still answers after every rejection.
+        let list = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            peer.request("session/list", json!({})),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("v{version}: session/list went unanswered"));
+        assert!(list["sessions"].is_array(), "v{version}: {list}");
+
+        drop(peer.stdin);
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait())
+            .await
+            .expect("server exits on EOF")
+            .unwrap();
+        assert!(exit.success(), "v{version}: server exited with {exit}");
+    }
+}
+
+#[tokio::test]
 async fn v2_session_status_answers_while_an_mcp_call_is_in_flight() {
     let temp = tempfile::tempdir().unwrap();
     let (started, call_started) = tokio::sync::oneshot::channel();
@@ -1087,6 +1153,16 @@ async fn spawn_peer_with_args(
     base_url: Option<&str>,
     extra_args: &[&str],
 ) -> Peer {
+    spawn_peer_with_stderr(data_dir, base_url, extra_args, Stdio::null()).await
+}
+
+/// Like [`spawn_peer_with_args`], with the server's stderr sent to `stderr`.
+async fn spawn_peer_with_stderr(
+    data_dir: &std::path::Path,
+    base_url: Option<&str>,
+    extra_args: &[&str],
+    stderr: Stdio,
+) -> Peer {
     let mut command = Command::new(env!("CARGO_BIN_EXE_dsh-acp"));
     command
         .arg("--data-dir")
@@ -1095,7 +1171,7 @@ async fn spawn_peer_with_args(
         .args(extra_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(stderr);
     if let Some(base_url) = base_url {
         command
             .arg("--base-url")
