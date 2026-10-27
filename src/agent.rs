@@ -1980,11 +1980,13 @@ impl Harness {
 
         let terminal_call = TerminalToolCall::new(call.id.clone());
         let result = if call.function.name.starts_with("mcp__") {
-            let mcp_result = {
-                let Some(mcp) = runtime.state.lock().await.mcp.clone() else {
-                    return Err(Error::internal_error().data("MCP session is unavailable"));
-                };
-                mcp.call(&call.function.name, arguments, cancellation).await
+            let mcp = runtime.state.lock().await.mcp.clone();
+            let mcp_result = match mcp {
+                Some(mcp) => mcp.call(&call.function.name, arguments, cancellation).await,
+                // With no MCP server attached, the model named a tool it was
+                // never offered: that fails only this call, as any unknown
+                // MCP tool does.
+                None => Err(Error::invalid_params().data("unknown MCP tool")),
             };
             match mcp_result {
                 Ok(value) => ToolResult {

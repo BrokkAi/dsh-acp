@@ -139,8 +139,11 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   that has no `content`, ended the whole turn with stop reason `error`, and the
   model saw only "Tool call failed before completion." It now fails just that
   tool call with the reason, the turn continues, and the model can send a
-  corrected plan. A v2 call to an `mcp__` tool in a session with no MCP servers
-  also ended the turn; it now fails like a call to any other unknown MCP tool.
+  corrected plan.
+- A call to an `mcp__` tool in a session with no MCP servers ended the whole
+  turn: an ACP v1 `session/prompt` failed with `-32603`, and an ACP v2 turn
+  ended with stop reason `error`. In both versions it now fails like a call to
+  any other unknown MCP tool, and the turn continues.
 
 ## 0.4.0 - 2026-10-25
 
