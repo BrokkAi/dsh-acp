@@ -11,7 +11,8 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 - An `initialize` request with an unsupported or malformed `protocolVersion`
   now always gets its error response (`-32022` with the requested and
   supported versions, or `-32602`) before the server exits. The response was
-  often lost while the client still had stdin open.
+  often lost, most often while the client still had stdin open. The same fix
+  delivers the `-32600` error for a first request that is not `initialize`.
 
 ## 0.4.0 - 2026-10-25
 

@@ -631,14 +631,24 @@ async fn a_rejected_initialize_is_answered_before_the_server_exits() {
         if let Some(protocol_version) = &protocol_version {
             params["protocolVersion"] = protocol_version.clone();
         }
-        // Stdin stays open: the response used to be lost only while the
-        // client was still connected.
-        let error = tokio::time::timeout(
+        // Stdin stays open, which is where the response was most often lost.
+        peer.write(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params}))
+            .await;
+        let mut line = String::new();
+        tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            peer.request_error("initialize", params),
+            peer.stdout.read_line(&mut line),
         )
         .await
-        .unwrap_or_else(|_| panic!("no reply to protocolVersion {protocol_version:?}"));
+        .unwrap_or_else(|_| panic!("no reply to protocolVersion {protocol_version:?}"))
+        .unwrap();
+        assert!(
+            !line.is_empty(),
+            "server exited without answering protocolVersion {protocol_version:?}"
+        );
+        let reply: Value = serde_json::from_str(&line).expect("valid JSON-RPC");
+        assert_eq!(reply["id"], 1);
+        let error = &reply["error"];
         assert_eq!(error["code"], code, "protocolVersion {protocol_version:?}");
         if code == -32022 {
             assert_eq!(error["data"], json!({"requested": 0, "supported": [1, 2]}));

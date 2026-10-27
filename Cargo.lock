@@ -10,7 +10,6 @@ checksum = "72adac0ce6b0d0390df9b7a498392b24ebcf9c65c3451e5d618d936f50256289"
 dependencies = [
  "agent-client-protocol-derive",
  "agent-client-protocol-schema",
- "blocking",
  "futures",
  "futures-concurrency",
  "rustc-hash",
