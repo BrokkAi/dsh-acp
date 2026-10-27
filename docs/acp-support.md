@@ -52,6 +52,7 @@ version's lifecycle and payload shapes.
 | URL elicitation | Implemented, with model-reported completion | Client capability |
 | `_session/steering` | Implemented | `_meta.steering.supported` |
 | `session/status` | Implemented (Draft RFD) | Advertised capability |
+| `session/set_title` | Implemented (Draft RFD) | Advertised capability |
 | Steering idle return | Implemented | `idleBehavior: "promptRequired"` |
 | Agent-owned terminals | Implemented in v2 | Baseline v2 |
 | Terminal output chunks | Implemented in v2 | Baseline v2 |
@@ -101,6 +102,53 @@ The request does not load, resume, or change the session. As the RFD says,
 create or resume itself. An inactive session is found by checking that its
 record file exists, without reading it, so an unreadable record is still
 reported as `inactive` and fails when resumed.
+
+## Session titles
+
+`session/set_title` follows the
+[Client-Set Session Titles RFD](https://agentclientprotocol.com/rfds/session-set-title),
+which is still a Draft. `agent-client-protocol` 3.4 has no types for it, so
+the request, response, and capability marker are written by hand and may change
+with the RFD. Both versions advertise it with an empty marker:
+`agentCapabilities.sessionCapabilities.setTitle` in v1 and
+`capabilities.session.setTitle` in v2.
+
+The request takes a `sessionId` and a `title`, and the result is the title as
+stored, which clients should display:
+
+```json
+{"title": "Investigate OAuth timeout"}
+```
+
+Before storing it, the agent trims the title, turns each run of whitespace or
+control characters, line breaks included, into one space, and cuts it to 256
+characters (Unicode scalar values).
+
+| Case | Answer |
+| --- | --- |
+| A session in memory in this process | The title, after a `session_info_update` that carries it. |
+| A stored session that is not in memory, for example after `session/close` or a restart | The title. The record is updated on disk without loading the session, which stays `inactive`, so no update is sent. |
+| A title that is empty after normalization | `-32602` with the message `Title must not be empty.` |
+| A missing or non-string `sessionId` or `title` | `-32602` |
+| No such session, including a deleted one | `-32002` with `data.sessionId` |
+
+The title is stored before the answer is sent. The request changes only the
+title: the session's `updatedAt` stays as it was, so a rename does not move
+the session in `session/list`, which lists the most recently updated sessions
+first.
+
+A session without a title takes one from its first prompt. Once a client sets
+a title, the record says so, and generated titles no longer replace it, also
+after a restart. Another `session/set_title` still replaces it. A title can be
+set while a turn runs; the turn is unaffected and keeps the new title when it
+saves the session. Sessions stored by earlier versions have no such flag, so
+they keep their generated titles until a client renames them.
+
+Within one process, setting a title and loading the session are serialized,
+so a load cannot bring back the old title. Another `dsh-acp` process that has
+the same session in memory does not see the new title and overwrites it the
+next time it saves the session. The RFD lets an agent refuse a session another
+process holds, but `dsh-acp` cannot tell that one does.
 
 ## Authentication status
 

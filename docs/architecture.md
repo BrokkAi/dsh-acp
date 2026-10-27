@@ -99,7 +99,9 @@ lossy text reconstruction.
   is bounded per server by `--mcp-connect-timeout-secs`. Servers connect one
   after another, so a request with N servers can wait up to N times that
   limit.
-- Session-store writes are serialized process-wide.
+- Session-store writes are serialized process-wide. Loading a stored session
+  takes the same lock, so a title `session/set_title` writes to a stored
+  record cannot be lost to a load in progress.
 
 ## Security boundaries
 

@@ -343,6 +343,13 @@ pub struct SessionRecord {
     pub additional_directories: Vec<std::path::PathBuf>,
     #[serde(default)]
     pub title: Option<String>,
+    /// Whether `title` was set with `session/set_title`. A generated title
+    /// only fills a missing one, and this keeps a turn whose save fails from
+    /// putting back the title it replaced. Records stored before
+    /// `session/set_title` support have no flag, so their titles count as
+    /// generated.
+    #[serde(default)]
+    pub title_set_by_client: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub config: SessionConfig,
@@ -388,6 +395,7 @@ impl SessionRecord {
             cwd,
             additional_directories,
             title: None,
+            title_set_by_client: false,
             created_at: now,
             updated_at: now,
             config: SessionConfig {
@@ -424,6 +432,12 @@ impl SessionRecord {
     pub fn set_client_system_prompt(&mut self, prompt: ClientSystemPrompt) {
         self.system_prompt_mode = prompt.mode;
         self.system_prompt = Some(prompt.text);
+    }
+
+    /// Store a title the client chose with `session/set_title`.
+    pub fn set_client_title(&mut self, title: &str) {
+        self.title = Some(title.to_string());
+        self.title_set_by_client = true;
     }
 
     pub fn install_system_prompt(&mut self, prompt: String) {

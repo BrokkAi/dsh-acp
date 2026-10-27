@@ -52,7 +52,7 @@ use crate::{
         SessionRuntime, TokenUsage, ToolOutcomeStatus, ensure_session_unique_tool_call_ids,
     },
     session::{self, SessionPresence, SessionStore, session_title},
-    session_status,
+    session_set_title, session_status,
     tools::{
         TerminalToolCall, ToolAccess, ToolResult, built_in_definitions, execute as execute_tool,
         persisted_tool_outcome, result_status, structured_content,
@@ -353,7 +353,7 @@ pub async fn run(config: Config) -> agent_client_protocol::Result<()> {
                             connection: ConnectionTo<Client>| {
                     match request.method.as_str() {
                         // Answered as JSON: the SDK capability types cannot advertise
-                        // `auth/status` or `session/status` yet.
+                        // `auth/status`, `session/status`, or `session/set_title` yet.
                         "initialize" => {
                             match InitializeRequest::parse_message(&request.method, &request.params)
                             {
@@ -376,6 +376,12 @@ pub async fn run(config: Config) -> agent_client_protocol::Result<()> {
                             harness
                                 .clone()
                                 .session_status(request.params, responder)
+                                .await
+                        }
+                        session_set_title::METHOD => {
+                            harness
+                                .clone()
+                                .session_set_title(request.params, responder, connection)
                                 .await
                         }
                         auth_status::METHOD => responder.respond(harness.auth_status().await),
@@ -534,6 +540,11 @@ impl Harness {
                 (
                     "/agentCapabilities/sessionCapabilities",
                     "status",
+                    json!({}),
+                ),
+                (
+                    "/agentCapabilities/sessionCapabilities",
+                    "setTitle",
                     json!({}),
                 ),
                 ("/agentCapabilities/auth", "status", json!(true)),
@@ -875,6 +886,7 @@ impl Harness {
             candidate.compactions = source.compactions.clone();
             candidate.config = source.config.clone();
             candidate.title = source.title.clone();
+            candidate.title_set_by_client = source.title_set_by_client;
             candidate.usage = source.usage.clone();
             candidate.context_used = source.context_used;
             let refresh = self.store.rebuild_system_prompt(&mut candidate);
@@ -1010,6 +1022,32 @@ impl Harness {
             }
             Err(error) => responder.respond_with_error(error),
         }
+    }
+
+    async fn session_set_title(
+        self,
+        params: Value,
+        responder: agent_client_protocol::Responder<Value>,
+        connection: ConnectionTo<Client>,
+    ) -> agent_client_protocol::Result<()> {
+        if !self.initialized.load(Ordering::Acquire) {
+            return responder.respond_with_error(Error::invalid_request().data("initialize first"));
+        }
+        let stored = match self.store_session_title(&params).await {
+            Ok(stored) => stored,
+            Err(error) => return responder.respond_with_error(error),
+        };
+        if stored.loaded {
+            // The result carries the title, so a client does not depend on
+            // this and a failed send does not fail the request.
+            let _ = connection.send_notification(SessionNotification::new(
+                SessionId::new(stored.session_id),
+                agent_client_protocol::schema::v1::SessionUpdate::SessionInfoUpdate(
+                    SessionInfoUpdate::new().title(stored.title.clone()),
+                ),
+            ));
+        }
+        responder.respond(json!({"title": stored.title}))
     }
 
     async fn set_session_mode(
@@ -1395,17 +1433,25 @@ impl Harness {
                 .prompt_blocks
                 .remove(&message_index.to_string());
             state.record.message_ids.remove(&message_index.to_string());
-            state.record.title = previous_title;
+            // A title set with `session/set_title` meanwhile stays.
+            if !state.record.title_set_by_client {
+                state.record.title = previous_title;
+            }
             return Err(error);
         }
         drop(lifecycle);
-        let record = runtime.snapshot().await;
-        connection.send_notification(SessionNotification::new(
-            session_id.clone(),
-            agent_client_protocol::schema::v1::SessionUpdate::SessionInfoUpdate(
-                SessionInfoUpdate::new().title(record.title.clone()),
-            ),
-        ))?;
+        let record = {
+            // Sent under the state lock, so this never announces a title that
+            // `session/set_title` has already replaced.
+            let state = runtime.state.lock().await;
+            connection.send_notification(SessionNotification::new(
+                session_id.clone(),
+                agent_client_protocol::schema::v1::SessionUpdate::SessionInfoUpdate(
+                    SessionInfoUpdate::new().title(state.record.title.clone()),
+                ),
+            ))?;
+            state.record.clone()
+        };
         send_usage_update(&connection, &record)?;
 
         let deepseek = self.deepseek_client().await?;

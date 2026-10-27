@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use agent_client_protocol::Error;
+use agent_client_protocol::{Error, ErrorCode};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -15,7 +15,8 @@ use crate::{
 
 const MAX_INSTRUCTION_BYTES: u64 = 1024 * 1024;
 
-/// Whether the store knows a session, as `session/status` reports it.
+/// Whether the store knows a session, as `session/status` reports it and
+/// [`SessionStore::set_client_title`] found it.
 pub enum SessionPresence {
     /// In memory.
     Active(SessionRuntime),
@@ -109,6 +110,10 @@ impl SessionStore {
         if let Some(runtime) = self.sessions.lock().await.get(id).cloned() {
             return Ok(runtime);
         }
+        // Loading under the write lock keeps `set_client_title` from changing
+        // the stored record between this read and the insert below, where the
+        // session's next save would overwrite the new title.
+        let _write_guard = self.write_lock.lock().await;
         let record = self.read_record(id).await?;
         let mut record = record;
         // Before pending steering is appended after the interrupted calls.
@@ -142,6 +147,55 @@ impl SessionStore {
             }
             Err(error) => Err(Error::into_internal_error(error)),
         }
+    }
+
+    /// Stores a title the client chose, and reports where the session was.
+    ///
+    /// A session in memory gets the title there and is saved. A stored session
+    /// is updated on disk without loading it, so it stays inactive and nothing
+    /// else in its record changes. Neither changes `updated_at`, which tracks
+    /// the session's activity. An `Unknown` session, including a deleted one,
+    /// is left alone.
+    ///
+    /// Another process with the session in memory does not see the new title,
+    /// and its next save of the session puts its own title back.
+    pub async fn set_client_title(&self, id: &str, title: &str) -> Result<SessionPresence, Error> {
+        if validate_session_id(id).is_err() {
+            return Ok(SessionPresence::Unknown);
+        }
+        let _write_guard = self.write_lock.lock().await;
+        if self.deleted.lock().await.contains(id) {
+            return Ok(SessionPresence::Unknown);
+        }
+        let runtime = self.sessions.lock().await.get(id).cloned();
+        if let Some(runtime) = runtime {
+            let previous = {
+                let mut state = runtime.state.lock().await;
+                let previous = (state.record.title.clone(), state.record.title_set_by_client);
+                state.record.set_client_title(title);
+                previous
+            };
+            let snapshot = runtime.snapshot().await;
+            if let Err(error) = self.write_record(&snapshot).await {
+                // Nothing else is saved while the write lock is held, and a
+                // turn leaves a client title alone, so this restores exactly
+                // what is stored.
+                let mut state = runtime.state.lock().await;
+                (state.record.title, state.record.title_set_by_client) = previous;
+                return Err(error);
+            }
+            return Ok(SessionPresence::Active(runtime));
+        }
+        let mut record = match self.read_record(id).await {
+            Ok(record) => record,
+            Err(error) if error.code == ErrorCode::ResourceNotFound => {
+                return Ok(SessionPresence::Unknown);
+            }
+            Err(error) => return Err(error),
+        };
+        record.set_client_title(title);
+        self.write_record(&record).await?;
+        Ok(SessionPresence::Inactive)
     }
 
     pub async fn save(&self, runtime: &SessionRuntime) -> Result<(), Error> {
@@ -594,6 +648,8 @@ pub(crate) fn validate_roots(cwd: &Path, additional: &[PathBuf]) -> Result<(), E
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+
     use super::*;
     use crate::config::{PermissionMode, ReasoningEffort};
 
@@ -758,6 +814,75 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn client_titles_are_stored_whether_or_not_the_session_is_loaded() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            api_key: None,
+            base_url: "http://localhost".to_string(),
+            default_model: "deepseek-flash".to_string(),
+            models: vec!["deepseek-flash".to_string()],
+            data_dir: temp.path().join("data"),
+            permission_mode: PermissionMode::Ask,
+            system_prompt: None,
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::High,
+            context_chars: 1000,
+            tool_output_bytes: 1000,
+            http_timeout: std::time::Duration::from_secs(1),
+            mcp_connect_timeout: std::time::Duration::from_secs(1),
+            disable_web: true,
+            trace: false,
+        };
+        let store = SessionStore::open(&config).await.unwrap();
+        let runtime = store
+            .create(temp.path().to_path_buf(), Vec::new(), None, None)
+            .await
+            .unwrap();
+        let id = runtime.snapshot().await.id;
+        let stored = || -> Value {
+            serde_json::from_slice(&std::fs::read(store.record_path(&id)).unwrap()).unwrap()
+        };
+        let mut expected = stored();
+        assert_eq!(expected["title_set_by_client"], false);
+
+        assert!(matches!(
+            store.set_client_title(&id, "In memory").await.unwrap(),
+            SessionPresence::Active(_)
+        ));
+        let record = runtime.snapshot().await;
+        assert_eq!(record.title.as_deref(), Some("In memory"));
+        assert!(record.title_set_by_client);
+        expected["title"] = json!("In memory");
+        expected["title_set_by_client"] = json!(true);
+        assert_eq!(stored(), expected, "only the title changed");
+
+        // A second store over the same directory stands in for a restart.
+        let restarted = SessionStore::open(&config).await.unwrap();
+        assert!(matches!(
+            restarted.set_client_title(&id, "On disk").await.unwrap(),
+            SessionPresence::Inactive
+        ));
+        assert!(restarted.sessions.lock().await.is_empty(), "not loaded");
+        expected["title"] = json!("On disk");
+        assert_eq!(stored(), expected, "only the title changed");
+        let loaded = restarted.get(&id).await.unwrap().snapshot().await;
+        assert_eq!(loaded.title.as_deref(), Some("On disk"));
+        assert!(loaded.title_set_by_client);
+
+        store.delete(&id).await.unwrap();
+        for id in [id.as_str(), "dsh-unknown", "", "../../outside"] {
+            assert!(
+                matches!(
+                    store.set_client_title(id, "Nowhere").await.unwrap(),
+                    SessionPresence::Unknown
+                ),
+                "{id:?}"
+            );
+        }
+        assert!(!store.record_path(&id).exists(), "deleted stays deleted");
     }
 
     #[tokio::test]

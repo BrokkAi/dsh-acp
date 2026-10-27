@@ -1544,6 +1544,480 @@ async fn auth_status_reports_missing_credentials() {
     }
 }
 
+/// Initializes `peer` with ACP `version` and checks that it advertises
+/// `session/set_title` with an empty marker.
+async fn initialize_advertising_set_title(peer: &mut Peer, version: u64) {
+    let params = if version == 1 {
+        json!({"protocolVersion": 1, "clientCapabilities": {}})
+    } else {
+        json!({
+            "protocolVersion": 2,
+            "info": {"name": "set-title-test", "version": "1.0.0"},
+            "capabilities": {}
+        })
+    };
+    let result = peer.request("initialize", params).await;
+    let marker = if version == 1 {
+        &result["agentCapabilities"]["sessionCapabilities"]["setTitle"]
+    } else {
+        &result["capabilities"]["session"]["setTitle"]
+    };
+    assert_eq!(marker, &json!({}), "v{version}: {result}");
+}
+
+/// The title `session/list` reports for `session_id`.
+async fn listed_title(peer: &mut Peer, session_id: &str) -> Value {
+    let list = peer.request("session/list", json!({})).await;
+    list["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["sessionId"] == session_id)
+        .map(|session| session["title"].clone())
+        .unwrap_or_else(|| panic!("{session_id} is not listed: {list}"))
+}
+
+/// The titles in the `session_info_update`s for `session_id` from
+/// `peer.updates[from..]`, in order.
+fn announced_titles(peer: &Peer, from: usize, session_id: &str) -> Vec<Value> {
+    peer.updates[from..]
+        .iter()
+        .filter(|message| {
+            message["params"]["sessionId"] == session_id
+                && message["params"]["update"]["sessionUpdate"] == "session_info_update"
+        })
+        .map(|message| message["params"]["update"]["title"].clone())
+        .collect()
+}
+
+/// Sends a prompt and waits for its turn to end.
+async fn prompt_until_end_turn(peer: &mut Peer, version: u64, session_id: &str, text: &str) {
+    let result = peer
+        .request(
+            "session/prompt",
+            json!({"sessionId": session_id, "prompt": [{"type": "text", "text": text}]}),
+        )
+        .await;
+    if version == 1 {
+        assert_eq!(result["stopReason"], "end_turn", "{result}");
+    } else {
+        let idle = next_v2_idle(peer).await;
+        assert_eq!(idle["params"]["update"]["stopReason"], "end_turn", "{idle}");
+    }
+}
+
+async fn exit_peer(mut peer: Peer) {
+    drop(peer.stdin);
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait())
+        .await
+        .expect("server exits on EOF")
+        .unwrap();
+    assert!(exit.success(), "server exited with {exit}");
+}
+
+fn stored_record(data_dir: &std::path::Path, session_id: &str) -> Value {
+    let path = data_dir
+        .join("sessions-data")
+        .join("sessions")
+        .join(format!("{session_id}.json"));
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn set_title_renames_a_loaded_session_and_later_prompts_keep_it() {
+    for version in [1, 2] {
+        let temp = tempfile::tempdir().unwrap();
+        let Some((base_url, server)) = mock_sequence_server(vec![mock_text_stream()]).await else {
+            eprintln!("skipping set_title test: loopback networking is unavailable");
+            return;
+        };
+        let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+        initialize_advertising_set_title(&mut peer, version).await;
+        let session_id = peer_new_session(&mut peer, &temp.path().to_string_lossy()).await;
+
+        let from = peer.updates.len();
+        let result = peer
+            .request(
+                "session/set_title",
+                json!({"sessionId": session_id, "title": "  Investigate\n\tOAuth   timeout  "}),
+            )
+            .await;
+        assert_eq!(
+            result,
+            json!({"title": "Investigate OAuth timeout"}),
+            "v{version}"
+        );
+        assert_eq!(
+            announced_titles(&peer, from, &session_id),
+            [json!("Investigate OAuth timeout")],
+            "v{version}: the loaded session is told"
+        );
+        assert_eq!(
+            listed_title(&mut peer, &session_id).await,
+            "Investigate OAuth timeout",
+            "v{version}"
+        );
+
+        // The first prompt would otherwise title the session after itself.
+        let from = peer.updates.len();
+        prompt_until_end_turn(&mut peer, version, &session_id, "Write the release notes").await;
+        let announced = announced_titles(&peer, from, &session_id);
+        assert!(
+            !announced.is_empty(),
+            "v{version}: the turn sends its title"
+        );
+        assert!(
+            announced
+                .iter()
+                .all(|title| title == "Investigate OAuth timeout"),
+            "v{version}: {announced:?}"
+        );
+        assert_eq!(
+            listed_title(&mut peer, &session_id).await,
+            "Investigate OAuth timeout",
+            "v{version}"
+        );
+        let record = stored_record(temp.path(), &session_id);
+        assert_eq!(record["title"], "Investigate OAuth timeout", "v{version}");
+        assert_eq!(record["title_set_by_client"], true, "v{version}");
+
+        // A later rename replaces the client's own title, capped in characters.
+        let result = peer
+            .request(
+                "session/set_title",
+                json!({"sessionId": session_id, "title": "ü".repeat(300)}),
+            )
+            .await;
+        assert_eq!(result, json!({"title": "ü".repeat(256)}), "v{version}");
+        assert_eq!(
+            listed_title(&mut peer, &session_id).await,
+            "ü".repeat(256),
+            "v{version}"
+        );
+
+        exit_peer(peer).await;
+        assert_eq!(server.await.unwrap().len(), 1, "v{version}");
+    }
+}
+
+#[tokio::test]
+async fn set_title_renames_a_session_that_is_not_loaded() {
+    for version in [1, 2] {
+        let temp = tempfile::tempdir().unwrap();
+        let Some((base_url, server)) = mock_sequence_server(vec![mock_text_stream()]).await else {
+            eprintln!("skipping set_title test: loopback networking is unavailable");
+            return;
+        };
+        let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+        initialize_advertising_set_title(&mut peer, version).await;
+        let session_id = peer_new_session(&mut peer, &temp.path().to_string_lossy()).await;
+        prompt_until_end_turn(&mut peer, version, &session_id, "Draft the migration plan").await;
+        assert_eq!(
+            listed_title(&mut peer, &session_id).await,
+            "Draft the migration plan",
+            "v{version}: a generated title"
+        );
+        exit_peer(peer).await;
+        server.await.unwrap();
+        let mut expected = stored_record(temp.path(), &session_id);
+        assert_eq!(expected["title_set_by_client"], false, "v{version}");
+
+        // A new process has the session on disk only.
+        let mut peer = spawn_peer(temp.path(), None).await;
+        initialize_advertising_set_title(&mut peer, version).await;
+        let result = peer
+            .request(
+                "session/set_title",
+                json!({"sessionId": session_id, "title": "Migration plan"}),
+            )
+            .await;
+        assert_eq!(result, json!({"title": "Migration plan"}), "v{version}");
+        assert!(
+            peer.updates.is_empty(),
+            "v{version}: no update for a session this connection has not loaded: {:?}",
+            peer.updates
+        );
+        let status = peer
+            .request("session/status", json!({"sessionId": session_id}))
+            .await;
+        assert_eq!(status["status"], "inactive", "v{version}: not loaded");
+        assert_eq!(
+            listed_title(&mut peer, &session_id).await,
+            "Migration plan",
+            "v{version}"
+        );
+        expected["title"] = json!("Migration plan");
+        expected["title_set_by_client"] = json!(true);
+        assert_eq!(
+            stored_record(temp.path(), &session_id),
+            expected,
+            "v{version}: only the title changed"
+        );
+        exit_peer(peer).await;
+
+        let mut peer = spawn_peer(temp.path(), None).await;
+        initialize_advertising_set_title(&mut peer, version).await;
+        assert_eq!(
+            listed_title(&mut peer, &session_id).await,
+            "Migration plan",
+            "v{version}: after a restart"
+        );
+        exit_peer(peer).await;
+    }
+}
+
+#[tokio::test]
+async fn set_title_rejects_empty_titles_unknown_sessions_and_malformed_params() {
+    for version in [1, 2] {
+        let temp = tempfile::tempdir().unwrap();
+        // Stderr is piped and never read, so a handler that returned its
+        // params error instead of answering it would stall the connection
+        // (#53).
+        let mut peer = spawn_peer_with_stderr(temp.path(), None, &[], Stdio::piped()).await;
+        initialize_advertising_set_title(&mut peer, version).await;
+        let cwd = temp.path().to_string_lossy().to_string();
+        let session_id = peer_new_session(&mut peer, &cwd).await;
+        let deleted_id = peer_new_session(&mut peer, &cwd).await;
+        peer.request("session/delete", json!({"sessionId": deleted_id}))
+            .await;
+        peer.request(
+            "session/set_title",
+            json!({"sessionId": session_id, "title": "Kept"}),
+        )
+        .await;
+
+        for title in ["", "   ", "\n\t\r\n", "\u{7}"] {
+            let error = peer
+                .request_error(
+                    "session/set_title",
+                    json!({"sessionId": session_id, "title": title}),
+                )
+                .await;
+            assert_eq!(
+                error,
+                json!({"code": -32602, "message": "Title must not be empty."}),
+                "v{version}: {title:?}"
+            );
+        }
+        for unknown in [deleted_id.as_str(), "dsh-never-created", "../outside", ""] {
+            let error = peer
+                .request_error(
+                    "session/set_title",
+                    json!({"sessionId": unknown, "title": "Lost"}),
+                )
+                .await;
+            assert_eq!(
+                error,
+                json!({
+                    "code": -32002,
+                    "message": "Resource not found",
+                    "data": {"sessionId": unknown}
+                }),
+                "v{version}: {unknown:?}"
+            );
+        }
+
+        let malformed = [
+            None,
+            Some(Value::Null),
+            Some(json!([])),
+            Some(json!({})),
+            Some(json!({"title": "No session"})),
+            Some(json!({"sessionId": 7, "title": "Number"})),
+            Some(json!({"sessionId": session_id})),
+            Some(json!({"sessionId": session_id, "title": null})),
+            Some(json!({"sessionId": session_id, "title": 7})),
+            Some(json!({"sessionId": session_id, "title": ["Kept"]})),
+        ];
+        for params in malformed {
+            let case = format!("v{version} params {params:?}");
+            let id = peer.next_id;
+            peer.next_id += 1;
+            let mut request = json!({"jsonrpc": "2.0", "id": id, "method": "session/set_title"});
+            if let Some(params) = params {
+                request["params"] = params;
+            }
+            peer.write(request).await;
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let message = peer.next_message().await;
+                    if message["id"] == id {
+                        return message;
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("no reply to {case}"));
+            assert_eq!(reply["error"]["code"], -32602, "{case}: {reply}");
+        }
+
+        // The connection still answers, and nothing was renamed or recreated.
+        let list = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            peer.request("session/list", json!({})),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("v{version}: session/list went unanswered"));
+        let sessions = list["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "v{version}: {list}");
+        assert_eq!(sessions[0]["sessionId"], session_id, "v{version}");
+        assert_eq!(sessions[0]["title"], "Kept", "v{version}");
+        exit_peer(peer).await;
+    }
+}
+
+#[tokio::test]
+async fn set_title_during_a_turn_keeps_the_new_title() {
+    for version in [1, 2] {
+        let temp = tempfile::tempdir().unwrap();
+        let Some((base_url, release, server)) = mock_gated_deepseek_server().await else {
+            eprintln!("skipping set_title test: loopback networking is unavailable");
+            return;
+        };
+        let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+        initialize_advertising_set_title(&mut peer, version).await;
+        let session_id = peer_new_session(&mut peer, &temp.path().to_string_lossy()).await;
+        let prompt = json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "Investigate the flaky test"}]
+        });
+        // A v1 prompt is answered when its turn ends, a v2 one when accepted.
+        let prompt_id = peer.next_id;
+        if version == 1 {
+            peer.next_id += 1;
+            peer.write(json!({
+                "jsonrpc": "2.0",
+                "id": prompt_id,
+                "method": "session/prompt",
+                "params": prompt
+            }))
+            .await;
+        } else {
+            peer.request("session/prompt", prompt).await;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !peer
+                .updates
+                .iter()
+                .any(|update| update["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+            {
+                let message = peer.next_message().await;
+                peer.updates.push(message);
+            }
+        })
+        .await
+        .expect("the model stream should start");
+        assert_eq!(
+            announced_titles(&peer, 0, &session_id),
+            [json!("Investigate the flaky test")],
+            "v{version}: the turn titled the session"
+        );
+
+        // The gated model cannot finish the turn until `release`.
+        let from = peer.updates.len();
+        let result = peer
+            .request(
+                "session/set_title",
+                json!({"sessionId": session_id, "title": "Flaky test hunt"}),
+            )
+            .await;
+        assert_eq!(result, json!({"title": "Flaky test hunt"}), "v{version}");
+        release.send(()).unwrap();
+        if version == 1 {
+            let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let message = peer.next_message().await;
+                    if message["id"] == prompt_id {
+                        return message;
+                    }
+                    peer.updates.push(message);
+                }
+            })
+            .await
+            .expect("the turn should end");
+            assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+        } else {
+            let idle = next_v2_idle(&mut peer).await;
+            assert_eq!(idle["params"]["update"]["stopReason"], "end_turn", "{idle}");
+        }
+        assert_eq!(
+            announced_titles(&peer, from, &session_id),
+            [json!("Flaky test hunt")],
+            "v{version}"
+        );
+        assert_eq!(
+            listed_title(&mut peer, &session_id).await,
+            "Flaky test hunt",
+            "v{version}: the turn's saves keep the new title"
+        );
+        exit_peer(peer).await;
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn sessions_stored_without_the_title_flag_still_get_generated_titles() {
+    for version in [1, 2] {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().to_string_lossy().to_string();
+        let mut peer = spawn_peer(temp.path(), None).await;
+        initialize_advertising_set_title(&mut peer, version).await;
+        let session_id = peer_new_session(&mut peer, &cwd).await;
+        exit_peer(peer).await;
+
+        // Make the record look like one stored before `session/set_title`.
+        let path = temp
+            .path()
+            .join("sessions-data")
+            .join("sessions")
+            .join(format!("{session_id}.json"));
+        let mut record = stored_record(temp.path(), &session_id);
+        assert_eq!(record["title"], Value::Null, "v{version}");
+        assert!(
+            record
+                .as_object_mut()
+                .unwrap()
+                .remove("title_set_by_client")
+                .is_some(),
+            "v{version}"
+        );
+        std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+        let Some((base_url, server)) = mock_sequence_server(vec![mock_text_stream()]).await else {
+            eprintln!("skipping set_title test: loopback networking is unavailable");
+            return;
+        };
+        let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+        initialize_advertising_set_title(&mut peer, version).await;
+        peer.request(
+            "session/resume",
+            json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []}),
+        )
+        .await;
+        let from = peer.updates.len();
+        prompt_until_end_turn(&mut peer, version, &session_id, "Summarize the open issues").await;
+        assert!(
+            announced_titles(&peer, from, &session_id)
+                .iter()
+                .any(|title| title == "Summarize the open issues"),
+            "v{version}: {:?}",
+            peer.updates
+        );
+        assert_eq!(
+            listed_title(&mut peer, &session_id).await,
+            "Summarize the open issues",
+            "v{version}"
+        );
+        assert_eq!(
+            stored_record(temp.path(), &session_id)["title_set_by_client"],
+            false,
+            "v{version}"
+        );
+        exit_peer(peer).await;
+        server.await.unwrap();
+    }
+}
+
 async fn spawn_peer(data_dir: &std::path::Path, base_url: Option<&str>) -> Peer {
     spawn_peer_with_args(data_dir, base_url, &[]).await
 }
