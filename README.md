@@ -188,12 +188,21 @@ It reports whether a session is in memory (`active`) or only stored
 A v2 `active` result also carries the foreground state. See
 [docs/acp-support.md](docs/acp-support.md#session-status).
 
+They also implement `session/set_title` from the Draft
+[Client-Set Session Titles RFD](https://agentclientprotocol.com/rfds/session-set-title),
+advertised as `sessionCapabilities.setTitle` in v1 and `session.setTitle` in
+v2. It renames a session whether or not it is loaded and returns the
+normalized title it stored, and later prompts no longer replace that title
+with a generated one. See
+[docs/acp-support.md](docs/acp-support.md#session-titles).
+
 ACP v1 includes:
 
 - `initialize`, agent info, capabilities, auth/logout, and optional provider
   configuration APIs
 - `session/new`, `session/load`, `session/resume`, `session/fork`,
-  `session/list`, `session/delete`, `session/close`, and `session/status`
+  `session/list`, `session/delete`, `session/close`, `session/status`, and
+  `session/set_title`
 - `session/prompt`, `session/cancel`, `session/set_mode`, and
   `session/set_config_option`
 - `$/cancel_request` for an in-flight `session/prompt`, answered with `-32800`

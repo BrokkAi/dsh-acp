@@ -64,6 +64,18 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   declined, already completed, and other sessions' IDs fail the call and send
   nothing. Pending IDs live in memory only and are dropped, without a
   completion, when the session is closed or deleted.
+- `session/set_title` from the Draft Client-Set Session Titles RFD, in both
+  protocol versions. A client can rename a session whether or not it is
+  loaded; a stored session is updated on disk without being loaded, and for a
+  session in memory the client is also sent a `session_info_update`. The
+  title is trimmed, runs of whitespace and control characters become one
+  space, it is capped at 256 characters, and the result returns the title as
+  stored. Once a client sets a title, titles generated from prompts no longer
+  replace it, also after a restart. A title that is empty after normalization
+  is rejected with `-32602`, and an unknown or deleted session with `-32002`.
+  It is advertised as `sessionCapabilities.setTitle` in v1 and
+  `session.setTitle` in v2. The SDK has no types for the method yet, so its
+  shape follows the RFD and may change with it.
 
 ### Changed
 
