@@ -2627,6 +2627,164 @@ async fn v2_resume_connects_mcp_servers_after_a_cancel() {
     );
 }
 
+/// A v1 stdio MCP server declaration that starts, writes its PID to
+/// `pid_file`, and never answers.
+#[cfg(unix)]
+fn silent_stdio_mcp_server(pid_file: &std::path::Path) -> Value {
+    json!({
+        "name": "silent",
+        "command": "/bin/sh",
+        "args": ["-c", "echo $$ > \"$1\"; exec sleep 60", "sh", pid_file],
+        "env": []
+    })
+}
+
+/// Sends a lifecycle request that declares a silent MCP server to a peer
+/// started with a one-second connect timeout. It must fail promptly with an
+/// error naming the server and the setting, with the server process gone.
+#[cfg(unix)]
+async fn assert_silent_mcp_server_fails(
+    peer: &mut Peer,
+    method: &str,
+    params: Value,
+    pid_file: &std::path::Path,
+) {
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        peer.request_error(method, params),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{method} hung despite the one-second MCP connect timeout"));
+    let message = error["data"].as_str().unwrap_or_default();
+    assert!(message.contains("MCP server `silent`"), "{method}: {error}");
+    assert!(
+        message.contains("DSH_ACP_MCP_CONNECT_TIMEOUT_SECS"),
+        "{method}: {error}"
+    );
+    let pid = std::fs::read_to_string(pid_file).expect("the MCP server should have started");
+    // `kill -0` also succeeds for an exited process nobody has reaped.
+    let running = std::process::Command::new("/bin/sh")
+        .args(["-c", "kill -0 \"$1\" 2>/dev/null", "sh", pid.trim()])
+        .status()
+        .unwrap()
+        .success();
+    assert!(
+        !running,
+        "{method}: MCP server {} is still running",
+        pid.trim()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_stdio_mcp_server_that_never_answers_fails_session_new_in_time() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut peer =
+        spawn_peer_with_args(temp.path(), None, &["--mcp-connect-timeout-secs", "1"]).await;
+    peer.request("initialize", json!({"protocolVersion": 1}))
+        .await;
+    let cwd = temp.path().to_string_lossy().to_string();
+    let pid_file = temp.path().join("mcp.pid");
+    assert_silent_mcp_server_fails(
+        &mut peer,
+        "session/new",
+        json!({
+            "cwd": cwd,
+            "mcpServers": [silent_stdio_mcp_server(&pid_file)],
+            "additionalDirectories": []
+        }),
+        &pid_file,
+    )
+    .await;
+
+    // The connection still answers, and the failed session was not kept.
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": cwd, "mcpServers": [], "additionalDirectories": []}),
+        )
+        .await;
+    let list = peer.request("session/list", json!({"cwd": cwd})).await;
+    assert_eq!(list["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(list["sessions"][0]["sessionId"], session["sessionId"]);
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn v2_a_stdio_mcp_server_that_never_answers_fails_session_setup_in_time() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut peer =
+        spawn_peer_with_args(temp.path(), None, &["--mcp-connect-timeout-secs", "1"]).await;
+    peer.request(
+        "initialize",
+        json!({
+            "protocolVersion": 2,
+            "info": {"name": "v2-test-client", "version": "1.0.0"},
+            "capabilities": {}
+        }),
+    )
+    .await;
+    let cwd = temp.path().to_string_lossy().to_string();
+    let silent = |pid_file: &std::path::Path| {
+        let mut server = silent_stdio_mcp_server(pid_file);
+        server["type"] = json!("stdio");
+        server
+    };
+    let new_pid_file = temp.path().join("new.pid");
+    assert_silent_mcp_server_fails(
+        &mut peer,
+        "session/new",
+        json!({
+            "cwd": cwd,
+            "mcpServers": [silent(&new_pid_file)],
+            "additionalDirectories": []
+        }),
+        &new_pid_file,
+    )
+    .await;
+
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": cwd, "mcpServers": [], "additionalDirectories": []}),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+    let resume_pid_file = temp.path().join("resume.pid");
+    assert_silent_mcp_server_fails(
+        &mut peer,
+        "session/resume",
+        json!({
+            "sessionId": session_id,
+            "cwd": cwd,
+            "mcpServers": [silent(&resume_pid_file)],
+            "additionalDirectories": []
+        }),
+        &resume_pid_file,
+    )
+    .await;
+
+    // The connection still answers, and the session can still be resumed.
+    let resumed = peer
+        .request(
+            "session/resume",
+            json!({
+                "sessionId": session_id,
+                "cwd": cwd,
+                "mcpServers": [],
+                "additionalDirectories": []
+            }),
+        )
+        .await;
+    assert!(resumed["configOptions"].is_array());
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+}
+
 #[tokio::test]
 async fn v2_effort_command_tells_the_client_the_new_setting() {
     let temp = tempfile::tempdir().unwrap();

@@ -49,6 +49,16 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   directories, and a v1 load had already saved them to the session file. The
   next prompt used instructions from a request the client was told had failed.
   Both versions now install them only after the MCP servers connect.
+- A stdio MCP server that started but never answered the MCP handshake or its
+  first `tools/list` hung `session/new`, `session/load`, `session/resume`, or
+  `session/fork`, and with it every later message on the connection. Each MCP
+  server now has `--mcp-connect-timeout-secs`
+  (`DSH_ACP_MCP_CONNECT_TIMEOUT_SECS`, default 60) to connect and list its
+  tools; a server that misses it fails the request with an error naming the
+  server, and the stdio server processes started for the request are killed.
+  The limit also covers HTTP MCP servers, whose setup could take up to 180
+  seconds per request. Tool calls and the tool list refresh during a turn are
+  not affected.
 
 ## 0.4.0 - 2026-10-25
 

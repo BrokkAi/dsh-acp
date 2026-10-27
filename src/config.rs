@@ -110,6 +110,7 @@ pub struct Config {
     pub context_chars: usize,
     pub tool_output_bytes: usize,
     pub http_timeout: Duration,
+    pub mcp_connect_timeout: Duration,
     pub disable_web: bool,
     pub trace: bool,
 }
@@ -133,6 +134,9 @@ impl Config {
         }
         if self.http_timeout.is_zero() {
             return Err(Error::invalid_params().data("HTTP timeout must be positive"));
+        }
+        if self.mcp_connect_timeout.is_zero() {
+            return Err(Error::invalid_params().data("MCP connect timeout must be positive"));
         }
         Ok(())
     }

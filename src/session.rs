@@ -482,6 +482,7 @@ mod tests {
             context_chars: 1000,
             tool_output_bytes: 1000,
             http_timeout: std::time::Duration::from_secs(1),
+            mcp_connect_timeout: std::time::Duration::from_secs(1),
             disable_web: true,
             trace: false,
         };
@@ -524,6 +525,7 @@ mod tests {
             context_chars: 1000,
             tool_output_bytes: 1000,
             http_timeout: std::time::Duration::from_secs(1),
+            mcp_connect_timeout: std::time::Duration::from_secs(1),
             disable_web: true,
             trace: false,
         };
@@ -586,6 +588,7 @@ mod tests {
             context_chars: 1000,
             tool_output_bytes: 1000,
             http_timeout: std::time::Duration::from_secs(1),
+            mcp_connect_timeout: std::time::Duration::from_secs(1),
             disable_web: true,
             trace: false,
         };
@@ -680,6 +683,7 @@ mod tests {
             context_chars: 1000,
             tool_output_bytes: 1000,
             http_timeout: std::time::Duration::from_secs(1),
+            mcp_connect_timeout: std::time::Duration::from_secs(1),
             disable_web: true,
             trace: false,
         };
@@ -714,6 +718,7 @@ mod tests {
             context_chars: 1000,
             tool_output_bytes: 1000,
             http_timeout: std::time::Duration::from_secs(1),
+            mcp_connect_timeout: std::time::Duration::from_secs(1),
             disable_web: true,
             trace: false,
         };
@@ -753,6 +758,7 @@ mod tests {
             context_chars: 1000,
             tool_output_bytes: 1000,
             http_timeout: std::time::Duration::from_secs(1),
+            mcp_connect_timeout: std::time::Duration::from_secs(1),
             disable_web: true,
             trace: false,
         };

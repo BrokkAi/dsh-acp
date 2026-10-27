@@ -120,6 +120,7 @@ The binary is `target/release/dsh-acp`.
 --reasoning-effort <EFFORT>      Thinking effort (default: high)
 --context-chars <N>              Approximate context budget
 --tool-output-bytes <N>          Per-tool output cap
+--mcp-connect-timeout-secs <N>   MCP server setup limit (default: 60)
 --disable-web                    Disable web_fetch
 --trace                          Detailed diagnostics on stderr
 ```
@@ -234,6 +235,13 @@ v2 uses the local workspace tools directly.
 MCP tools are exposed to the model as
 `mcp__<server>__<tool>`. Both stdio servers and modern streamable HTTP servers
 are supported; a session can declare multiple servers.
+
+Each server has `--mcp-connect-timeout-secs` seconds (default 60) to start,
+complete the MCP handshake, and list its tools when a session is created,
+loaded, resumed, or forked. A server that misses the deadline fails that
+request with an error naming the server, and the stdio server processes
+started for the request are killed. The limit does not apply to tool calls or
+to the tool list refresh during a turn.
 
 ## DeepSeek behavior
 

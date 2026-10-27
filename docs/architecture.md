@@ -77,6 +77,9 @@ lossy text reconstruction.
 - Steering requests for a session serialize through that same lock.
 - Closing prevents new prompt insertion and waits for active work to settle.
 - MCP calls are serialized per server.
+- Session lifecycle requests run in the SDK's dispatch loop, so no other
+  incoming message is handled until they answer. Connecting their MCP servers
+  is bounded per server by `--mcp-connect-timeout-secs`.
 - Session-store writes are serialized process-wide.
 
 ## Security boundaries
