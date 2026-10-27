@@ -1858,8 +1858,9 @@ async fn v2_override_system_prompt_replaces_only_the_harness_prompt() {
     assert_appended(system_prompt_of(&requests[3]), "client persona v3");
 }
 
-/// The client system prompt and mode stored in a session's file.
-fn stored_system_prompt(data_dir: &std::path::Path, session_id: &str) -> (Value, Value) {
+/// The client system prompt, its mode, and the additional directories stored
+/// in a session's file.
+fn stored_instructions(data_dir: &std::path::Path, session_id: &str) -> (Value, Value, Value) {
     let path = data_dir
         .join("sessions-data")
         .join("sessions")
@@ -1868,7 +1869,20 @@ fn stored_system_prompt(data_dir: &std::path::Path, session_id: &str) -> (Value,
     (
         record["system_prompt"].clone(),
         record["system_prompt_mode"].clone(),
+        record["additional_directories"].clone(),
     )
+}
+
+/// What a session created with an override and no additional directories
+/// stores.
+fn original_instructions() -> (Value, Value, Value) {
+    (json!("client persona v1"), json!("override"), json!([]))
+}
+
+/// The failing request reached the MCP connect, rather than being refused
+/// earlier.
+fn assert_mcp_connect_failed(error: &Value) {
+    assert_eq!(error["code"], -32603, "{error}");
 }
 
 #[tokio::test]
@@ -1877,6 +1891,9 @@ async fn v1_a_load_or_resume_whose_mcp_server_fails_changes_nothing() {
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::write(workspace.join("AGENTS.md"), "workspace instructions\n").unwrap();
+    let extra = temp.path().join("extra");
+    std::fs::create_dir_all(&extra).unwrap();
+    std::fs::write(extra.join("AGENTS.md"), "additional-root instructions\n").unwrap();
     let Some((base_url, server)) = mock_sequence_server(vec![mock_text_stream(); 2]).await else {
         eprintln!("skipping v1 MCP failure test: loopback networking is unavailable");
         return;
@@ -1912,29 +1929,35 @@ async fn v1_a_load_or_resume_whose_mcp_server_fails_changes_nothing() {
     )
     .await;
 
-    peer.request_error(
-        "session/resume",
-        json!({
-            "sessionId": session_id,
-            "cwd": workspace,
-            "mcpServers": [missing_server],
-            "systemPrompt": client_system_prompt("append", "client persona v2")
-        }),
-    )
-    .await;
-    peer.request_error(
-        "session/load",
-        json!({
-            "sessionId": session_id,
-            "cwd": workspace,
-            "mcpServers": [missing_server],
-            "systemPrompt": client_system_prompt("append", "client persona v3")
-        }),
-    )
-    .await;
+    let error = peer
+        .request_error(
+            "session/resume",
+            json!({
+                "sessionId": session_id,
+                "cwd": workspace,
+                "mcpServers": [missing_server],
+                "additionalDirectories": [extra],
+                "systemPrompt": client_system_prompt("append", "client persona v2")
+            }),
+        )
+        .await;
+    assert_mcp_connect_failed(&error);
+    let error = peer
+        .request_error(
+            "session/load",
+            json!({
+                "sessionId": session_id,
+                "cwd": workspace,
+                "mcpServers": [missing_server],
+                "additionalDirectories": [extra],
+                "systemPrompt": client_system_prompt("append", "client persona v3")
+            }),
+        )
+        .await;
+    assert_mcp_connect_failed(&error);
     assert_eq!(
-        stored_system_prompt(temp.path(), &session_id),
-        (json!("client persona v1"), json!("override"))
+        stored_instructions(temp.path(), &session_id),
+        original_instructions()
     );
     peer.request(
         "session/prompt",
@@ -1944,9 +1967,17 @@ async fn v1_a_load_or_resume_whose_mcp_server_fails_changes_nothing() {
 
     drop(peer.stdin);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    // The prompt saved the live record, so this also covers the resume, which
+    // never saves when it fails.
+    assert_eq!(
+        stored_instructions(temp.path(), &session_id),
+        original_instructions()
+    );
     let requests = server.await.unwrap();
     for request in &requests {
-        assert_overridden(system_prompt_of(request), "client persona v1");
+        let prompt = system_prompt_of(request);
+        assert_overridden(prompt, "client persona v1");
+        assert!(!prompt.contains("additional-root instructions"), "{prompt}");
     }
 }
 
@@ -1956,6 +1987,9 @@ async fn v2_a_resume_whose_mcp_server_fails_changes_nothing() {
     let workspace = temp.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::write(workspace.join("AGENTS.md"), "workspace instructions\n").unwrap();
+    let extra = temp.path().join("extra");
+    std::fs::create_dir_all(&extra).unwrap();
+    std::fs::write(extra.join("AGENTS.md"), "additional-root instructions\n").unwrap();
     let Some((base_url, server)) = mock_sequence_server(vec![mock_text_stream(); 2]).await else {
         eprintln!("skipping v2 MCP failure test: loopback networking is unavailable");
         return;
@@ -1993,23 +2027,26 @@ async fn v2_a_resume_whose_mcp_server_fails_changes_nothing() {
     .await;
     next_v2_idle(&mut peer).await;
 
-    peer.request_error(
-        "session/resume",
-        json!({
-            "sessionId": session_id,
-            "cwd": workspace,
-            "mcpServers": [{
-                "type": "stdio",
-                "name": "missing",
-                "command": temp.path().join("missing-mcp-server")
-            }],
-            "systemPrompt": client_system_prompt("append", "client persona v2")
-        }),
-    )
-    .await;
+    let error = peer
+        .request_error(
+            "session/resume",
+            json!({
+                "sessionId": session_id,
+                "cwd": workspace,
+                "mcpServers": [{
+                    "type": "stdio",
+                    "name": "missing",
+                    "command": temp.path().join("missing-mcp-server")
+                }],
+                "additionalDirectories": [extra],
+                "systemPrompt": client_system_prompt("append", "client persona v2")
+            }),
+        )
+        .await;
+    assert_mcp_connect_failed(&error);
     assert_eq!(
-        stored_system_prompt(temp.path(), &session_id),
-        (json!("client persona v1"), json!("override"))
+        stored_instructions(temp.path(), &session_id),
+        original_instructions()
     );
     peer.request(
         "session/prompt",
@@ -2020,9 +2057,17 @@ async fn v2_a_resume_whose_mcp_server_fails_changes_nothing() {
 
     drop(peer.stdin);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    // The prompt saved the live record, so this also covers the in-memory
+    // session the failed resume must not have changed.
+    assert_eq!(
+        stored_instructions(temp.path(), &session_id),
+        original_instructions()
+    );
     let requests = server.await.unwrap();
     for request in &requests {
-        assert_overridden(system_prompt_of(request), "client persona v1");
+        let prompt = system_prompt_of(request);
+        assert_overridden(prompt, "client persona v1");
+        assert!(!prompt.contains("additional-root instructions"), "{prompt}");
     }
 }
 
