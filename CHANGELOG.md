@@ -90,6 +90,12 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   request at once. An interrupted MCP tool call is reported as failed, an ACP
   v1 prompt ends with `stopReason: "cancelled"`, and ACP v2 settles to idle
   with `cancelled`.
+- An empty or whitespace-only `DEEPSEEK_API_KEY` or `--api-key` was sent to
+  DeepSeek as a blank bearer token, so the prompt failed with DeepSeek's HTTP
+  401 even though authentication already treated such a key as missing. It now
+  counts as no key: the prompt fails locally with the `-32000` error that says
+  to set `DEEPSEEK_API_KEY`, and no request is sent. An `Authorization` header
+  set with `providers/set` is still used in its place.
 
 ## 0.4.0 - 2026-10-25
 

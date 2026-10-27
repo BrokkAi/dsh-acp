@@ -1153,13 +1153,36 @@ async fn spawn_peer_with_args(
     base_url: Option<&str>,
     extra_args: &[&str],
 ) -> Peer {
-    spawn_peer_with_stderr(data_dir, base_url, extra_args, Stdio::null()).await
+    let api_key = base_url.map(|_| "test-key");
+    spawn_peer_with_api_key(data_dir, base_url, api_key, extra_args).await
+}
+
+/// Like `spawn_peer_with_args`, but `DEEPSEEK_API_KEY` is set to `api_key`,
+/// or removed when it is `None`, whatever the base URL.
+async fn spawn_peer_with_api_key(
+    data_dir: &std::path::Path,
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+    extra_args: &[&str],
+) -> Peer {
+    spawn_peer_with_options(data_dir, base_url, api_key, extra_args, Stdio::null()).await
 }
 
 /// Like [`spawn_peer_with_args`], with the server's stderr sent to `stderr`.
 async fn spawn_peer_with_stderr(
     data_dir: &std::path::Path,
     base_url: Option<&str>,
+    extra_args: &[&str],
+    stderr: Stdio,
+) -> Peer {
+    let api_key = base_url.map(|_| "test-key");
+    spawn_peer_with_options(data_dir, base_url, api_key, extra_args, stderr).await
+}
+
+async fn spawn_peer_with_options(
+    data_dir: &std::path::Path,
+    base_url: Option<&str>,
+    api_key: Option<&str>,
     extra_args: &[&str],
     stderr: Stdio,
 ) -> Peer {
@@ -1177,11 +1200,12 @@ async fn spawn_peer_with_stderr(
             .arg("--base-url")
             .arg(base_url)
             .arg("--permission-mode")
-            .arg("ask")
-            .env("DEEPSEEK_API_KEY", "test-key");
-    } else {
-        command.env_remove("DEEPSEEK_API_KEY");
+            .arg("ask");
     }
+    match api_key {
+        Some(api_key) => command.env("DEEPSEEK_API_KEY", api_key),
+        None => command.env_remove("DEEPSEEK_API_KEY"),
+    };
     let mut child = command.spawn().unwrap();
     let stdin = child.stdin.take().unwrap();
     let stdout = BufReader::new(child.stdout.take().unwrap());
@@ -2695,6 +2719,111 @@ async fn model_request_failures_name_the_setting_to_check() {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
     }
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_blank_api_key_fails_locally_without_calling_the_model() {
+    let Some((base_url, mut authorizations)) = mock_authorization_recording_server().await else {
+        eprintln!("skipping blank API key test: loopback networking is unavailable");
+        return;
+    };
+    let cases: [(&str, Option<&str>, &[&str]); 3] = [
+        ("empty DEEPSEEK_API_KEY", Some(""), &[]),
+        ("blank DEEPSEEK_API_KEY", Some("   "), &[]),
+        ("blank --api-key", None, &["--api-key", "  "]),
+    ];
+    for (case, api_key, extra_args) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let mut peer =
+            spawn_peer_with_api_key(temp.path(), Some(&base_url), api_key, extra_args).await;
+        peer.request("initialize", json!({"protocolVersion": 1}))
+            .await;
+        let session = peer
+            .request(
+                "session/new",
+                json!({"cwd": temp.path().to_string_lossy(), "mcpServers": []}),
+            )
+            .await;
+        let error = peer
+            .request_error(
+                "session/prompt",
+                json!({
+                    "sessionId": session["sessionId"],
+                    "prompt": [{"type": "text", "text": "hello"}]
+                }),
+            )
+            .await;
+        assert_eq!(error["code"], -32000, "{case}: {error}");
+        assert_eq!(
+            error["data"],
+            "Set DEEPSEEK_API_KEY, pass --api-key, or configure an Authorization provider header",
+            "{case}: {error}"
+        );
+        drop(peer.stdin);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+        if let Ok(authorization) = authorizations.try_recv() {
+            panic!("{case}: the model was called with Authorization {authorization:?}");
+        }
+    }
+
+    // A non-blank key is sent unchanged, and a provider Authorization header
+    // still stands in for a blank key.
+    let cases = [
+        (
+            "non-blank DEEPSEEK_API_KEY",
+            "test-key",
+            None,
+            "Bearer test-key",
+        ),
+        (
+            "provider Authorization header",
+            "   ",
+            Some("Bearer provider-key"),
+            "Bearer provider-key",
+        ),
+    ];
+    for (case, api_key, provider_authorization, expected) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let mut peer =
+            spawn_peer_with_api_key(temp.path(), Some(&base_url), Some(api_key), &[]).await;
+        peer.request("initialize", json!({"protocolVersion": 1}))
+            .await;
+        if let Some(authorization) = provider_authorization {
+            peer.request(
+                "providers/set",
+                json!({
+                    "providerId": "deepseek",
+                    "apiType": "openai",
+                    "baseUrl": base_url,
+                    "headers": {"Authorization": authorization}
+                }),
+            )
+            .await;
+        }
+        let session = peer
+            .request(
+                "session/new",
+                json!({"cwd": temp.path().to_string_lossy(), "mcpServers": []}),
+            )
+            .await;
+        let response = peer
+            .request(
+                "session/prompt",
+                json!({
+                    "sessionId": session["sessionId"],
+                    "prompt": [{"type": "text", "text": "hello"}]
+                }),
+            )
+            .await;
+        assert_eq!(response["stopReason"], "end_turn", "{case}");
+        drop(peer.stdin);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+        assert_eq!(
+            authorizations.try_recv().ok(),
+            Some(Some(expected.to_string())),
+            "{case}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -5046,6 +5175,37 @@ async fn mock_single_text_server() -> Option<(String, tokio::task::JoinHandle<Va
     Some((format!("http://{address}"), task))
 }
 
+/// A mock model that answers every request with text and reports each
+/// request's `Authorization` header, or `None` when it had none, before
+/// answering it.
+async fn mock_authorization_recording_server()
+-> Option<(String, tokio::sync::mpsc::UnboundedReceiver<Option<String>>)> {
+    let listener = loopback_listener().await?;
+    let address = listener.local_addr().unwrap();
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let (headers, _) = read_http_request(&mut socket).await;
+            let authorization = headers.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("authorization")
+                    .then(|| value.trim_start().to_string())
+            });
+            let _ = sender.send(authorization);
+            let response = mock_text_stream();
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                response.len()
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        }
+    });
+    Some((format!("http://{address}"), receiver))
+}
+
 /// A mock model that answers each request with the next response in order.
 async fn mock_sequence_server(
     responses: Vec<String>,
@@ -5191,6 +5351,11 @@ async fn loopback_listener() -> Option<TcpListener> {
 }
 
 async fn read_http_json_body(socket: &mut tokio::net::TcpStream) -> Value {
+    read_http_request(socket).await.1
+}
+
+/// The request line and headers, and the JSON body, of one HTTP request.
+async fn read_http_request(socket: &mut tokio::net::TcpStream) -> (String, Value) {
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 4096];
     let header_end = loop {
@@ -5201,7 +5366,7 @@ async fn read_http_json_body(socket: &mut tokio::net::TcpStream) -> Value {
             break position + 4;
         }
     };
-    let headers = String::from_utf8_lossy(&bytes[..header_end]);
+    let headers = String::from_utf8_lossy(&bytes[..header_end]).into_owned();
     let content_length = headers
         .lines()
         .find_map(|line| {
@@ -5215,7 +5380,8 @@ async fn read_http_json_body(socket: &mut tokio::net::TcpStream) -> Value {
         assert!(read > 0, "HTTP request ended before body");
         bytes.extend_from_slice(&chunk[..read]);
     }
-    serde_json::from_slice(&bytes[header_end..header_end + content_length]).unwrap()
+    let body = serde_json::from_slice(&bytes[header_end..header_end + content_length]).unwrap();
+    (headers, body)
 }
 
 fn mock_tool_call_stream() -> String {
