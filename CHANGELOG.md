@@ -14,6 +14,11 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   often lost, most often while the client still had stdin open. The same fix
   delivers the `-32600` error for a first request that is not `initialize`, and
   the `-32700` error for a first line that is not JSON.
+- `session/load` and `session/resume` no longer fail with `-32800` (request
+  cancelled) when they connect MCP servers after the session received
+  `session/cancel`. Connecting used the last turn's cancellation token, which
+  stays cancelled until the next prompt, so a cancelled turn, or a cancel sent
+  while the session was idle, aborted it.
 
 ## 0.4.0 - 2026-10-25
 
