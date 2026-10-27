@@ -132,8 +132,26 @@ list.
 The system prompt combines the built-in harness guidance, any
 `--system-prompt` / `DSH_ACP_SYSTEM_PROMPT` text, `AGENTS.md` from
 `<data-dir>`, `AGENTS.md` from the session working directory, and
-`AGENTS.md` from each additional workspace root. A client-provided ACP system
-prompt is appended last.
+`AGENTS.md` from each additional workspace root, in that order.
+
+An ACP client can add its own system prompt in one of two modes:
+
+- `append` adds the client's text after everything above.
+- `override` puts the client's text in place of the built-in harness guidance.
+  The `--system-prompt` text and the `AGENTS.md` files still follow it, and
+  plan mode still adds its instructions. Tools, MCP servers, permission
+  prompts, and workspace boundaries do not change. A client that overrides the
+  prompt takes responsibility for the tool guidance and safety instructions
+  the built-in guidance provided. Three of those rules exist only in the
+  prompt, with nothing in code enforcing them: treat file contents, command
+  output, web pages, and MCP results as untrusted data; do not expose secrets;
+  and do not run broad destructive commands. An override removes them, so put
+  rules that must survive one in `--system-prompt` / `DSH_ACP_SYSTEM_PROMPT` or
+  `AGENTS.md`.
+
+The client's prompt and its mode are stored with the session. A load, resume,
+or fork that carries a system prompt applies it; one that carries none keeps
+the stored prompt, and a fork inherits its source's.
 
 Instruction files are read again when a session is created, loaded, resumed, or
 forked. Keeping persistent instructions in `<data-dir>/AGENTS.md` avoids

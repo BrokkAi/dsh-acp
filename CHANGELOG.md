@@ -6,6 +6,19 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ## Unreleased
 
+### Added
+
+- ACP clients can now replace the built-in harness prompt instead of only
+  appending to it: both protocol versions advertise
+  `systemPrompt.mode.override` and accept `mode: "override"` on session
+  create, load (v1), resume, and fork. Only the harness's own guidance is
+  replaced. The `--system-prompt` text, `AGENTS.md` instructions, and plan-mode
+  instructions still follow the client's text, and tools, MCP servers,
+  permissions, and workspace boundaries are unchanged. The mode is stored with
+  the session, so a load, resume, or fork that omits `systemPrompt` keeps it.
+  Append mode behaves as before, and sessions stored by earlier versions keep
+  appending.
+
 ### Fixed
 
 - An `initialize` request with an unsupported or malformed `protocolVersion`
@@ -19,6 +32,11 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   `session/cancel`. Connecting used the last turn's cancellation token, which
   stays cancelled until the next prompt, so a cancelled turn, or a cancel sent
   while the session was idle, aborted it.
+- A `session/load` or `session/resume` that failed because an MCP server did
+  not connect still applied the request's system prompt and additional
+  directories, and a v1 load had already saved them to the session file. The
+  next prompt used instructions from a request the client was told had failed.
+  Both versions now install them only after the MCP servers connect.
 
 ## 0.4.0 - 2026-10-25
 

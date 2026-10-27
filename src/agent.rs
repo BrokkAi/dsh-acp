@@ -29,6 +29,7 @@ use agent_client_protocol::{
         SessionDeleteCapabilities, SessionForkCapabilities, SessionId, SessionInfo,
         SessionInfoUpdate, SessionListCapabilities, SessionMode, SessionModeId, SessionModeState,
         SessionNotification, SessionResumeCapabilities, SessionSystemPromptCapabilities,
+        SessionSystemPromptModeCapabilities, SessionSystemPromptOverrideCapabilities,
         SetProviderRequest, SetProviderResponse, SetSessionConfigOptionRequest,
         SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
         SystemPromptMode, Terminal, TerminalId, TextContent, ToolCall, ToolCallContent, ToolCallId,
@@ -45,9 +46,9 @@ use crate::{
     deepseek::{Completion, DeepSeekClient, StreamEvent},
     mcp::{McpSession, mcp_result_text},
     model::{
-        ChatMessage, ContentPart, ImageUrl, MessageContent, PendingUserMessage,
-        PersistedCompaction, PersistedDiff, Role, SessionRecord, SessionRuntime, TokenUsage,
-        ToolOutcomeStatus, ensure_session_unique_tool_call_ids,
+        ChatMessage, ClientPromptMode, ClientSystemPrompt, ContentPart, ImageUrl, MessageContent,
+        PendingUserMessage, PersistedCompaction, PersistedDiff, Role, SessionRecord,
+        SessionRuntime, TokenUsage, ToolOutcomeStatus, ensure_session_unique_tool_call_ids,
     },
     session::{self, SessionStore, session_title},
     tools::{
@@ -378,7 +379,12 @@ impl Harness {
             .resume(SessionResumeCapabilities::new())
             .close(SessionCloseCapabilities::new())
             .fork(SessionForkCapabilities::new())
-            .system_prompt(SessionSystemPromptCapabilities::new());
+            .system_prompt(
+                SessionSystemPromptCapabilities::new().mode(
+                    SessionSystemPromptModeCapabilities::new()
+                        .override_(SessionSystemPromptOverrideCapabilities::new()),
+                ),
+            );
         let capabilities = AgentCapabilities::new()
             .load_session(true)
             .prompt_capabilities(
@@ -521,7 +527,7 @@ impl Harness {
         if !self.initialized.load(Ordering::Acquire) {
             return responder.respond_with_error(Error::invalid_request().data("initialize first"));
         }
-        let system_prompt = match system_prompt_text(request.system_prompt.as_ref()) {
+        let system_prompt = match client_system_prompt(request.system_prompt.as_ref()) {
             Ok(prompt) => prompt,
             Err(error) => return responder.respond_with_error(error),
         };
@@ -557,7 +563,7 @@ impl Harness {
         responder: agent_client_protocol::Responder<LoadSessionResponse>,
         connection: ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
-        let system_prompt = match system_prompt_text(request.system_prompt.as_ref()) {
+        let system_prompt = match client_system_prompt(request.system_prompt.as_ref()) {
             Ok(prompt) => prompt,
             Err(error) => return responder.respond_with_error(error),
         };
@@ -581,8 +587,8 @@ impl Harness {
                 Error::invalid_params().data("invalid session workspace roots"),
             );
         }
-        {
-            let mut state = runtime.state.lock().await;
+        let instructions = {
+            let state = runtime.state.lock().await;
             if state.record.cwd != request.cwd {
                 return responder.respond_with_error(Error::invalid_params().data(format!(
                     "session cwd mismatch: stored {}, requested {}",
@@ -590,18 +596,21 @@ impl Harness {
                     request.cwd.display()
                 )));
             }
-            if let Err(error) = self.store.update_session_instructions(
-                &mut state.record,
+            match self.store.session_instructions(
+                &state.record,
                 request.additional_directories,
                 system_prompt,
             ) {
-                return responder.respond_with_error(error);
+                Ok(instructions) => instructions,
+                Err(error) => return responder.respond_with_error(error),
             }
-        }
-        if let Err(error) = self.store.save(&runtime).await {
+        };
+        // A load whose MCP servers fail to connect leaves the session as it was.
+        if let Err(error) = self.attach_mcp(&runtime, &request.mcp_servers).await {
             return responder.respond_with_error(error);
         }
-        if let Err(error) = self.attach_mcp(&runtime, &request.mcp_servers).await {
+        instructions.install(&mut runtime.state.lock().await.record);
+        if let Err(error) = self.store.save(&runtime).await {
             return responder.respond_with_error(error);
         }
         let record = runtime.snapshot().await;
@@ -630,7 +639,7 @@ impl Harness {
         responder: agent_client_protocol::Responder<ResumeSessionResponse>,
         connection: ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
-        let system_prompt = match system_prompt_text(request.system_prompt.as_ref()) {
+        let system_prompt = match client_system_prompt(request.system_prompt.as_ref()) {
             Ok(prompt) => prompt,
             Err(error) => return responder.respond_with_error(error),
         };
@@ -649,8 +658,8 @@ impl Harness {
                 Error::invalid_request().data("cannot resume a session with active work"),
             );
         }
-        {
-            let mut state = runtime.state.lock().await;
+        let instructions = {
+            let state = runtime.state.lock().await;
             if state.record.cwd != request.cwd {
                 return responder.respond_with_error(Error::invalid_params().data(format!(
                     "session cwd mismatch: stored {}, requested {}",
@@ -663,17 +672,21 @@ impl Harness {
             {
                 return responder.respond_with_error(error);
             }
-            if let Err(error) = self.store.update_session_instructions(
-                &mut state.record,
+            match self.store.session_instructions(
+                &state.record,
                 request.additional_directories,
                 system_prompt,
             ) {
-                return responder.respond_with_error(error);
+                Ok(instructions) => instructions,
+                Err(error) => return responder.respond_with_error(error),
             }
-        }
+        };
+        // A resume whose MCP servers fail to connect leaves the session as it
+        // was.
         if let Err(error) = self.attach_mcp(&runtime, &request.mcp_servers).await {
             return responder.respond_with_error(error);
         }
+        instructions.install(&mut runtime.state.lock().await.record);
         if let Err(error) = self.store.save(&runtime).await {
             return responder.respond_with_error(error);
         }
@@ -715,8 +728,8 @@ impl Harness {
                 request.cwd.display()
             )));
         }
-        let system_prompt = match system_prompt_text(request.system_prompt.as_ref()) {
-            Ok(prompt) => prompt.or(source.system_prompt.clone()),
+        let system_prompt = match client_system_prompt(request.system_prompt.as_ref()) {
+            Ok(prompt) => prompt.or_else(|| source.client_system_prompt()),
             Err(error) => return responder.respond_with_error(error),
         };
         let runtime = match self
@@ -2679,16 +2692,22 @@ fn message_content_to_v1_blocks(content: &MessageContent) -> Vec<ContentBlock> {
     }
 }
 
-fn system_prompt_text(
+fn client_system_prompt(
     prompt: Option<&agent_client_protocol::schema::v1::SystemPrompt>,
-) -> Result<Option<String>, Error> {
+) -> Result<Option<ClientSystemPrompt>, Error> {
     let Some(prompt) = prompt else {
         return Ok(None);
     };
-    if !matches!(prompt.mode, SystemPromptMode::Append) {
-        return Err(Error::invalid_params()
-            .data("this agent only supports append mode for client system prompts"));
-    }
+    let mode = match &prompt.mode {
+        SystemPromptMode::Append => ClientPromptMode::Append,
+        SystemPromptMode::Override => ClientPromptMode::Override,
+        mode => {
+            return Err(Error::invalid_params().data(format!(
+                "unsupported client system prompt mode {}; this agent supports append and override",
+                serde_json::to_string(mode).unwrap_or_default()
+            )));
+        }
+    };
     let text =
         prompt
             .content
@@ -2700,7 +2719,7 @@ fn system_prompt_text(
             })
             .collect::<Result<Vec<_>, _>>()?
             .join("\n\n");
-    Ok(Some(text))
+    Ok(Some(ClientSystemPrompt { mode, text }))
 }
 
 fn replay_history(
