@@ -53,6 +53,17 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   returns the credential. It is advertised as `agentCapabilities.auth.status`
   in v1 and `capabilities.auth.status` in v2. The SDK has no types for the
   method yet, so its shape follows the RFD and may change with it.
+- URL elicitations can now be closed out. Accepting a URL only means the user
+  agreed to open it, and the harness has no callback that sees the external
+  step finish, so `elicitation/complete` was never sent and the Client could not
+  tell the flow was over. The `ask_user` result now gives the model the
+  elicitation ID, and Clients that advertise URL elicitation are offered a
+  `complete_url_elicitation` tool. Once the model has verified the step
+  finished, for example by retrying the operation that needed it, the tool sends
+  `elicitation/complete` with the original ID on the same connection. Unknown,
+  declined, already completed, and other sessions' IDs fail the call and send
+  nothing. Pending IDs live in memory only and are dropped, without a
+  completion, when the session is closed or deleted.
 
 ### Changed
 
@@ -61,6 +72,9 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   timeout on each request (`initialize`, `notifications/initialized`, and each
   `tools/list` page), so an HTTP MCP server that takes more than 60 seconds to
   connect now fails session setup unless the limit is raised.
+- The result of an accepted URL elicitation no longer includes `content` the
+  Client attached to its response. What the user enters out of band must stay
+  out of the model's context.
 
 ### Fixed
 
@@ -104,6 +118,23 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   counts as no key: the prompt fails locally with the `-32000` error that says
   to set `DEEPSEEK_API_KEY`, and no request is sent. An `Authorization` header
   set with `providers/set` is still used in its place.
+- `ask_user` sent a model-chosen URL `elicitation_id` again even while an
+  earlier request with that ID was still outstanding, which ACP forbids. It now
+  fails the tool call and tells the model to omit the ID so one is generated.
+  An ID whose request was cancelled before the Client answered stays reserved
+  until the session closes, because the Client may already have accepted it.
+- An `ask_user` request that could not be sent, or that the Client answered
+  with an error, did not tell the model why. In ACP v1 the model saw only the
+  JSON-RPC error name, such as "Invalid params". In ACP v2 the whole turn ended
+  with stop reason `error`, and the model saw only "Tool call failed before
+  completion." Both versions now fail just that tool call with the reason, for
+  example that the URL must use HTTPS, and the turn continues. In ACP v2, a
+  request refused before it is sent no longer reports `requires_action`.
+- A Client that cancelled an `ask_user` elicitation itself, answering `-32800`,
+  ended the whole turn as `cancelled` although nobody cancelled the turn. Only
+  the turn's own cancellation (`session/cancel`, or a v1 `$/cancel_request` for
+  the prompt) now ends it; a Client-side cancel fails only that tool call, and
+  the model is told the client cancelled the request.
 
 ## 0.4.0 - 2026-10-25
 

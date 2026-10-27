@@ -49,7 +49,7 @@ version's lifecycle and payload shapes.
 | MCP stdio | Implemented | Advertised transport |
 | MCP streamable HTTP | Implemented | Advertised transport |
 | Form elicitation | Implemented | Client capability |
-| URL elicitation | Implemented | Client capability |
+| URL elicitation | Implemented, with model-reported completion | Client capability |
 | `_session/steering` | Implemented | `_meta.steering.supported` |
 | `session/status` | Implemented (Draft RFD) | Advertised capability |
 | Steering idle return | Implemented | `idleBehavior: "promptRequired"` |
@@ -235,3 +235,41 @@ adds the result text only if the command failed; replay after `session/load`
 shows the result text, because the terminal has been released.
 ACP v2 has no client filesystem or terminal execution methods; use an MCP server
 for client-provided tools.
+
+## Elicitation
+
+`ask_user` sends a session-scoped `elicitation/create` tied to its tool call.
+It uses form mode, or URL mode when the model passes a URL and the Client
+advertises URL elicitation. A URL must use HTTPS outside localhost and must not
+embed credentials. In both versions, a request refused before it is sent, or
+answered with an error, fails that tool call with the reason and the turn
+continues. Only the turn's own cancellation ends the turn: `session/cancel`, or
+in ACP v1 a `$/cancel_request` for the prompt. A Client that cancels the
+elicitation request itself answers `-32800`; that fails only the tool call, and
+a URL elicitation's ID is freed as it is for a decline. ACP v2 reports
+`requires_action` only once the request has been sent.
+
+Accepting a URL elicitation means only that the user consented to open the
+URL. The harness has no callback that observes the external interaction, so the
+model reports completion. The `ask_user` result says completion was not
+verified and names the `elicitationId`. Clients that advertise URL elicitation
+are also offered `complete_url_elicitation`; once the model has verified the
+interaction finished, for example by retrying the operation that needed it,
+that tool sends `elicitation/complete` with the original ID on the same
+connection. It asks no permission and stays available in plan mode. An ID that
+is unknown, was declined or cancelled, was already completed, or belongs to
+another session fails the tool call and sends nothing.
+
+Each `elicitationId` is unique among the connection's outstanding URL
+elicitations, so `ask_user` refuses a model-chosen ID that is still
+outstanding: the tool call fails and tells the model to omit the ID so one is
+generated. Accepted IDs are held in memory for the connection and never
+written to disk. They survive `session/cancel`, later turns, and `session/load`
+or `session/resume` on the same connection, because the external interaction
+may still finish. If a turn is cancelled while its `elicitation/create` is
+still unanswered, the Client may already have accepted it, so the ID stays
+reserved, but can never be completed, until the session is closed or deleted.
+Pending and reserved IDs are dropped without a completion when the session is
+closed or deleted, or when the process exits. Replay does not resend
+`elicitation/complete`, and a fork does not inherit the source session's
+pending IDs.

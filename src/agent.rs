@@ -1391,6 +1391,10 @@ impl Harness {
                 .is_some_and(|capabilities| {
                     capabilities.supports_form() || capabilities.supports_url()
                 });
+        let supports_url_elicitation = client_capabilities
+            .elicitation
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.supports_url());
         let access = ToolAccess {
             connection: Some(connection.clone()),
             client: client_capabilities,
@@ -1444,6 +1448,9 @@ impl Harness {
             let mut tools = built_in_definitions(&self.config);
             if supports_elicitation {
                 tools.push(crate::tools::ask_user_definition());
+            }
+            if supports_url_elicitation {
+                tools.push(crate::tools::complete_url_elicitation_definition());
             }
             let read_only_mcp_names = {
                 let mcp = runtime.state.lock().await.mcp.clone();
@@ -1860,22 +1867,48 @@ impl Harness {
                     return Ok(result);
                 }
             };
-            let (result, success) =
-                match ask_user(access, session_id, call, message, &arguments, cancellation).await {
-                    Ok(result) => (result, true),
-                    Err(error)
-                        if error.code == agent_client_protocol::ErrorCode::RequestCancelled =>
-                    {
-                        return Err(error);
-                    }
-                    Err(error) => (
-                        ToolResult {
-                            text: format!("Unable to request user input: {}", error.message),
-                            raw: json!({"error": error.message}),
-                        },
-                        false,
-                    ),
-                };
+            let (result, success) = match ask_user(
+                access,
+                &self.store,
+                session_id,
+                call,
+                message,
+                &arguments,
+                cancellation,
+            )
+            .await
+            {
+                Ok(result) => (result, true),
+                // Only the turn's own cancellation ends it: a Client that
+                // cancels the elicitation answers -32800 too.
+                Err(_) if cancellation.is_cancelled() => return Err(Error::request_cancelled()),
+                Err(error) => (crate::tools::ask_user_failed(&error), false),
+            };
+            send_tool_finished(access, session_id, call, &title, &result, success, None)?;
+            return Ok(result);
+        }
+
+        // Only a protocol notification to the Client, so it needs no
+        // permission and stays available in plan mode.
+        if call.function.name == "complete_url_elicitation" {
+            let connection = access
+                .connection
+                .as_ref()
+                .expect("v1 elicitation completion requires an ACP v1 connection");
+            let result = crate::tools::complete_url_elicitation(
+                &self.store,
+                &session_id.to_string(),
+                &arguments,
+                |elicitation_id| {
+                    connection.send_notification(
+                        agent_client_protocol::schema::v1::CompleteElicitationNotification::new(
+                            elicitation_id,
+                        ),
+                    )
+                },
+            )
+            .await;
+            let success = result_status(&result) == ToolOutcomeStatus::Completed;
             send_tool_finished(access, session_id, call, &title, &result, success, None)?;
             return Ok(result);
         }
@@ -2434,6 +2467,7 @@ enum PermissionDecision {
 
 async fn ask_user(
     access: &ToolAccess,
+    store: &SessionStore,
     session_id: &SessionId,
     call: &crate::model::ToolCall,
     message: &str,
@@ -2442,8 +2476,8 @@ async fn ask_user(
 ) -> Result<ToolResult, Error> {
     let scope = ElicitationSessionScope::new(session_id.clone())
         .tool_call_id(Some(ToolCallId::new(call.id.clone())));
-    let url_mode = arguments.get("url").and_then(Value::as_str);
-    let mode = if let Some(url) = url_mode {
+    let mut url_elicitation_id = None;
+    let mode = if let Some(url) = arguments.get("url").and_then(Value::as_str) {
         if !access
             .client
             .elicitation
@@ -2470,6 +2504,10 @@ async fn ask_user(
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("elicit-{}", uuid::Uuid::new_v4().simple()));
+        store
+            .reserve_url_elicitation(&session_id.to_string(), &elicitation_id)
+            .await?;
+        url_elicitation_id = Some(elicitation_id.clone());
         ElicitationMode::Url(ElicitationUrlMode::new(scope, elicitation_id, url))
     } else {
         if !access
@@ -2489,17 +2527,32 @@ async fn ask_user(
         ElicitationMode::Form(ElicitationFormMode::new(scope, schema))
     };
     let request = CreateElicitationRequest::new(mode, message);
-    let response: CreateElicitationResponse = tokio::select! {
+    let response: Result<CreateElicitationResponse, Error> = tokio::select! {
+        // The Client may already have accepted, so a URL elicitation's ID
+        // stays reserved, though never completable, until the session closes.
         _ = cancellation.cancelled() => return Err(Error::request_cancelled()),
         response = access
             .connection
             .as_ref()
             .expect("v1 elicitation requires an ACP v1 connection")
             .send_request(request)
-            .block_task() => response?,
+            .block_task() => response,
     };
-    match response.action {
+    if let Some(elicitation_id) = &url_elicitation_id {
+        let accepted = response
+            .as_ref()
+            .is_ok_and(|response| matches!(response.action, ElicitationAction::Accept(_)));
+        store
+            .settle_url_elicitation(&session_id.to_string(), elicitation_id, accepted)
+            .await;
+    }
+    match response?.action {
         ElicitationAction::Accept(action) => {
+            // Consent, not completion. What the user enters out of band must
+            // stay out of the model's context, so URL content is not read.
+            if let Some(elicitation_id) = &url_elicitation_id {
+                return Ok(crate::tools::url_elicitation_accepted(elicitation_id));
+            }
             let response = action
                 .content
                 .as_ref()
@@ -2511,12 +2564,7 @@ async fn ask_user(
                     raw: json!({"response": response, "action": "accept"}),
                 }),
                 None => Ok(ToolResult {
-                    text: if url_mode.is_some() {
-                        "The user consented to open the URL. External completion was not verified."
-                            .to_string()
-                    } else {
-                        "The user accepted without providing a response.".to_string()
-                    },
+                    text: "The user accepted without providing a response.".to_string(),
                     raw: json!({"action": "accept"}),
                 }),
             }

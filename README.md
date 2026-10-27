@@ -226,6 +226,7 @@ Built-in model tools:
 | --- | --- |
 | `update_plan` | Publish a complete ACP-visible execution plan |
 | `ask_user` | Request structured input through ACP elicitation |
+| `complete_url_elicitation` | Report a finished URL elicitation to the client |
 | `read_file` | Read text with line ranges |
 | `list_directory` | Bounded recursive directory listing |
 | `search_files` | Regex content search with path filtering |
@@ -296,9 +297,15 @@ carried is marked failed rather than run with truncated arguments, and the
 client is sent a warning notice when it supports notices.
 
 `ask_user` uses ACP form elicitation by default. When the Client advertises URL
-elicitation, the model may also request an HTTPS URL with an optional stable
-`elicitation_id`. Embedded URL credentials and plain HTTP outside localhost are
-rejected.
+elicitation, the model may also request an HTTPS URL with an optional
+`elicitation_id`; one is generated when it is omitted, and an ID still in use
+is refused. Embedded URL credentials and plain HTTP outside localhost are
+rejected. Accepting a URL only means the user agreed to open it, so the result
+gives the model the elicitation ID; after it has verified the external step
+finished, the model calls `complete_url_elicitation`, which sends
+`elicitation/complete` for that ID. That tool is offered only to Clients that
+advertise URL elicitation. See [docs/acp-support.md](docs/acp-support.md#elicitation)
+for the lifecycle of pending IDs.
 
 Session model and permission configuration is available through ACP config
 options. The in-conversation commands `/help`, `/plan`, `/agent`, `/model`,

@@ -31,11 +31,24 @@ pub struct SessionStore {
     data_dir: PathBuf,
     sessions: Arc<Mutex<HashMap<String, SessionRuntime>>>,
     deleted: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// URL elicitations outstanding on this connection, by `elicitationId`.
+    /// The process serves one stdio connection, so this is that connection's
+    /// state. It is never persisted: a completion may only be reported to the
+    /// Client that received the original request.
+    url_elicitations: Arc<Mutex<HashMap<String, UrlElicitation>>>,
     write_lock: Arc<Mutex<()>>,
     configured_prompt: Option<Arc<str>>,
     default_model: Arc<str>,
     default_permission: crate::config::PermissionMode,
     default_reasoning_effort: crate::config::ReasoningEffort,
+}
+
+#[derive(Clone, Debug)]
+struct UrlElicitation {
+    session_id: String,
+    /// The user consented to open the URL. The interaction then runs out of
+    /// band until the model reports that it finished.
+    accepted: bool,
 }
 
 impl SessionStore {
@@ -56,6 +69,7 @@ impl SessionStore {
             data_dir: config.data_dir.clone(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             deleted: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            url_elicitations: Arc::new(Mutex::new(HashMap::new())),
             write_lock: Arc::new(Mutex::new(())),
             configured_prompt: config.configured_system_prompt().map(Arc::from),
             default_model: Arc::from(config.default_model.as_str()),
@@ -208,6 +222,7 @@ impl SessionStore {
                 .store(true, std::sync::atomic::Ordering::Release);
             runtime.state.lock().await.cancellation.cancel();
         }
+        self.forget_url_elicitations(id).await;
         let _write_guard = self.write_lock.lock().await;
         match tokio::fs::remove_file(self.record_path(id)).await {
             Ok(()) => Ok(()),
@@ -225,7 +240,89 @@ impl SessionStore {
                 .store(true, std::sync::atomic::Ordering::Release);
             runtime.state.lock().await.cancellation.cancel();
         }
+        self.forget_url_elicitations(id).await;
         Ok(())
+    }
+
+    /// Claim `elicitation_id` for a URL elicitation the session is about to
+    /// request. ACP requires each ID to be unique among the connection's
+    /// outstanding URL elicitations, so an ID still in use is refused. A
+    /// request cancelled before its answer arrives is never settled: the
+    /// Client may already have accepted it, so its ID stays reserved, and can
+    /// never be completed, until the session closes.
+    pub async fn reserve_url_elicitation(
+        &self,
+        session_id: &str,
+        elicitation_id: &str,
+    ) -> Result<(), Error> {
+        let mut elicitations = self.url_elicitations.lock().await;
+        // A session deleted while its turn still runs has already had its
+        // elicitations dropped, so nothing would free a new reservation.
+        // Close and delete remove the runtime before taking this lock.
+        if !self.sessions.lock().await.contains_key(session_id) {
+            return Err(Error::request_cancelled());
+        }
+        match elicitations.entry(elicitation_id.to_string()) {
+            std::collections::hash_map::Entry::Occupied(_) => Err(Error::invalid_params().data(
+                format!(
+                    "elicitation ID {elicitation_id} is still in use by a URL elicitation that was not reported complete; omit elicitation_id to generate a new one"
+                ),
+            )),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(UrlElicitation {
+                    session_id: session_id.to_string(),
+                    accepted: false,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    /// Record the Client's answer to a reserved URL elicitation. An accepted
+    /// one stays outstanding until the model reports it complete or the
+    /// session closes; any other answer, or an error instead of an answer,
+    /// frees the ID.
+    pub async fn settle_url_elicitation(
+        &self,
+        session_id: &str,
+        elicitation_id: &str,
+        accepted: bool,
+    ) {
+        let mut elicitations = self.url_elicitations.lock().await;
+        let Some(elicitation) = elicitations
+            .get_mut(elicitation_id)
+            .filter(|elicitation| elicitation.session_id == session_id && !elicitation.accepted)
+        else {
+            return;
+        };
+        if accepted {
+            elicitation.accepted = true;
+        } else {
+            elicitations.remove(elicitation_id);
+        }
+    }
+
+    /// Take an accepted URL elicitation of the session so its completion can
+    /// be reported. Unknown, unanswered, already completed, and other
+    /// sessions' IDs return `false` and are left alone.
+    pub async fn complete_url_elicitation(&self, session_id: &str, elicitation_id: &str) -> bool {
+        let mut elicitations = self.url_elicitations.lock().await;
+        let pending = elicitations.get(elicitation_id).is_some_and(|elicitation| {
+            elicitation.session_id == session_id && elicitation.accepted
+        });
+        if pending {
+            elicitations.remove(elicitation_id);
+        }
+        pending
+    }
+
+    /// Drop a closed or deleted session's URL elicitations without reporting
+    /// them complete: closing says nothing about whether they finished.
+    async fn forget_url_elicitations(&self, session_id: &str) {
+        self.url_elicitations
+            .lock()
+            .await
+            .retain(|_, elicitation| elicitation.session_id != session_id);
     }
 
     pub fn effective_system_prompt(&self, record: &SessionRecord) -> Result<String, Error> {
@@ -587,6 +684,80 @@ mod tests {
                 "{id:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn url_elicitations_complete_once_and_only_for_their_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            api_key: None,
+            base_url: "http://localhost".to_string(),
+            default_model: "deepseek-flash".to_string(),
+            models: vec!["deepseek-flash".to_string()],
+            data_dir: temp.path().join("data"),
+            permission_mode: PermissionMode::Ask,
+            system_prompt: None,
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::High,
+            context_chars: 1000,
+            tool_output_bytes: 1000,
+            http_timeout: std::time::Duration::from_secs(1),
+            mcp_connect_timeout: std::time::Duration::from_secs(1),
+            disable_web: true,
+            trace: false,
+        };
+        let store = SessionStore::open(&config).await.unwrap();
+        let mut sessions = Vec::new();
+        for _ in 0..3 {
+            let runtime = store
+                .create(temp.path().to_path_buf(), Vec::new(), None, None)
+                .await
+                .unwrap();
+            sessions.push(runtime.snapshot().await.id);
+        }
+        let [a, b, c] = [&sessions[0], &sessions[1], &sessions[2]];
+
+        // An ID is unique on the connection while it is outstanding, even
+        // across sessions, and an unanswered request cannot be completed.
+        assert!(store.reserve_url_elicitation(a, "oauth").await.is_ok());
+        let reused = store.reserve_url_elicitation(b, "oauth").await.unwrap_err();
+        assert_eq!(reused.code, agent_client_protocol::ErrorCode::InvalidParams);
+        assert!(!store.complete_url_elicitation(a, "oauth").await);
+
+        // Declining frees the ID.
+        store.settle_url_elicitation(a, "oauth", false).await;
+        assert!(store.reserve_url_elicitation(b, "oauth").await.is_ok());
+        store.settle_url_elicitation(b, "oauth", true).await;
+
+        // Only the session that created it completes it, and only once.
+        assert!(!store.complete_url_elicitation(a, "oauth").await);
+        assert!(store.complete_url_elicitation(b, "oauth").await);
+        assert!(!store.complete_url_elicitation(b, "oauth").await);
+        assert!(store.reserve_url_elicitation(a, "oauth").await.is_ok());
+
+        // Closing a session drops its accepted elicitations unreported.
+        store.settle_url_elicitation(a, "oauth", true).await;
+        store.close(a).await.unwrap();
+        assert!(!store.complete_url_elicitation(a, "oauth").await);
+        assert!(store.reserve_url_elicitation(b, "oauth").await.is_ok());
+
+        // A turn still running after its session was deleted cannot reserve an
+        // ID that nothing would free.
+        store.delete(c).await.unwrap();
+        let deleted = store
+            .reserve_url_elicitation(c, "oauth-deleted")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            deleted.code,
+            agent_client_protocol::ErrorCode::RequestCancelled
+        );
+        assert!(
+            store
+                .reserve_url_elicitation(b, "oauth-deleted")
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
