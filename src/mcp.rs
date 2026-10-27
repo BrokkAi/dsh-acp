@@ -49,9 +49,9 @@ impl McpToolMetadata {
     }
 }
 
-/// The MCP servers of a session. Sessions share it through an `Arc` so a call
-/// or refresh runs without the session state lock; each client serializes its
-/// own requests.
+/// The MCP servers of one session. The session hands out clones of its `Arc`
+/// so a call or refresh runs without the session state lock; each client
+/// serializes its own requests.
 pub struct McpSession {
     clients: Vec<Arc<McpClient>>,
     /// Its lock is never held across an await.

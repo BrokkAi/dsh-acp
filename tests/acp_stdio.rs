@@ -3479,19 +3479,7 @@ async fn v2_cancel_ends_work_waiting_on_an_mcp_tool_call() {
         "params": {"sessionId": session_id}
     }))
     .await;
-    let idle = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let message = peer.next_message().await;
-            if message["params"]["update"]["sessionUpdate"] == "state_update"
-                && message["params"]["update"]["state"] == "idle"
-            {
-                return message;
-            }
-            peer.updates.push(message);
-        }
-    })
-    .await
-    .expect("session/cancel should settle the work without waiting for the MCP call");
+    let idle = next_v2_idle(&mut peer).await;
     assert_eq!(idle["params"]["update"]["stopReason"], "cancelled");
     assert_eq!(final_tool_status(&peer, "call-mcp"), Some("failed"));
 
@@ -3516,8 +3504,14 @@ async fn session_cancel_ends_a_turn_waiting_on_an_mcp_tool_refresh() {
         return;
     };
     let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
-    peer.request("initialize", json!({"protocolVersion": 1}))
-        .await;
+    peer.request(
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {"session": {"notices": {}}}
+        }),
+    )
+    .await;
     let session = peer
         .request(
             "session/new",
@@ -3564,6 +3558,7 @@ async fn session_cancel_ends_a_turn_waiting_on_an_mcp_tool_refresh() {
     .await
     .expect("session/cancel should end the turn without waiting for tools/list");
     assert_eq!(response["result"]["stopReason"], "cancelled");
+    assert!(!reported_refresh_failure(&peer), "{:?}", peer.updates);
 
     drop(peer.stdin);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
@@ -3627,11 +3622,20 @@ async fn v2_cancel_ends_work_waiting_on_an_mcp_tool_refresh() {
     .await;
     let idle = next_v2_idle(&mut peer).await;
     assert_eq!(idle["params"]["update"]["stopReason"], "cancelled");
+    assert!(!reported_refresh_failure(&peer), "{:?}", peer.updates);
 
     drop(peer.stdin);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
     model_server.abort();
     mcp_server.abort();
+}
+
+/// Whether the agent sent a notice that refreshing MCP tools failed.
+fn reported_refresh_failure(peer: &Peer) -> bool {
+    peer.updates.iter().any(|update| {
+        update["params"]["update"]["sessionUpdate"] == "notice"
+            && update["params"]["update"]["title"] == "MCP tool refresh failed"
+    })
 }
 
 /// Reads updates until the model's MCP tool call is running, then waits for it

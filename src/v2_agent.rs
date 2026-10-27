@@ -1314,6 +1314,15 @@ impl V2Harness {
                 let mcp = runtime.state.lock().await.mcp.clone();
                 if let Some(mcp) = mcp {
                     if let Err(error) = mcp.refresh(cancellation).await {
+                        // A cancel that lands during the refresh ends the
+                        // work; the refresh did not fail.
+                        if error.code == agent_client_protocol::ErrorCode::RequestCancelled {
+                            return Ok((
+                                StopReason::Cancelled,
+                                usage,
+                                runtime.state.lock().await.prompt_seq,
+                            ));
+                        }
                         tracing::warn!(?error, "failed to refresh MCP tools");
                         let _ = send_update(
                             connection,
