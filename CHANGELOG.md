@@ -53,6 +53,17 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   returns the credential. It is advertised as `agentCapabilities.auth.status`
   in v1 and `capabilities.auth.status` in v2. The SDK has no types for the
   method yet, so its shape follows the RFD and may change with it.
+- URL elicitations can now be closed out. Accepting a URL only means the user
+  agreed to open it, and the harness has no callback that sees the external
+  step finish, so `elicitation/complete` was never sent and the Client could not
+  tell the flow was over. The `ask_user` result now gives the model the
+  elicitation ID, and Clients that advertise URL elicitation are offered a
+  `complete_url_elicitation` tool. Once the model has verified the step
+  finished, for example by retrying the operation that needed it, the tool sends
+  `elicitation/complete` with the original ID on the same connection. Unknown,
+  declined, already completed, and other sessions' IDs fail the call and send
+  nothing. Pending IDs live in memory only and are dropped, without a
+  completion, when the session is closed or deleted.
 
 ### Changed
 
@@ -61,6 +72,9 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   timeout on each request (`initialize`, `notifications/initialized`, and each
   `tools/list` page), so an HTTP MCP server that takes more than 60 seconds to
   connect now fails session setup unless the limit is raised.
+- The result of an accepted URL elicitation no longer includes `content` the
+  Client attached to its response. What the user enters out of band must stay
+  out of the model's context.
 
 ### Fixed
 
@@ -104,6 +118,13 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   counts as no key: the prompt fails locally with the `-32000` error that says
   to set `DEEPSEEK_API_KEY`, and no request is sent. An `Authorization` header
   set with `providers/set` is still used in its place.
+- `ask_user` sent a model-chosen URL `elicitation_id` again even while an
+  earlier request with that ID was still outstanding, which ACP forbids. It now
+  refuses the request with an error that says to omit the ID so one is
+  generated.
+- In ACP v1, an `ask_user` request that could not be sent told the model only
+  the JSON-RPC error name, such as "Invalid params". It now gives the reason,
+  for example that the URL must use HTTPS.
 
 ## 0.4.0 - 2026-10-25
 

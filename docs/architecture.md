@@ -26,6 +26,11 @@ Each session contains:
 JSON writes use a temporary file and atomic rename. Session files live under
 `<data-dir>/sessions/` and are created with owner-only permissions on Unix.
 
+URL elicitations awaiting a completion report are connection state, not session
+data. The store keeps them in memory, keyed by `elicitationId` with the session
+that requested each, and drops a session's entries when it is closed or
+deleted. They are never written to the session file.
+
 ## Prompt execution
 
 The DeepSeek request context is bounded by the configured character budget.

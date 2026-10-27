@@ -20,6 +20,11 @@ struct Peer {
     terminal_requests: Vec<(String, usize)>,
     /// Answer `terminal/wait_for_exit` with an error.
     fail_terminal_wait: bool,
+    elicitation_requests: Vec<Value>,
+    elicitation_answer: &'static str,
+    /// Each `elicitation/complete` the agent sent, with how many updates the
+    /// peer had received by then.
+    elicitation_completions: Vec<(Value, usize)>,
 }
 
 /// The id and output of the terminal the peer pretends to run.
@@ -146,6 +151,21 @@ impl Peer {
                     }
                 }))
                 .await;
+                continue;
+            }
+            if value.get("method").and_then(Value::as_str) == Some("elicitation/create") {
+                self.elicitation_requests.push(value.clone());
+                self.write(json!({
+                    "jsonrpc": "2.0",
+                    "id": value["id"],
+                    "result": {"action": self.elicitation_answer}
+                }))
+                .await;
+                continue;
+            }
+            if value.get("method").and_then(Value::as_str) == Some("elicitation/complete") {
+                self.elicitation_completions
+                    .push((value, self.updates.len()));
                 continue;
             }
             return value;
@@ -1439,6 +1459,9 @@ async fn spawn_peer_with_options(
         permission_answer: "allow_once",
         terminal_requests: Vec::new(),
         fail_terminal_wait: false,
+        elicitation_requests: Vec::new(),
+        elicitation_answer: "accept",
+        elicitation_completions: Vec::new(),
     }
 }
 
@@ -3259,6 +3282,461 @@ async fn plan_mode_allows_only_read_only_http_mcp_tools() {
             .collect::<Vec<_>>(),
         ["report"],
         "MCP requests: {mcp_requests:?}"
+    );
+}
+
+/// A model turn that asks the user to open an authorization URL.
+fn ask_url_stream(id: &str, elicitation_id: &str) -> String {
+    tool_call_stream(
+        id,
+        "ask_user",
+        json!({
+            "message": "Authorize repository access",
+            "url": "https://auth.example.com/connect",
+            "elicitation_id": elicitation_id
+        }),
+    )
+}
+
+/// A model turn that reports a URL interaction finished.
+fn complete_url_stream(id: &str, elicitation_id: &str) -> String {
+    tool_call_stream(
+        id,
+        "complete_url_elicitation",
+        json!({"elicitation_id": elicitation_id}),
+    )
+}
+
+/// The last update the peer received for a tool call.
+fn final_tool_update<'a>(peer: &'a Peer, tool_call_id: &str) -> &'a Value {
+    peer.updates
+        .iter()
+        .map(|update| &update["params"]["update"])
+        .rfind(|update| update["toolCallId"] == tool_call_id)
+        .unwrap_or_else(|| panic!("no update for tool call {tool_call_id}"))
+}
+
+/// What a model request said a tool call returned.
+fn tool_message<'a>(request: &'a Value, tool_call_id: &str) -> &'a str {
+    request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["tool_call_id"] == tool_call_id)
+        .and_then(|message| message["content"].as_str())
+        .unwrap_or_else(|| panic!("no tool message for {tool_call_id}"))
+}
+
+fn offered_tools(request: &Value) -> Vec<&str> {
+    request["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect()
+}
+
+/// `elicitation/complete` went out while the completing tool call ran: after
+/// the call was announced and before it finished.
+fn assert_completion_sent_during(peer: &Peer, completion: usize, tool_call_id: &str) {
+    let at = peer.elicitation_completions[completion].1;
+    assert!(
+        peer.updates[..at]
+            .iter()
+            .any(|update| update["params"]["update"]["toolCallId"] == tool_call_id)
+    );
+    assert!(peer.updates[at..].iter().any(|update| {
+        update["params"]["update"]["toolCallId"] == tool_call_id
+            && update["params"]["update"]["status"] == "completed"
+    }));
+}
+
+#[tokio::test]
+async fn v1_reports_an_accepted_url_elicitation_complete_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, server)) = mock_sequence_server(vec![
+        ask_url_stream("call-ask", "oauth-1"),
+        // Reusing an ID that is still outstanding would break its uniqueness
+        // on the connection.
+        ask_url_stream("call-ask-again", "oauth-1"),
+        mock_text_stream(),
+        complete_url_stream("call-complete", "oauth-1"),
+        complete_url_stream("call-complete-again", "oauth-1"),
+        complete_url_stream("call-complete-unknown", "never-requested"),
+        mock_text_stream(),
+    ])
+    .await
+    else {
+        eprintln!("skipping URL elicitation test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request(
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {"elicitation": {"form": {}, "url": {}}}
+        }),
+    )
+    .await;
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": temp.path().to_string_lossy(), "mcpServers": []}),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+    let response = peer
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "Connect the repository"}]
+            }),
+        )
+        .await;
+    assert_eq!(response["stopReason"], "end_turn");
+    assert_eq!(peer.elicitation_requests.len(), 1);
+    let request = &peer.elicitation_requests[0]["params"];
+    assert_eq!(request["mode"], "url");
+    assert_eq!(request["elicitationId"], "oauth-1");
+    assert_eq!(request["sessionId"], session_id.as_str());
+    assert_eq!(request["toolCallId"], "call-ask");
+    let asked = final_tool_update(&peer, "call-ask");
+    assert_eq!(asked["status"], "completed");
+    assert_eq!(asked["rawOutput"]["elicitation_id"], "oauth-1");
+    assert_eq!(
+        final_tool_update(&peer, "call-ask-again")["status"],
+        "failed"
+    );
+    // Accepting is consent, not completion.
+    assert!(peer.elicitation_completions.is_empty());
+
+    // The model checks the interaction finished in a later turn and reports
+    // it, in plan mode, which keeps the tool and asks no permission. Loading
+    // the session on the same connection keeps the pending elicitation.
+    peer.request(
+        "session/load",
+        json!({
+            "sessionId": session_id,
+            "cwd": temp.path().to_string_lossy(),
+            "mcpServers": []
+        }),
+    )
+    .await;
+    peer.request(
+        "session/set_mode",
+        json!({"sessionId": session_id, "modeId": "plan"}),
+    )
+    .await;
+    let response = peer
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "I finished authorizing"}]
+            }),
+        )
+        .await;
+    assert_eq!(response["stopReason"], "end_turn");
+    assert_eq!(peer.elicitation_completions.len(), 1);
+    let (completion, _) = &peer.elicitation_completions[0];
+    assert!(completion.get("id").is_none(), "{completion}");
+    assert_eq!(completion["params"]["elicitationId"], "oauth-1");
+    assert_completion_sent_during(&peer, 0, "call-complete");
+    assert_eq!(
+        final_tool_update(&peer, "call-complete")["status"],
+        "completed"
+    );
+    for refused in ["call-complete-again", "call-complete-unknown"] {
+        assert_eq!(final_tool_update(&peer, refused)["status"], "failed");
+    }
+    assert!(peer.permission_requests.is_empty());
+    // Replay shows the tool call but does not report the completion again.
+    peer.request(
+        "session/load",
+        json!({
+            "sessionId": session_id,
+            "cwd": temp.path().to_string_lossy(),
+            "mcpServers": []
+        }),
+    )
+    .await;
+    assert_eq!(peer.elicitation_completions.len(), 1);
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 7);
+    for request in [&requests[0], &requests[3]] {
+        let offered = offered_tools(request);
+        assert!(offered.contains(&"ask_user"), "{offered:?}");
+        assert!(offered.contains(&"complete_url_elicitation"), "{offered:?}");
+    }
+    // The model is told the ID, that completion is unverified, and why a
+    // reused ID or an unknown completion was refused.
+    let accepted = tool_message(&requests[1], "call-ask");
+    assert!(
+        accepted.contains("oauth-1")
+            && accepted.contains("not verified")
+            && accepted.contains("complete_url_elicitation"),
+        "{accepted}"
+    );
+    let reused = tool_message(&requests[2], "call-ask-again");
+    assert!(reused.contains("still in use"), "{reused}");
+    let unknown = tool_message(&requests[6], "call-complete-unknown");
+    assert!(unknown.contains("Nothing was reported"), "{unknown}");
+}
+
+#[tokio::test]
+async fn v2_reports_an_accepted_url_elicitation_complete_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, server)) = mock_sequence_server(vec![
+        ask_url_stream("call-ask", "oauth-2"),
+        mock_text_stream(),
+        complete_url_stream("call-complete", "oauth-2"),
+        complete_url_stream("call-complete-again", "oauth-2"),
+        complete_url_stream("call-complete-unknown", "never-requested"),
+        mock_text_stream(),
+    ])
+    .await
+    else {
+        eprintln!("skipping v2 URL elicitation test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request(
+        "initialize",
+        json!({
+            "protocolVersion": 2,
+            "info": {"name": "v2-test-client", "version": "1.0.0"},
+            "capabilities": {"elicitation": {"url": {}}}
+        }),
+    )
+    .await;
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": temp.path().to_string_lossy(), "mcpServers": []}),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+    for text in ["Connect the repository", "I finished authorizing"] {
+        peer.request(
+            "session/prompt",
+            json!({"sessionId": session_id, "prompt": [{"type": "text", "text": text}]}),
+        )
+        .await;
+        let idle = next_v2_idle(&mut peer).await;
+        assert_eq!(idle["params"]["update"]["stopReason"], "end_turn");
+        // Resuming on the same connection keeps the pending elicitation.
+        peer.request(
+            "session/resume",
+            json!({
+                "sessionId": session_id,
+                "cwd": temp.path().to_string_lossy(),
+                "mcpServers": []
+            }),
+        )
+        .await;
+    }
+    assert_eq!(peer.elicitation_requests.len(), 1);
+    let request = &peer.elicitation_requests[0]["params"];
+    assert_eq!(request["mode"], "url");
+    assert_eq!(request["elicitationId"], "oauth-2");
+    assert_eq!(request["toolCallId"], "call-ask");
+    assert_eq!(
+        final_tool_update(&peer, "call-ask")["rawOutput"]["elicitation_id"],
+        "oauth-2"
+    );
+    assert_eq!(peer.elicitation_completions.len(), 1);
+    let (completion, _) = &peer.elicitation_completions[0];
+    assert!(completion.get("id").is_none(), "{completion}");
+    assert_eq!(completion["params"]["elicitationId"], "oauth-2");
+    assert_completion_sent_during(&peer, 0, "call-complete");
+    let completed = final_tool_update(&peer, "call-complete");
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(completed["rawOutput"]["completed"], true);
+    for refused in ["call-complete-again", "call-complete-unknown"] {
+        assert_eq!(final_tool_update(&peer, refused)["status"], "failed");
+    }
+    // Reporting completion is not a foreground state change.
+    let completing = peer
+        .updates
+        .iter()
+        .position(|update| update["params"]["update"]["toolCallId"] == "call-complete")
+        .unwrap();
+    assert!(
+        !peer.updates[completing..]
+            .iter()
+            .any(|update| update["params"]["update"]["state"] == "requires_action")
+    );
+    assert!(peer.permission_requests.is_empty());
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 6);
+    let offered = offered_tools(&requests[0]);
+    assert!(offered.contains(&"complete_url_elicitation"), "{offered:?}");
+    let accepted = tool_message(&requests[1], "call-ask");
+    assert!(accepted.contains("oauth-2"), "{accepted}");
+}
+
+#[tokio::test]
+async fn declined_and_closed_url_elicitations_are_never_reported_complete() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, server)) = mock_sequence_server(vec![
+        ask_url_stream("call-ask-declined", "oauth-3"),
+        complete_url_stream("call-complete-declined", "oauth-3"),
+        mock_text_stream(),
+        ask_url_stream("call-ask", "oauth-4"),
+        mock_text_stream(),
+        complete_url_stream("call-complete-after-close", "oauth-4"),
+        mock_text_stream(),
+    ])
+    .await
+    else {
+        eprintln!("skipping URL elicitation close test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request(
+        "initialize",
+        json!({
+            "protocolVersion": 2,
+            "info": {"name": "v2-test-client", "version": "1.0.0"},
+            "capabilities": {"elicitation": {"url": {}}}
+        }),
+    )
+    .await;
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": temp.path().to_string_lossy(), "mcpServers": []}),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+    let prompt = json!({
+        "sessionId": session_id,
+        "prompt": [{"type": "text", "text": "Connect the repository"}]
+    });
+
+    peer.elicitation_answer = "decline";
+    peer.request("session/prompt", prompt.clone()).await;
+    next_v2_idle(&mut peer).await;
+    assert_eq!(
+        final_tool_update(&peer, "call-complete-declined")["status"],
+        "failed"
+    );
+
+    // Closing the session drops what it was waiting for: the connection never
+    // learns whether the interaction finished.
+    peer.elicitation_answer = "accept";
+    peer.request("session/prompt", prompt.clone()).await;
+    next_v2_idle(&mut peer).await;
+    peer.request("session/close", json!({"sessionId": session_id}))
+        .await;
+    peer.request(
+        "session/resume",
+        json!({
+            "sessionId": session_id,
+            "cwd": temp.path().to_string_lossy(),
+            "mcpServers": []
+        }),
+    )
+    .await;
+    peer.request("session/prompt", prompt).await;
+    next_v2_idle(&mut peer).await;
+    assert_eq!(
+        final_tool_update(&peer, "call-complete-after-close")["status"],
+        "failed"
+    );
+
+    assert_eq!(peer.elicitation_requests.len(), 2);
+    assert!(peer.elicitation_completions.is_empty());
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    assert_eq!(server.await.unwrap().len(), 7);
+}
+
+#[tokio::test]
+async fn url_elicitation_completion_is_offered_only_with_url_support() {
+    let temp = tempfile::tempdir().unwrap();
+    // The v1 client supports forms only; the model calls the tool anyway.
+    let Some((base_url, server)) = mock_sequence_server(vec![
+        complete_url_stream("call-complete", "oauth-5"),
+        mock_text_stream(),
+    ])
+    .await
+    else {
+        eprintln!("skipping URL elicitation offer test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request(
+        "initialize",
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {"elicitation": {"form": {}}}
+        }),
+    )
+    .await;
+    let response = peer_prompt(&mut peer, temp.path(), "Connect the repository").await;
+    assert_eq!(response["stopReason"], "end_turn");
+    assert_eq!(
+        final_tool_update(&peer, "call-complete")["status"],
+        "failed"
+    );
+    assert!(peer.elicitation_completions.is_empty());
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    let requests = server.await.unwrap();
+    let offered = offered_tools(&requests[0]);
+    assert!(offered.contains(&"ask_user"), "{offered:?}");
+    assert!(
+        !offered.contains(&"complete_url_elicitation"),
+        "{offered:?}"
+    );
+
+    // Nor is it offered to a v2 client that supports forms only.
+    let Some((base_url, server)) = mock_sequence_server(vec![mock_text_stream()]).await else {
+        return;
+    };
+    let v2_temp = tempfile::tempdir().unwrap();
+    let mut peer = spawn_peer(v2_temp.path(), Some(&base_url)).await;
+    peer.request(
+        "initialize",
+        json!({
+            "protocolVersion": 2,
+            "info": {"name": "v2-test-client", "version": "1.0.0"},
+            "capabilities": {"elicitation": {"form": {}}}
+        }),
+    )
+    .await;
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": v2_temp.path().to_string_lossy(), "mcpServers": []}),
+        )
+        .await;
+    peer.request(
+        "session/prompt",
+        json!({
+            "sessionId": session["sessionId"],
+            "prompt": [{"type": "text", "text": "Connect the repository"}]
+        }),
+    )
+    .await;
+    next_v2_idle(&mut peer).await;
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    let requests = server.await.unwrap();
+    let offered = offered_tools(&requests[0]);
+    assert!(offered.contains(&"ask_user"), "{offered:?}");
+    assert!(
+        !offered.contains(&"complete_url_elicitation"),
+        "{offered:?}"
     );
 }
 

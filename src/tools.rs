@@ -25,6 +25,7 @@ use crate::{
         ChatMessage, MessageContent, PersistedDiff, PersistedTerminal, PersistedToolOutcome, Role,
         SessionRecord, ToolCall, ToolOutcomeStatus,
     },
+    session::SessionStore,
 };
 
 #[derive(Clone)]
@@ -403,12 +404,79 @@ pub fn ask_user_definition() -> Value {
             "properties": {
                 "message": {"type": "string", "description": "The question to show the user."},
                 "url": {"type": "string", "description": "Optional HTTPS URL for an out-of-band interaction."},
-                "elicitation_id": {"type": "string", "description": "Stable identifier for a URL interaction."}
+                "elicitation_id": {"type": "string", "description": "Stable identifier for a URL interaction. Generated when omitted. Must differ from every URL interaction that has not been reported complete."}
             },
             "required": ["message"],
             "additionalProperties": false
         }),
     )
+}
+
+/// Offered with [`ask_user_definition`] when the Client supports URL
+/// elicitation. The harness cannot observe an out-of-band interaction finish,
+/// so the model reports it once it has checked.
+pub fn complete_url_elicitation_definition() -> Value {
+    function_tool(
+        "complete_url_elicitation",
+        "Tell the client that a URL interaction started with ask_user has finished, such as an authorization the user completed in their browser. Call it only after verifying that it finished, for example by retrying the operation that needed it, and only with an elicitation ID that ask_user reported as accepted.",
+        json!({
+            "type": "object",
+            "properties": {
+                "elicitation_id": {"type": "string", "description": "The elicitation ID from the accepted ask_user result."}
+            },
+            "required": ["elicitation_id"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+/// The result of an accepted URL elicitation. Consent to open the URL is not
+/// completion, so the model is told so, along with the ID to pass to
+/// `complete_url_elicitation` once it has verified the interaction finished.
+pub fn url_elicitation_accepted(elicitation_id: &str) -> ToolResult {
+    ToolResult {
+        text: format!(
+            "The user consented to open the URL. External completion was not verified. Elicitation ID: {elicitation_id}. Once you have confirmed the interaction finished, for example by retrying the operation that needed it, call complete_url_elicitation with this ID."
+        ),
+        raw: json!({"action": "accept", "elicitation_id": elicitation_id}),
+    }
+}
+
+/// Run `complete_url_elicitation`: take the session's accepted URL
+/// elicitation with the given ID and `send` its `elicitation/complete`. An ID
+/// that is unknown, already completed, or another session's fails the call
+/// without sending anything.
+pub async fn complete_url_elicitation(
+    store: &SessionStore,
+    session_id: &str,
+    arguments: &Value,
+    send: impl FnOnce(String) -> Result<(), agent_client_protocol::Error>,
+) -> Result<ToolResult, agent_client_protocol::Error> {
+    let Some(elicitation_id) = arguments.get("elicitation_id").and_then(Value::as_str) else {
+        return Ok(ToolResult {
+            text: "complete_url_elicitation requires an elicitation_id.".to_string(),
+            raw: json!({"error": "missing elicitation_id"}),
+        });
+    };
+    if !store
+        .complete_url_elicitation(session_id, elicitation_id)
+        .await
+    {
+        return Ok(ToolResult {
+            text: format!(
+                "No accepted URL elicitation {elicitation_id} is awaiting completion in this session. Nothing was reported to the client."
+            ),
+            raw: json!({
+                "error": "no pending URL elicitation",
+                "elicitation_id": elicitation_id
+            }),
+        });
+    }
+    send(elicitation_id.to_string())?;
+    Ok(ToolResult {
+        text: format!("Reported URL elicitation {elicitation_id} complete to the client."),
+        raw: json!({"elicitation_id": elicitation_id, "completed": true}),
+    })
 }
 
 pub fn permission_required(name: &str) -> bool {

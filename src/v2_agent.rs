@@ -1323,6 +1323,10 @@ impl V2Harness {
             .is_some_and(|capabilities| {
                 capabilities.supports_form() || capabilities.supports_url()
             });
+        let supports_url_elicitation = capabilities
+            .elicitation
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.supports_url());
         let mut compaction_reported = false;
         // A turn runs until the model stops asking for tools, the user
         // cancels, or a request fails. There is no round limit: a task that
@@ -1351,6 +1355,9 @@ impl V2Harness {
             let mut tools = built_in_definitions(&self.base.config);
             if supports_elicitation {
                 tools.push(crate::tools::ask_user_definition());
+            }
+            if supports_url_elicitation {
+                tools.push(crate::tools::complete_url_elicitation_definition());
             }
             let read_only_mcp_names = {
                 let mcp = runtime.state.lock().await.mcp.clone();
@@ -1833,6 +1840,23 @@ impl V2Harness {
             send_tool_result(connection, session_id, call, &result, true)?;
             return Ok(result);
         }
+        // Only a protocol notification to the Client: it needs no permission,
+        // stays available in plan mode, and is not a foreground state change.
+        if call.function.name == "complete_url_elicitation" {
+            let result = crate::tools::complete_url_elicitation(
+                &self.base.store,
+                &session_id.to_string(),
+                &arguments,
+                |elicitation_id| {
+                    connection
+                        .send_notification(v2::CompleteElicitationNotification::new(elicitation_id))
+                },
+            )
+            .await?;
+            let success = result_status(&result) == ToolOutcomeStatus::Completed;
+            send_tool_result(connection, session_id, call, &result, success)?;
+            return Ok(result);
+        }
         // Refuse before asking permission: approving a call plan mode then
         // refuses would only mislead the user.
         if refused_in_plan_mode {
@@ -2002,70 +2026,92 @@ impl V2Harness {
             .ok_or_else(|| Error::invalid_params().data("ask_user requires message"))?;
         let scope = v2::ElicitationSessionScope::new(session_id.clone())
             .tool_call_id(Some(v2::ToolCallId::new(call.id.clone())));
-        let url_mode = arguments.get("url").and_then(Value::as_str);
-        let mode =
-            if let Some(url) = url_mode {
-                if !capabilities
-                    .elicitation
-                    .as_ref()
-                    .is_some_and(|capabilities| capabilities.supports_url())
-                {
-                    return Err(Error::invalid_request()
-                        .data("the Client does not support URL elicitation"));
-                }
-                let parsed = reqwest::Url::parse(url)
-                    .map_err(|error| Error::invalid_params().data(error.to_string()))?;
-                if parsed.username() != "" || parsed.password().is_some() {
-                    return Err(Error::invalid_params()
-                        .data("URL elicitations must not contain embedded credentials"));
-                }
-                if parsed.scheme() != "https" && parsed.host_str() != Some("localhost") {
-                    return Err(Error::invalid_params()
-                        .data("URL elicitations require HTTPS outside localhost"));
-                }
-                let elicitation_id = arguments
-                    .get("elicitation_id")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_else(|| format!("elicit-{}", uuid::Uuid::new_v4().simple()));
-                v2::ElicitationMode::Url(v2::ElicitationUrlMode::new(scope, elicitation_id, url))
-            } else {
-                if !capabilities
-                    .elicitation
-                    .as_ref()
-                    .is_some_and(|capabilities| capabilities.supports_form())
-                {
-                    return Err(Error::invalid_request()
-                        .data("the Client does not support form elicitation"));
-                }
-                let schema = v2::ElicitationSchema::new()
-                    .title("User input")
-                    .description("Provide the requested information.")
-                    .string("response", true);
-                v2::ElicitationMode::Form(v2::ElicitationFormMode::new(scope, schema))
-            };
-        let request = v2::CreateElicitationRequest::new(mode, message);
-        let response: v2::CreateElicitationResponse = tokio::select! {
-            _ = cancellation.cancelled() => return Err(Error::request_cancelled()),
-            response = connection.send_request(request).block_task() => response?,
+        let mut url_elicitation_id = None;
+        let mode = if let Some(url) = arguments.get("url").and_then(Value::as_str) {
+            if !capabilities
+                .elicitation
+                .as_ref()
+                .is_some_and(|capabilities| capabilities.supports_url())
+            {
+                return Err(
+                    Error::invalid_request().data("the Client does not support URL elicitation")
+                );
+            }
+            let parsed = reqwest::Url::parse(url)
+                .map_err(|error| Error::invalid_params().data(error.to_string()))?;
+            if parsed.username() != "" || parsed.password().is_some() {
+                return Err(Error::invalid_params()
+                    .data("URL elicitations must not contain embedded credentials"));
+            }
+            if parsed.scheme() != "https" && parsed.host_str() != Some("localhost") {
+                return Err(Error::invalid_params()
+                    .data("URL elicitations require HTTPS outside localhost"));
+            }
+            let elicitation_id = arguments
+                .get("elicitation_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("elicit-{}", uuid::Uuid::new_v4().simple()));
+            if !self
+                .base
+                .store
+                .reserve_url_elicitation(&session_id.to_string(), &elicitation_id)
+                .await
+            {
+                return Err(Error::invalid_params().data(format!(
+                    "elicitation ID {elicitation_id} is still in use by a URL elicitation that was not reported complete; omit elicitation_id to generate a new one"
+                )));
+            }
+            url_elicitation_id = Some(elicitation_id.clone());
+            v2::ElicitationMode::Url(v2::ElicitationUrlMode::new(scope, elicitation_id, url))
+        } else {
+            if !capabilities
+                .elicitation
+                .as_ref()
+                .is_some_and(|capabilities| capabilities.supports_form())
+            {
+                return Err(
+                    Error::invalid_request().data("the Client does not support form elicitation")
+                );
+            }
+            let schema = v2::ElicitationSchema::new()
+                .title("User input")
+                .description("Provide the requested information.")
+                .string("response", true);
+            v2::ElicitationMode::Form(v2::ElicitationFormMode::new(scope, schema))
         };
-        Ok(match response.action {
-            v2::ElicitationAction::Accept(action) => ToolResult {
-                text: action
-                    .content
-                    .as_ref()
-                    .and_then(|content| content.get("response"))
-                    .map(elicitation_text)
-                    .unwrap_or_else(|| {
-                        if url_mode.is_some() {
-                            "The user consented to open the URL. External completion was not verified."
-                                .to_string()
-                        } else {
-                            "The user accepted without text.".to_string()
-                        }
-                    }),
-                raw: json!({"action": "accept"}),
-            },
+        let request = v2::CreateElicitationRequest::new(mode, message);
+        let response: Result<v2::CreateElicitationResponse, Error> = tokio::select! {
+            _ = cancellation.cancelled() => Err(Error::request_cancelled()),
+            response = connection.send_request(request).block_task() => response,
+        };
+        if let Some(elicitation_id) = &url_elicitation_id {
+            let accepted = response
+                .as_ref()
+                .is_ok_and(|response| matches!(response.action, v2::ElicitationAction::Accept(_)));
+            self.base
+                .store
+                .settle_url_elicitation(&session_id.to_string(), elicitation_id, accepted)
+                .await;
+        }
+        Ok(match response?.action {
+            v2::ElicitationAction::Accept(action) => {
+                // Consent, not completion. What the user enters out of band
+                // must stay out of the model's context, so URL content is not
+                // read.
+                if let Some(elicitation_id) = &url_elicitation_id {
+                    return Ok(crate::tools::url_elicitation_accepted(elicitation_id));
+                }
+                ToolResult {
+                    text: action
+                        .content
+                        .as_ref()
+                        .and_then(|content| content.get("response"))
+                        .map(elicitation_text)
+                        .unwrap_or_else(|| "The user accepted without text.".to_string()),
+                    raw: json!({"action": "accept"}),
+                }
+            }
             v2::ElicitationAction::Decline => ToolResult {
                 text: "The user declined.".to_string(),
                 raw: json!({"action": "decline"}),
