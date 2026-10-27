@@ -36,6 +36,15 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   forked. Servers connect one after another, so a request that declares
   several servers can take up to that many times the limit. Tool calls and the
   tool list refresh during a turn are not bounded by it.
+- `session/status` from the Draft Session Status RFD, in both protocol
+  versions. It reports whether a session is `active` (in memory) or `inactive`
+  (stored, for example after `session/close` or a restart) without loading,
+  resuming, or changing it, and answers an unknown or deleted session with
+  `-32002` and the requested `sessionId`. A v2 `active` result also carries the
+  session's `running`, `requires_action`, or `idle` state. It is advertised as
+  `sessionCapabilities.status` in v1 and `session.status` in v2. The SDK has no
+  types for the method yet, so its shape follows the RFD and may change with
+  it.
 
 ### Changed
 

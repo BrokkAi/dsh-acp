@@ -572,6 +572,11 @@ pub struct SessionRuntime {
     pub lifecycle: Arc<tokio::sync::Mutex<()>>,
     pub turn_lock: Arc<tokio::sync::Mutex<()>>,
     pub closed: Arc<std::sync::atomic::AtomicBool>,
+    /// The same flag as `SessionState::active_prompt`, readable without the
+    /// state lock, which can be held across an MCP call.
+    pub active_prompt: Arc<std::sync::atomic::AtomicBool>,
+    /// The same flag as `SessionState::requires_action`, likewise.
+    pub requires_action: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -592,12 +597,14 @@ pub struct SessionState {
 
 impl SessionRuntime {
     pub fn new(record: SessionRecord) -> Self {
+        let active_prompt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let requires_action = Arc::new(std::sync::atomic::AtomicBool::new(false));
         Self {
             state: Arc::new(tokio::sync::Mutex::new(SessionState {
                 record,
                 cancellation: tokio_util::sync::CancellationToken::new(),
-                active_prompt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                requires_action: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                active_prompt: active_prompt.clone(),
+                requires_action: requires_action.clone(),
                 activity_notify: Arc::new(tokio::sync::Notify::new()),
                 prompt_seq: 0,
                 session_approvals: std::collections::HashSet::new(),
@@ -606,6 +613,8 @@ impl SessionRuntime {
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             turn_lock: Arc::new(tokio::sync::Mutex::new(())),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            active_prompt,
+            requires_action,
         }
     }
 
