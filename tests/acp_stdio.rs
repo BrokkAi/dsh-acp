@@ -614,6 +614,43 @@ async fn stdio_negotiates_acp_v2_and_uses_async_prompt_lifecycle() {
     assert!(status.success(), "server exited with {status}");
 }
 
+#[tokio::test]
+async fn a_rejected_initialize_is_answered_before_the_server_exits() {
+    let temp = tempfile::tempdir().unwrap();
+    let cases = [
+        (Some(json!(0)), -32022),
+        (None, -32602),
+        (Some(json!("2")), -32602),
+        (Some(Value::Null), -32602),
+        (Some(json!(-1)), -32602),
+        (Some(json!(65536)), -32602),
+    ];
+    for (protocol_version, code) in cases {
+        let mut peer = spawn_peer(temp.path(), None).await;
+        let mut params = json!({"info": {"name": "tck", "version": "0"}, "capabilities": {}});
+        if let Some(protocol_version) = &protocol_version {
+            params["protocolVersion"] = protocol_version.clone();
+        }
+        // Stdin stays open: the response used to be lost only while the
+        // client was still connected.
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            peer.request_error("initialize", params),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("no reply to protocolVersion {protocol_version:?}"));
+        assert_eq!(error["code"], code, "protocolVersion {protocol_version:?}");
+        if code == -32022 {
+            assert_eq!(error["data"], json!({"requested": 0, "supported": [1, 2]}));
+        }
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait())
+            .await
+            .expect("server exits after rejecting initialize")
+            .unwrap();
+        assert!(status.success(), "server exited with {status}");
+    }
+}
+
 async fn spawn_peer(data_dir: &std::path::Path, base_url: Option<&str>) -> Peer {
     spawn_peer_with_args(data_dir, base_url, &[]).await
 }

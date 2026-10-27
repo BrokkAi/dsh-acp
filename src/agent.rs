@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use agent_client_protocol::{
-    Agent, Client, ConnectTo, ConnectionTo, Error, Stdio, UntypedMessage,
+    Agent, ByteStreams, Client, ConnectTo, ConnectionTo, Error, UntypedMessage,
     schema::ProtocolVersion,
     schema::v1::{
         AgentAuthCapabilities, AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest,
@@ -339,8 +339,21 @@ pub async fn run(config: Config) -> agent_client_protocol::Result<()> {
         .protocol_router()
         .with_v1(v1_agent)
         .with_v2(crate::v2_agent::component(harness.clone()))
-        .connect_to(Stdio::new())
+        .connect_to(stdio_transport())
         .await
+}
+
+/// Stdio as a transport the protocol router can finish.
+///
+/// When the router rejects `initialize`, it asks the transport to finish so
+/// the error response is written before the process exits. The SDK's `Stdio`
+/// cannot be asked to finish, so the router stops it after one poll, which
+/// races the write: the client often got no response at all.
+fn stdio_transport() -> impl ConnectTo<Agent> {
+    ByteStreams::new(
+        blocking::Unblock::new(std::io::stdout()),
+        blocking::Unblock::new(std::io::stdin()),
+    )
 }
 
 impl Harness {
