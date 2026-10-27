@@ -1963,7 +1963,7 @@ impl Harness {
                     preview.as_ref(),
                     cancellation,
                 )
-                .await?
+                .await
                 {
                     PermissionDecision::AllowOnce => {}
                     PermissionDecision::AllowAlways => {
@@ -1981,6 +1981,11 @@ impl Harness {
                         };
                         send_tool_finished(access, session_id, call, &title, &denied, false, None)?;
                         return Ok(denied);
+                    }
+                    PermissionDecision::Failed(error) => {
+                        let failed = crate::tools::permission_request_failed(&error);
+                        send_tool_finished(access, session_id, call, &title, &failed, false, None)?;
+                        return Ok(failed);
                     }
                     PermissionDecision::Cancelled => {
                         return Err(Error::request_cancelled());
@@ -2489,6 +2494,8 @@ enum PermissionDecision {
     AllowOnce,
     AllowAlways,
     Deny,
+    /// The Client answered with an error while the turn went on.
+    Failed(Error),
     Cancelled,
 }
 
@@ -2630,7 +2637,7 @@ async fn request_permission(
     arguments: &Value,
     preview: Option<&PersistedDiff>,
     cancellation: &CancellationToken,
-) -> Result<PermissionDecision, Error> {
+) -> PermissionDecision {
     let options = vec![
         PermissionOption::new(
             PermissionOptionId::new("allow_once"),
@@ -2660,15 +2667,22 @@ async fn request_permission(
         options,
     );
     let response = tokio::select! {
-        _ = cancellation.cancelled() => return Ok(PermissionDecision::Cancelled),
+        _ = cancellation.cancelled() => return PermissionDecision::Cancelled,
         response = access
             .connection
             .as_ref()
             .expect("v1 permissions require an ACP v1 connection")
             .send_request(request)
-            .block_task() => response?,
+            .block_task() => response,
     };
-    Ok(match response.outcome {
+    let response = match response {
+        Ok(response) => response,
+        // Only the turn's own cancellation ends it: a Client that cancels
+        // the permission request itself answers -32800 too.
+        Err(_) if cancellation.is_cancelled() => return PermissionDecision::Cancelled,
+        Err(error) => return PermissionDecision::Failed(error),
+    };
+    match response.outcome {
         RequestPermissionOutcome::Cancelled => PermissionDecision::Cancelled,
         RequestPermissionOutcome::Selected(SelectedPermissionOutcome { option_id, .. }) => {
             match option_id.to_string().as_str() {
@@ -2678,7 +2692,7 @@ async fn request_permission(
             }
         }
         _ => PermissionDecision::Deny,
-    })
+    }
 }
 
 fn tool_kind(name: &str) -> ToolKind {

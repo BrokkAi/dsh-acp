@@ -1910,8 +1910,8 @@ impl V2Harness {
                 .await
                 .requires_action
                 .store(false, Ordering::Release);
-            match decision? {
-                PermissionDecision::AllowOnce => {}
+            let refusal = match decision {
+                PermissionDecision::AllowOnce => None,
                 PermissionDecision::AllowAlways => {
                     runtime
                         .state
@@ -1919,28 +1919,18 @@ impl V2Harness {
                         .await
                         .session_approvals
                         .insert(approval_key);
+                    None
                 }
-                PermissionDecision::Deny => {
-                    {
-                        let state = runtime.state.lock().await;
-                        send_update(
-                            connection,
-                            session_id,
-                            SessionUpdate::StateUpdate(StateUpdate::Running(
-                                RunningStateUpdate::new(),
-                            )),
-                        )?;
-                        drop(state);
-                    }
-                    let result = ToolResult {
-                        text: "The user denied permission.".to_string(),
-                        raw: json!({"denied": true}),
-                    };
-                    send_tool_result(connection, session_id, call, &result, false)?;
-                    return Ok(result);
+                PermissionDecision::Deny => Some(ToolResult {
+                    text: "The user denied permission.".to_string(),
+                    raw: json!({"denied": true}),
+                }),
+                PermissionDecision::Failed(error) => {
+                    Some(crate::tools::permission_request_failed(&error))
                 }
                 PermissionDecision::Cancelled => return Err(Error::request_cancelled()),
-            }
+            };
+            // The turn goes on whether or not the tool runs.
             {
                 let state = runtime.state.lock().await;
                 send_update(
@@ -1949,6 +1939,10 @@ impl V2Harness {
                     SessionUpdate::StateUpdate(StateUpdate::Running(RunningStateUpdate::new())),
                 )?;
                 drop(state);
+            }
+            if let Some(result) = refusal {
+                send_tool_result(connection, session_id, call, &result, false)?;
+                return Ok(result);
             }
         }
         send_update(
@@ -2462,6 +2456,8 @@ enum PermissionDecision {
     AllowOnce,
     AllowAlways,
     Deny,
+    /// The Client answered with an error while the turn went on.
+    Failed(Error),
     Cancelled,
 }
 
@@ -2471,7 +2467,7 @@ async fn request_permission(
     tool_call: ToolCallUpdate,
     session_approval_label: &str,
     cancellation: &CancellationToken,
-) -> Result<PermissionDecision, Error> {
+) -> PermissionDecision {
     let options = vec![
         PermissionOption::new(
             v2::PermissionOptionId::new("allow_once"),
@@ -2491,11 +2487,18 @@ async fn request_permission(
     ];
     let request = RequestPermissionRequest::new(session_id.clone(), "Run sensitive tool", options)
         .subject(Some(v2::RequestPermissionSubject::from(tool_call)));
-    let response: v2::RequestPermissionResponse = tokio::select! {
-        _ = cancellation.cancelled() => return Err(Error::request_cancelled()),
-        response = connection.send_request(request).block_task() => response?,
+    let response = tokio::select! {
+        _ = cancellation.cancelled() => return PermissionDecision::Cancelled,
+        response = connection.send_request(request).block_task() => response,
     };
-    Ok(match response.outcome {
+    let response: v2::RequestPermissionResponse = match response {
+        Ok(response) => response,
+        // Only the turn's own cancellation ends it: a Client that cancels
+        // the permission request itself answers -32800 too.
+        Err(_) if cancellation.is_cancelled() => return PermissionDecision::Cancelled,
+        Err(error) => return PermissionDecision::Failed(error),
+    };
+    match response.outcome {
         RequestPermissionOutcome::Cancelled => PermissionDecision::Cancelled,
         RequestPermissionOutcome::Selected(v2::SelectedPermissionOutcome { option_id, .. }) => {
             match option_id.to_string().as_str() {
@@ -2505,7 +2508,7 @@ async fn request_permission(
             }
         }
         _ => PermissionDecision::Deny,
-    })
+    }
 }
 
 fn replay_history(

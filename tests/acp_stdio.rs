@@ -15,6 +15,9 @@ struct Peer {
     updates: Vec<Value>,
     permission_requests: Vec<Value>,
     permission_answer: &'static str,
+    /// Answer `session/request_permission` with this JSON-RPC error instead
+    /// of `permission_answer`.
+    permission_error: Option<Value>,
     /// Each `terminal/*` request the agent sent, with how many updates the
     /// peer had received by then.
     terminal_requests: Vec<(String, usize)>,
@@ -142,17 +145,20 @@ impl Peer {
             }
             if value.get("method").and_then(Value::as_str) == Some("session/request_permission") {
                 self.permission_requests.push(value.clone());
-                self.write(json!({
-                    "jsonrpc": "2.0",
-                    "id": value["id"],
-                    "result": {
-                        "outcome": {
-                            "outcome": "selected",
-                            "optionId": self.permission_answer
+                let reply = match &self.permission_error {
+                    Some(error) => json!({"jsonrpc": "2.0", "id": value["id"], "error": error}),
+                    None => json!({
+                        "jsonrpc": "2.0",
+                        "id": value["id"],
+                        "result": {
+                            "outcome": {
+                                "outcome": "selected",
+                                "optionId": self.permission_answer
+                            }
                         }
-                    }
-                }))
-                .await;
+                    }),
+                };
+                self.write(reply).await;
                 continue;
             }
             if value.get("method").and_then(Value::as_str) == Some("elicitation/create") {
@@ -1614,6 +1620,7 @@ async fn spawn_peer_with_options(
         updates: Vec::new(),
         permission_requests: Vec::new(),
         permission_answer: "allow_once",
+        permission_error: None,
         terminal_requests: Vec::new(),
         fail_terminal_wait: false,
         elicitation_requests: Vec::new(),
@@ -4119,6 +4126,215 @@ async fn a_client_cancelling_an_elicitation_fails_only_that_tool_call() {
             cancelled.contains("the client cancelled the request"),
             "v{version}: {cancelled}"
         );
+    }
+}
+
+#[tokio::test]
+async fn a_client_cancelling_a_permission_request_fails_only_that_tool_call() {
+    let errors = [
+        // The Client dismisses its own dialog: no session/cancel was sent, so
+        // the turn must go on.
+        (
+            json!({"code": -32800, "message": "Request cancelled"}),
+            "the client cancelled the permission request",
+        ),
+        (
+            json!({
+                "code": -32603,
+                "message": "Internal error",
+                "data": "permission dialog unavailable"
+            }),
+            "permission dialog unavailable",
+        ),
+    ];
+    for version in [1, 2] {
+        for (error, reason) in &errors {
+            let case = format!("v{version} {}", error["code"]);
+            let temp = tempfile::tempdir().unwrap();
+            let Some((base_url, server)) =
+                mock_sequence_server(vec![mock_tool_call_stream(), mock_text_stream()]).await
+            else {
+                eprintln!("skipping permission error test: loopback networking is unavailable");
+                return;
+            };
+            let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+            let initialize = if version == 1 {
+                json!({"protocolVersion": 1, "clientCapabilities": {"fs": {}, "terminal": false}})
+            } else {
+                json!({
+                    "protocolVersion": 2,
+                    "info": {"name": "v2-test-client", "version": "1.0.0"},
+                    "capabilities": {}
+                })
+            };
+            peer.request("initialize", initialize).await;
+            let session_id = peer_new_session(&mut peer, &temp.path().to_string_lossy()).await;
+            peer.permission_error = Some(error.clone());
+            let response = peer
+                .request(
+                    "session/prompt",
+                    json!({
+                        "sessionId": session_id,
+                        "prompt": [{"type": "text", "text": "Write sample.txt"}]
+                    }),
+                )
+                .await;
+            let stop_reason = if version == 1 {
+                response["stopReason"].clone()
+            } else {
+                next_v2_idle(&mut peer).await["params"]["update"]["stopReason"].clone()
+            };
+            assert_eq!(stop_reason, "end_turn", "{case}");
+            assert_eq!(peer.permission_requests.len(), 1, "{case}");
+            assert_eq!(
+                final_tool_update(&peer, "call-1")["status"],
+                "failed",
+                "{case}"
+            );
+            assert!(!temp.path().join("sample.txt").exists(), "{case}");
+            if version == 2 {
+                // Progress resumed after the request, as it does for a denial.
+                let states = peer
+                    .updates
+                    .iter()
+                    .map(|update| &update["params"]["update"])
+                    .filter(|update| update["sessionUpdate"] == "state_update")
+                    .map(|update| update["state"].clone())
+                    .collect::<Vec<_>>();
+                assert!(
+                    states
+                        .windows(2)
+                        .any(|pair| pair[0] == "requires_action" && pair[1] == "running"),
+                    "{case}: {states:?}"
+                );
+            }
+
+            drop(peer.stdin);
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+            let requests = server.await.unwrap();
+            assert_eq!(requests.len(), 2, "{case}");
+            let failed = tool_message(&requests[1], "call-1");
+            assert!(failed.contains(reason), "{case}: {failed}");
+            assert!(failed.contains("did not run"), "{case}: {failed}");
+
+            let saved: Value = serde_json::from_slice(
+                &std::fs::read(
+                    temp.path()
+                        .join("sessions-data/sessions")
+                        .join(format!("{session_id}.json")),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                saved["tool_outcomes"]["call-1"]["status"], "failed",
+                "{case}: {saved}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn session_cancel_during_a_permission_request_still_ends_the_turn_cancelled() {
+    // A Client must answer a pending permission request `cancelled` when it
+    // sends session/cancel. One that answers -32800 instead still cancels the
+    // turn, because the turn's own cancellation came first.
+    let answers = [
+        json!({"result": {"outcome": {"outcome": "cancelled"}}}),
+        json!({"error": {"code": -32800, "message": "Request cancelled"}}),
+    ];
+    for version in [1, 2] {
+        for answer in &answers {
+            let case = format!("v{version} {answer}");
+            let temp = tempfile::tempdir().unwrap();
+            let Some((base_url, server)) =
+                mock_sequence_server(vec![mock_tool_call_stream()]).await
+            else {
+                eprintln!("skipping permission cancel test: loopback networking is unavailable");
+                return;
+            };
+            let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+            let initialize = if version == 1 {
+                json!({"protocolVersion": 1, "clientCapabilities": {"fs": {}, "terminal": false}})
+            } else {
+                json!({
+                    "protocolVersion": 2,
+                    "info": {"name": "v2-test-client", "version": "1.0.0"},
+                    "capabilities": {}
+                })
+            };
+            peer.request("initialize", initialize).await;
+            let session_id = peer_new_session(&mut peer, &temp.path().to_string_lossy()).await;
+            let prompt_id = peer.next_id;
+            peer.next_id += 1;
+            peer.write(json!({
+                "jsonrpc": "2.0",
+                "id": prompt_id,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": "Write sample.txt"}]
+                }
+            }))
+            .await;
+            let mut permission_asked = false;
+            // v2 accepts the prompt first; an idle before that is the new
+            // session's initial state.
+            let mut accepted = false;
+            let stop_reason = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let message = peer.read_message().await;
+                    if message["method"] == "session/request_permission" {
+                        permission_asked = true;
+                        let mut reply = answer.as_object().unwrap().clone();
+                        reply.insert("jsonrpc".to_string(), json!("2.0"));
+                        reply.insert("id".to_string(), message["id"].clone());
+                        // One write, so the agent reads session/cancel first.
+                        peer.write_together(&[
+                            json!({
+                                "jsonrpc": "2.0",
+                                "method": "session/cancel",
+                                "params": {"sessionId": session_id}
+                            }),
+                            Value::Object(reply),
+                        ])
+                        .await;
+                        continue;
+                    }
+                    // The agent may withdraw the request it no longer needs.
+                    if message["method"] == "$/cancel_request" {
+                        continue;
+                    }
+                    if message["id"] == prompt_id {
+                        if version == 1 {
+                            return message["result"]["stopReason"].clone();
+                        }
+                        accepted = true;
+                        continue;
+                    }
+                    if accepted && message["params"]["update"]["state"] == "idle" {
+                        return message["params"]["update"]["stopReason"].clone();
+                    }
+                    peer.updates.push(message);
+                }
+            })
+            .await
+            .expect("the turn should finish");
+            assert!(permission_asked, "{case}");
+            assert_eq!(stop_reason, "cancelled", "{case}");
+            assert_eq!(
+                final_tool_update(&peer, "call-1")["status"],
+                if version == 1 { "failed" } else { "cancelled" },
+                "{case}"
+            );
+            assert!(!temp.path().join("sample.txt").exists(), "{case}");
+
+            drop(peer.stdin);
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+            assert_eq!(server.await.unwrap().len(), 1, "{case}");
+        }
     }
 }
 

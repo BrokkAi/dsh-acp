@@ -155,6 +155,14 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   response it sends. `_session/steering` now answers invalid params itself,
   like the other hand-rolled methods. A `RUST_LOG` setting still replaces the
   default filter.
+- A Client that answered a permission request with an error ended the whole
+  turn: as `cancelled` for `-32800` (Request cancelled) although nobody
+  cancelled the turn, and otherwise with a prompt error in ACP v1 or stop
+  reason `error` in ACP v2. The model was never told why the tool did not run.
+  Both versions now treat the error as a refusal: the tool does not run, its
+  call fails with the reason, for example that the client cancelled the
+  permission request, and the turn continues. Only the turn's own cancellation
+  (`session/cancel`, or a v1 `$/cancel_request` for the prompt) ends it.
 
 ## 0.4.0 - 2026-10-25
 
