@@ -55,8 +55,11 @@ foreground turn; per-update usage continues to track the session total.
 
 An ACP v1 prompt turn runs outside the connection's ordered dispatch, so a
 `$/cancel_request` for the prompt reaches it while it runs. The notification
-cancels the same token as `session/cancel`, and a turn it stops answers the
-prompt with `-32800`. Every other request is answered from the ordered
+cancels a child of the token `session/cancel` uses, so the turn stops the same
+way and the session token still shows whether `session/cancel` or a close
+reached the turn. A turn stopped by `$/cancel_request` alone answers the prompt
+with `-32800`; one that `session/cancel` also reached ends with
+`stopReason: "cancelled"`. Every other request is answered from the ordered
 dispatch, before a later `$/cancel_request` can be read.
 
 ## Replay

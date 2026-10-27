@@ -153,8 +153,16 @@ impl Peer {
     }
 
     async fn write(&mut self, value: Value) {
-        let mut bytes = serde_json::to_vec(&value).unwrap();
-        bytes.push(b'\n');
+        self.write_together(&[value]).await;
+    }
+
+    /// Write messages in a single write, so the agent reads them together.
+    async fn write_together(&mut self, values: &[Value]) {
+        let mut bytes = Vec::new();
+        for value in values {
+            serde_json::to_writer(&mut bytes, value).unwrap();
+            bytes.push(b'\n');
+        }
         self.stdin.write_all(&bytes).await.unwrap();
         self.stdin.flush().await.unwrap();
     }
@@ -3331,6 +3339,110 @@ async fn cancel_request_withdraws_a_pending_permission_and_fails_its_tool_call()
     drop(peer.stdin);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
     assert_eq!(server.await.unwrap().len(), 1);
+
+    // The failed tool call was saved: a new process replays it as failed.
+    let mut peer = spawn_peer(temp.path(), None).await;
+    peer_raw_initialize(&mut peer).await;
+    peer.request(
+        "session/load",
+        json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []}),
+    )
+    .await;
+    let replayed = peer
+        .updates
+        .iter()
+        .map(|update| &update["params"]["update"])
+        .rfind(|update| update["toolCallId"] == "call-1")
+        .unwrap();
+    assert_eq!(replayed["status"], "failed");
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+}
+
+#[tokio::test]
+async fn session_cancel_with_cancel_request_still_ends_the_prompt_cancelled() {
+    for cancel_request_first in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let Some((base_url, server)) = mock_slow_deepseek_server().await else {
+            eprintln!("skipping cancellation test: loopback networking is unavailable");
+            return;
+        };
+        let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+        peer_raw_initialize(&mut peer).await;
+        let cwd = temp.path().to_string_lossy().to_string();
+        let session = peer
+            .request(
+                "session/new",
+                json!({"cwd": cwd, "mcpServers": [], "additionalDirectories": []}),
+            )
+            .await;
+        let session_id = session["sessionId"].as_str().unwrap().to_string();
+        let prompt_id = peer.next_id;
+        peer.next_id += 1;
+        peer.write(json!({
+            "jsonrpc": "2.0",
+            "id": prompt_id,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "keep going until cancelled"}]
+            }
+        }))
+        .await;
+        let session_cancel = json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": {"sessionId": session_id}
+        });
+        let cancel_request = json!({
+            "jsonrpc": "2.0",
+            "method": "$/cancel_request",
+            "params": {"requestId": prompt_id}
+        });
+        let mut notifications = Some(if cancel_request_first {
+            [cancel_request, session_cancel]
+        } else {
+            [session_cancel, cancel_request]
+        });
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let message = peer.next_message().await;
+                if message.get("id").and_then(Value::as_u64) == Some(prompt_id) {
+                    return message;
+                }
+                if message["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+                    && let Some(notifications) = notifications.take()
+                {
+                    // One write, so the agent has read session/cancel before
+                    // the turn can answer.
+                    peer.write_together(&notifications).await;
+                }
+                peer.updates.push(message);
+            }
+        })
+        .await
+        .expect("cancellation should complete promptly");
+        assert!(notifications.is_none());
+        assert_eq!(
+            response["result"]["stopReason"], "cancelled",
+            "cancel_request_first={cancel_request_first}: {response}"
+        );
+
+        // `request` fails on any other response to the cancelled prompt.
+        let status = peer
+            .request(
+                "session/prompt",
+                json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "/status"}]}),
+            )
+            .await;
+        assert_eq!(status["stopReason"], "end_turn");
+
+        drop(peer.stdin);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+        server.abort();
+    }
 }
 
 #[tokio::test]

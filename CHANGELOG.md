@@ -23,12 +23,13 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   turn now stops the way it does for `session/cancel`: the model stream and
   the running tool stop, unfinished tool calls are reported and saved as
   failed, and a request still waiting on the client, such as a permission
-  request, is cancelled too. The prompt is answered once, with error `-32800`
-  (Request cancelled), or with its normal result if the turn had already
-  finished. `session/cancel` still ends the turn with
-  `stopReason: "cancelled"`. ACP v2 is unchanged: `session/prompt` is answered
-  when the message is inserted, so stopping the work it started still takes
-  `session/cancel`.
+  request, is cancelled too. The prompt is answered once: with error `-32800`
+  (Request cancelled) when `$/cancel_request` alone stopped the turn, or with
+  its normal result if the turn had already finished. A prompt that
+  `session/cancel` reaches still ends with `stopReason: "cancelled"`, even if
+  a `$/cancel_request` for it arrives as well. ACP v2 is unchanged:
+  `session/prompt` is answered when the message is inserted, so stopping the
+  work it started still takes `session/cancel`.
 
 ### Fixed
 

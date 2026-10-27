@@ -121,10 +121,12 @@ ACP v1 honors `$/cancel_request` for a `session/prompt` that is still running.
 The turn stops the way it does for `session/cancel`: the model stream and the
 running tool stop, unfinished tool calls are reported and saved as failed, and
 a request still waiting on the client, such as a permission request, is
-cancelled with its own `$/cancel_request`. The prompt is then answered once,
-with error `-32800` (Request cancelled), or with its normal result if the turn
-had already finished. `session/cancel` still ends the turn with
-`stopReason: "cancelled"`.
+cancelled with its own `$/cancel_request`. The prompt is then answered once:
+with error `-32800` (Request cancelled) when `$/cancel_request` alone stopped
+the turn, or with its normal result if the turn had already finished. If
+`session/cancel` or `session/close` also reaches the turn before the prompt is
+answered, the prompt ends with `stopReason: "cancelled"` as usual, which the
+request cancellation rules accept too.
 
 ACP v2 answers `session/prompt` once the user message is inserted, so a later
 `$/cancel_request` cannot stop the work it started; use `session/cancel`.
