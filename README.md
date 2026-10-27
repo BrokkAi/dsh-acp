@@ -180,12 +180,20 @@ before reporting `idle`. An idle steering request with its default behavior
 starts a new detached turn; with `idleBehavior: "promptRequired"`, it returns
 `promptRequired` so the Client can retain and submit the prompt itself.
 
+Both protocol versions also implement `session/status` from the Draft
+[Session Status RFD](https://agentclientprotocol.com/rfds/session-status),
+advertised as `sessionCapabilities.status` in v1 and `session.status` in v2.
+It reports whether a session is in memory (`active`) or only stored
+(`inactive`) without loading it, and returns `-32002` for an unknown session.
+A v2 `active` result also carries the foreground state. See
+[docs/acp-support.md](docs/acp-support.md#session-status).
+
 ACP v1 includes:
 
 - `initialize`, agent info, capabilities, auth/logout, and optional provider
   configuration APIs
 - `session/new`, `session/load`, `session/resume`, `session/fork`,
-  `session/list`, `session/delete`, and `session/close`
+  `session/list`, `session/delete`, `session/close`, and `session/status`
 - `session/prompt`, `session/cancel`, `session/set_mode`, and
   `session/set_config_option`
 - `$/cancel_request` for an in-flight `session/prompt`, answered with `-32800`

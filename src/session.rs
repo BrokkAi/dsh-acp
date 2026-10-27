@@ -15,6 +15,16 @@ use crate::{
 
 const MAX_INSTRUCTION_BYTES: u64 = 1024 * 1024;
 
+/// Whether the store knows a session, as `session/status` reports it.
+pub enum SessionPresence {
+    /// In memory.
+    Active(SessionRuntime),
+    /// Stored but not in memory.
+    Inactive,
+    /// Neither in memory nor stored.
+    Unknown,
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionStore {
     directory: PathBuf,
@@ -94,6 +104,30 @@ impl SessionStore {
         let runtime = SessionRuntime::new(record);
         let mut sessions = self.sessions.lock().await;
         Ok(sessions.entry(id.to_string()).or_insert(runtime).clone())
+    }
+
+    /// Finds a session without loading it, unlike [`Self::get`].
+    ///
+    /// A stored session is only checked for a record file, not read, so an
+    /// unreadable record is reported as inactive and fails when resumed.
+    pub async fn presence(&self, id: &str) -> Result<SessionPresence, Error> {
+        if validate_session_id(id).is_err() {
+            return Ok(SessionPresence::Unknown);
+        }
+        if let Some(runtime) = self.sessions.lock().await.get(id).cloned() {
+            return Ok(SessionPresence::Active(runtime));
+        }
+        if self.deleted.lock().await.contains(id) {
+            return Ok(SessionPresence::Unknown);
+        }
+        match tokio::fs::metadata(self.record_path(id)).await {
+            Ok(metadata) if metadata.is_file() => Ok(SessionPresence::Inactive),
+            Ok(_) => Ok(SessionPresence::Unknown),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(SessionPresence::Unknown)
+            }
+            Err(error) => Err(Error::into_internal_error(error)),
+        }
     }
 
     pub async fn save(&self, runtime: &SessionRuntime) -> Result<(), Error> {
@@ -498,6 +532,61 @@ mod tests {
         store.save(&runtime).await.unwrap();
         assert!(store.list(None).await.unwrap().is_empty());
         assert!(store.get("../../outside").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn presence_finds_stored_sessions_without_loading_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            api_key: None,
+            base_url: "http://localhost".to_string(),
+            default_model: "deepseek-flash".to_string(),
+            models: vec!["deepseek-flash".to_string()],
+            data_dir: temp.path().join("data"),
+            permission_mode: PermissionMode::Ask,
+            system_prompt: None,
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::High,
+            context_chars: 1000,
+            tool_output_bytes: 1000,
+            http_timeout: std::time::Duration::from_secs(1),
+            mcp_connect_timeout: std::time::Duration::from_secs(1),
+            disable_web: true,
+            trace: false,
+        };
+        let store = SessionStore::open(&config).await.unwrap();
+        let runtime = store
+            .create(temp.path().to_path_buf(), Vec::new(), None, None)
+            .await
+            .unwrap();
+        let id = runtime.snapshot().await.id;
+        assert!(matches!(
+            store.presence(&id).await.unwrap(),
+            SessionPresence::Active(_)
+        ));
+
+        // A second store over the same directory stands in for a restart.
+        let restarted = SessionStore::open(&config).await.unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                restarted.presence(&id).await.unwrap(),
+                SessionPresence::Inactive
+            ));
+        }
+        assert!(restarted.sessions.lock().await.is_empty());
+
+        store.close(&id).await.unwrap();
+        assert!(matches!(
+            store.presence(&id).await.unwrap(),
+            SessionPresence::Inactive
+        ));
+        store.delete(&id).await.unwrap();
+        for id in [id.as_str(), "dsh-unknown", "", "../../outside"] {
+            assert!(
+                matches!(store.presence(id).await.unwrap(), SessionPresence::Unknown),
+                "{id:?}"
+            );
+        }
     }
 
     #[tokio::test]

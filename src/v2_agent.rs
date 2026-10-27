@@ -7,7 +7,7 @@ use std::{
 };
 
 use agent_client_protocol::{
-    Agent, Client, ConnectTo, Error, UntypedMessage, V2ConnectionTo,
+    Agent, Client, ConnectTo, Error, JsonRpcMessage, UntypedMessage, V2ConnectionTo,
     schema::v2::{
         self, AgentCapabilities, AgentMessage, AgentThought, AuthMethod, AuthMethodAgent,
         AvailableCommand, CompactionStatus, CompactionUpdate, ContentBlock, ContentChunk, Diff,
@@ -36,9 +36,11 @@ use crate::{
     model::{
         ChatMessage, ClientPromptMode, ClientSystemPrompt, ContentPart, ImageUrl, MessageContent,
         PendingUserMessage, PersistedCompaction, PersistedDiff, Role, SessionRecord,
-        SessionRuntime, TokenUsage, ToolOutcomeStatus, ensure_session_unique_tool_call_ids,
+        SessionRuntime, SessionState, TokenUsage, ToolOutcomeStatus,
+        ensure_session_unique_tool_call_ids,
     },
-    session::session_title,
+    session::{SessionPresence, session_title},
+    session_status,
     tools::{
         ToolAccess, ToolResult, built_in_definitions, git_patch, persisted_diff,
         persisted_tool_outcome, result_status, structured_content,
@@ -66,17 +68,6 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
     Agent
         .v2()
         .name("dsh-acp-v2")
-        .on_receive_request(
-            {
-                let harness = harness.clone();
-                async move |request: InitializeRequest,
-                            responder: agent_client_protocol::Responder<InitializeResponse>,
-                            _connection: V2ConnectionTo<Client>| {
-                    harness.clone().initialize(request, responder).await
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
         .on_receive_request(
             {
                 let harness = harness.clone();
@@ -248,13 +239,32 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
                 async move |request: UntypedMessage,
                             responder: agent_client_protocol::Responder<Value>,
                             connection: V2ConnectionTo<Client>| {
-                    if request.method != STEERING_METHOD {
-                        return responder.respond_with_error(Error::method_not_found());
+                    match request.method.as_str() {
+                        // Answered as JSON: the SDK capability types cannot advertise
+                        // `session/status` yet.
+                        "initialize" => {
+                            match InitializeRequest::parse_message(&request.method, &request.params)
+                            {
+                                Ok(initialize) => {
+                                    harness.clone().initialize(initialize, responder).await
+                                }
+                                Err(error) => responder.respond_with_error(error),
+                            }
+                        }
+                        STEERING_METHOD => {
+                            harness
+                                .clone()
+                                .steering(request.params, responder, connection)
+                                .await
+                        }
+                        session_status::METHOD => {
+                            harness
+                                .clone()
+                                .session_status(request.params, responder)
+                                .await
+                        }
+                        _ => responder.respond_with_error(Error::method_not_found()),
                     }
-                    harness
-                        .clone()
-                        .steering(request.params, responder, connection)
-                        .await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -276,7 +286,7 @@ impl V2Harness {
     async fn initialize(
         self,
         request: InitializeRequest,
-        responder: agent_client_protocol::Responder<InitializeResponse>,
+        responder: agent_client_protocol::Responder<Value>,
     ) -> agent_client_protocol::Result<()> {
         *self.capabilities.write().await = request.capabilities.clone();
         self.initialized.store(true, Ordering::Release);
@@ -310,22 +320,24 @@ impl V2Harness {
         let capabilities = AgentCapabilities::new()
             .session(session_capabilities)
             .providers(ProvidersCapabilities::new());
-        responder.respond(
-            InitializeResponse::new(
-                request.protocol_version,
-                Implementation::new("dsh-acp", env!("CARGO_PKG_VERSION")).title("DeepSeek Harness"),
-            )
-            .capabilities(capabilities)
-            .auth_methods(vec![AuthMethod::Agent(
-                AuthMethodAgent::new("deepseek-api-key", "DeepSeek API key").description(
-                    "Uses DEEPSEEK_API_KEY, --api-key, or an Authorization provider header.",
-                ),
-            )])
-            .meta(Some(serde_json::Map::from_iter([(
-                "steering".to_string(),
-                json!({"supported": true, "idleBehaviors": ["promptRequired"]}),
-            )]))),
+        let response = InitializeResponse::new(
+            request.protocol_version,
+            Implementation::new("dsh-acp", env!("CARGO_PKG_VERSION")).title("DeepSeek Harness"),
         )
+        .capabilities(capabilities)
+        .auth_methods(vec![AuthMethod::Agent(
+            AuthMethodAgent::new("deepseek-api-key", "DeepSeek API key").description(
+                "Uses DEEPSEEK_API_KEY, --api-key, or an Authorization provider header.",
+            ),
+        )])
+        .meta(Some(serde_json::Map::from_iter([(
+            "steering".to_string(),
+            json!({"supported": true, "idleBehaviors": ["promptRequired"]}),
+        )])));
+        match session_status::advertise(response, "/capabilities/session") {
+            Ok(response) => responder.respond(response),
+            Err(error) => responder.respond_with_error(error),
+        }
     }
 
     async fn login(
@@ -567,17 +579,10 @@ impl V2Harness {
         }
         {
             let state = runtime.state.lock().await;
-            let current = if state.requires_action.load(Ordering::Acquire) {
-                StateUpdate::RequiresAction(RequiresActionStateUpdate::new())
-            } else if state.active_prompt.load(Ordering::Acquire) {
-                StateUpdate::Running(RunningStateUpdate::new())
-            } else {
-                StateUpdate::Idle(IdleStateUpdate::new())
-            };
             send_update(
                 &connection,
                 &v2_session_id(&record.id),
-                SessionUpdate::StateUpdate(current),
+                SessionUpdate::StateUpdate(foreground_state(&state)),
             )?;
         }
         responder.respond(
@@ -726,6 +731,31 @@ impl V2Harness {
         }
         match self.base.store.close(&request.session_id.to_string()).await {
             Ok(()) => responder.respond(v2::CloseSessionResponse::new()),
+            Err(error) => responder.respond_with_error(error),
+        }
+    }
+
+    async fn session_status(
+        self,
+        params: Value,
+        responder: agent_client_protocol::Responder<Value>,
+    ) -> agent_client_protocol::Result<()> {
+        if !self.initialized.load(Ordering::Acquire) {
+            return responder.respond_with_error(Error::invalid_request().data("initialize first"));
+        }
+        let session_id = match session_status::requested_session_id(&params) {
+            Ok(session_id) => session_id,
+            Err(error) => return responder.respond_with_error(error),
+        };
+        match self.base.store.presence(session_id).await {
+            Ok(SessionPresence::Active(runtime)) => {
+                let state = foreground_state(&*runtime.state.lock().await);
+                responder.respond(json!({"status": "active", "state": state}))
+            }
+            Ok(SessionPresence::Inactive) => responder.respond(json!({"status": "inactive"})),
+            Ok(SessionPresence::Unknown) => {
+                responder.respond_with_error(session_status::unknown_session(session_id))
+            }
             Err(error) => responder.respond_with_error(error),
         }
     }
@@ -2105,6 +2135,18 @@ impl V2Harness {
             .map(convert_mcp_server)
             .collect::<Result<Vec<_>, _>>()?;
         self.base.attach_mcp(runtime, &converted).await
+    }
+}
+
+/// The foreground state snapshot that `session/resume` and `session/status`
+/// report.
+fn foreground_state(state: &SessionState) -> StateUpdate {
+    if state.requires_action.load(Ordering::Acquire) {
+        StateUpdate::RequiresAction(RequiresActionStateUpdate::new())
+    } else if state.active_prompt.load(Ordering::Acquire) {
+        StateUpdate::Running(RunningStateUpdate::new())
+    } else {
+        StateUpdate::Idle(IdleStateUpdate::new())
     }
 }
 

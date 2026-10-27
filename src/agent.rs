@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use agent_client_protocol::{
-    Agent, ByteStreams, Client, ConnectTo, ConnectionTo, Error, UntypedMessage,
+    Agent, ByteStreams, Client, ConnectTo, ConnectionTo, Error, JsonRpcMessage, UntypedMessage,
     schema::ProtocolVersion,
     schema::v1::{
         AgentAuthCapabilities, AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest,
@@ -50,7 +50,8 @@ use crate::{
         PendingUserMessage, PersistedCompaction, PersistedDiff, Role, SessionRecord,
         SessionRuntime, TokenUsage, ToolOutcomeStatus, ensure_session_unique_tool_call_ids,
     },
-    session::{self, SessionStore, session_title},
+    session::{self, SessionPresence, SessionStore, session_title},
+    session_status,
     tools::{
         TerminalToolCall, ToolAccess, ToolResult, built_in_definitions, execute as execute_tool,
         persisted_tool_outcome, result_status, structured_content,
@@ -109,20 +110,6 @@ pub async fn run(config: Config) -> agent_client_protocol::Result<()> {
     let v1_agent = Agent
         .builder()
         .name("dsh-acp")
-        .on_receive_request(
-            {
-                let harness = harness.clone();
-                async move |request: InitializeRequest,
-                            responder: agent_client_protocol::Responder<InitializeResponse>,
-                            connection: ConnectionTo<Client>| {
-                    harness
-                        .clone()
-                        .initialize(request, responder, connection)
-                        .await
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
         .on_receive_request(
             {
                 let harness = harness.clone();
@@ -314,13 +301,35 @@ pub async fn run(config: Config) -> agent_client_protocol::Result<()> {
                 async move |request: UntypedMessage,
                             responder: agent_client_protocol::Responder<Value>,
                             connection: ConnectionTo<Client>| {
-                    if request.method != STEERING_METHOD {
-                        return responder.respond_with_error(Error::method_not_found());
+                    match request.method.as_str() {
+                        // Answered as JSON: the SDK capability types cannot advertise
+                        // `session/status` yet.
+                        "initialize" => {
+                            match InitializeRequest::parse_message(&request.method, &request.params)
+                            {
+                                Ok(initialize) => {
+                                    harness
+                                        .clone()
+                                        .initialize(initialize, responder, connection)
+                                        .await
+                                }
+                                Err(error) => responder.respond_with_error(error),
+                            }
+                        }
+                        STEERING_METHOD => {
+                            harness
+                                .clone()
+                                .steering(request.params, responder, connection)
+                                .await
+                        }
+                        session_status::METHOD => {
+                            harness
+                                .clone()
+                                .session_status(request.params, responder)
+                                .await
+                        }
+                        _ => responder.respond_with_error(Error::method_not_found()),
                     }
-                    harness
-                        .clone()
-                        .steering(request.params, responder, connection)
-                        .await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -361,7 +370,7 @@ impl Harness {
     async fn initialize(
         self,
         request: InitializeRequest,
-        responder: agent_client_protocol::Responder<InitializeResponse>,
+        responder: agent_client_protocol::Responder<Value>,
         _connection: ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         if request.protocol_version == ProtocolVersion::V0 {
@@ -402,23 +411,24 @@ impl Harness {
             .auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new()))
             .providers(ProvidersCapabilities::new());
 
-        responder.respond(
-            InitializeResponse::new(ProtocolVersion::V1)
-                .agent_capabilities(capabilities)
-                .auth_methods(vec![AuthMethod::Agent(
-                    AuthMethodAgent::new("deepseek-api-key", "DeepSeek API key").description(
-                        "Uses DEEPSEEK_API_KEY, --api-key, or an Authorization provider header.",
-                    ),
-                )])
-                .agent_info(
-                    Implementation::new("dsh-acp", env!("CARGO_PKG_VERSION"))
-                        .title("DeepSeek Harness"),
-                )
-                .meta(Some(serde_json::Map::from_iter([(
-                    "steering".to_string(),
-                    json!({"supported": true, "idleBehaviors": ["promptRequired"]}),
-                )]))),
-        )
+        let response = InitializeResponse::new(ProtocolVersion::V1)
+            .agent_capabilities(capabilities)
+            .auth_methods(vec![AuthMethod::Agent(
+                AuthMethodAgent::new("deepseek-api-key", "DeepSeek API key").description(
+                    "Uses DEEPSEEK_API_KEY, --api-key, or an Authorization provider header.",
+                ),
+            )])
+            .agent_info(
+                Implementation::new("dsh-acp", env!("CARGO_PKG_VERSION")).title("DeepSeek Harness"),
+            )
+            .meta(Some(serde_json::Map::from_iter([(
+                "steering".to_string(),
+                json!({"supported": true, "idleBehaviors": ["promptRequired"]}),
+            )])));
+        match session_status::advertise(response, "/agentCapabilities/sessionCapabilities") {
+            Ok(response) => responder.respond(response),
+            Err(error) => responder.respond_with_error(error),
+        }
     }
 
     async fn authenticate(
@@ -867,6 +877,29 @@ impl Harness {
         }
         match self.store.close(&request.session_id.to_string()).await {
             Ok(()) => responder.respond(CloseSessionResponse::new()),
+            Err(error) => responder.respond_with_error(error),
+        }
+    }
+
+    async fn session_status(
+        self,
+        params: Value,
+        responder: agent_client_protocol::Responder<Value>,
+    ) -> agent_client_protocol::Result<()> {
+        if !self.initialized.load(Ordering::Acquire) {
+            return responder.respond_with_error(Error::invalid_request().data("initialize first"));
+        }
+        let session_id = match session_status::requested_session_id(&params) {
+            Ok(session_id) => session_id,
+            Err(error) => return responder.respond_with_error(error),
+        };
+        // v1 has no foreground state model, so the response has no `state`.
+        match self.store.presence(session_id).await {
+            Ok(SessionPresence::Active(_)) => responder.respond(json!({"status": "active"})),
+            Ok(SessionPresence::Inactive) => responder.respond(json!({"status": "inactive"})),
+            Ok(SessionPresence::Unknown) => {
+                responder.respond_with_error(session_status::unknown_session(session_id))
+            }
             Err(error) => responder.respond_with_error(error),
         }
     }

@@ -628,6 +628,303 @@ async fn stdio_negotiates_acp_v2_and_uses_async_prompt_lifecycle() {
 }
 
 #[tokio::test]
+async fn session_status_reports_sessions_without_loading_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().to_string_lossy().to_string();
+    let mut peer = spawn_peer(temp.path(), None).await;
+    let initialize = peer
+        .request(
+            "initialize",
+            json!({"protocolVersion": 1, "clientCapabilities": {}}),
+        )
+        .await;
+    assert_eq!(
+        initialize["agentCapabilities"]["sessionCapabilities"]["status"],
+        json!({})
+    );
+    let session_id = peer_new_session(&mut peer, &cwd).await;
+    let closed_id = peer_new_session(&mut peer, &cwd).await;
+    let deleted_id = peer_new_session(&mut peer, &cwd).await;
+    peer.request("session/close", json!({"sessionId": closed_id}))
+        .await;
+    peer.request("session/delete", json!({"sessionId": deleted_id}))
+        .await;
+
+    let status = peer
+        .request("session/status", json!({"sessionId": session_id}))
+        .await;
+    assert_eq!(status, json!({"status": "active"}));
+    let status = peer
+        .request("session/status", json!({"sessionId": closed_id}))
+        .await;
+    assert_eq!(status, json!({"status": "inactive"}));
+    for unknown in [deleted_id.as_str(), "dsh-never-created", "../outside", ""] {
+        let error = peer
+            .request_error("session/status", json!({"sessionId": unknown}))
+            .await;
+        assert_eq!(
+            error,
+            json!({
+                "code": -32002,
+                "message": "Resource not found",
+                "data": {"sessionId": unknown}
+            }),
+            "{unknown:?}"
+        );
+    }
+    for params in [
+        json!({}),
+        json!({"sessionId": 7}),
+        json!({"sessionId": null}),
+    ] {
+        let error = peer.request_error("session/status", params.clone()).await;
+        assert_eq!(error["code"], -32602, "{params}");
+    }
+    let error = peer.request_error("session/unknown", json!({})).await;
+    assert_eq!(error["code"], -32601);
+
+    drop(peer.stdin);
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait())
+        .await
+        .expect("server exits on EOF")
+        .unwrap();
+    assert!(exit.success(), "server exited with {exit}");
+
+    // A new process has the sessions on disk but none in memory.
+    let sessions = temp.path().join("sessions-data").join("sessions");
+    let stored = || {
+        let mut files = std::fs::read_dir(&sessions)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let modified = entry.metadata().unwrap().modified().unwrap();
+                (
+                    entry.file_name(),
+                    modified,
+                    std::fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    };
+    let before = stored();
+    assert_eq!(before.len(), 2);
+    let mut peer = spawn_peer(temp.path(), None).await;
+    peer.request(
+        "initialize",
+        json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    )
+    .await;
+    // Repeated, because a status that loaded the session would make the
+    // second one report it active.
+    for _ in 0..2 {
+        let status = peer
+            .request("session/status", json!({"sessionId": session_id}))
+            .await;
+        assert_eq!(status, json!({"status": "inactive"}));
+    }
+    let error = peer
+        .request_error("session/status", json!({"sessionId": deleted_id}))
+        .await;
+    assert_eq!(error["code"], -32002);
+    assert_eq!(stored(), before, "session/status changed the session store");
+
+    peer.request(
+        "session/resume",
+        json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []}),
+    )
+    .await;
+    let status = peer
+        .request("session/status", json!({"sessionId": session_id}))
+        .await;
+    assert_eq!(status, json!({"status": "active"}));
+
+    drop(peer.stdin);
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait())
+        .await
+        .expect("server exits on EOF")
+        .unwrap();
+    assert!(exit.success(), "server exited with {exit}");
+}
+
+#[tokio::test]
+async fn v2_session_status_reports_foreground_state() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("sample.txt"), "old contents").unwrap();
+    let Some((base_url, server)) = mock_deepseek_server().await else {
+        eprintln!("skipping v2 status test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    let initialize = peer
+        .request(
+            "initialize",
+            json!({
+                "protocolVersion": 2,
+                "info": {"name": "v2-test-client", "version": "1.0.0"},
+                "capabilities": {}
+            }),
+        )
+        .await;
+    assert_eq!(initialize["capabilities"]["session"]["status"], json!({}));
+    let session_id = peer_new_session(&mut peer, &temp.path().to_string_lossy()).await;
+    let status = peer
+        .request("session/status", json!({"sessionId": session_id}))
+        .await;
+    assert_eq!(
+        status,
+        json!({"status": "active", "state": {"state": "idle"}})
+    );
+
+    peer.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "Write sample.txt"}]
+        }),
+    )
+    .await;
+    // Leave the permission request unanswered so the turn waits on the user.
+    let permission = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let mut line = String::new();
+            let read = peer.stdout.read_line(&mut line).await.unwrap();
+            assert!(read > 0, "server closed stdout before asking permission");
+            let message: Value = serde_json::from_str(&line).unwrap();
+            if message["method"] == "session/request_permission" {
+                return message;
+            }
+            peer.updates.push(message);
+        }
+    })
+    .await
+    .expect("the write should ask permission");
+    let status = peer
+        .request("session/status", json!({"sessionId": session_id}))
+        .await;
+    assert_eq!(
+        status,
+        json!({"status": "active", "state": {"state": "requires_action"}})
+    );
+    peer.write(json!({
+        "jsonrpc": "2.0",
+        "id": permission["id"],
+        "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}}
+    }))
+    .await;
+    let idle = next_v2_idle(&mut peer).await;
+    assert_eq!(idle["params"]["update"]["stopReason"], "end_turn");
+    let status = peer
+        .request("session/status", json!({"sessionId": session_id}))
+        .await;
+    assert_eq!(
+        status,
+        json!({"status": "active", "state": {"state": "idle"}})
+    );
+
+    peer.request("session/close", json!({"sessionId": session_id}))
+        .await;
+    let status = peer
+        .request("session/status", json!({"sessionId": session_id}))
+        .await;
+    assert_eq!(status, json!({"status": "inactive"}));
+    peer.request("session/delete", json!({"sessionId": session_id}))
+        .await;
+    let error = peer
+        .request_error("session/status", json!({"sessionId": session_id}))
+        .await;
+    assert_eq!(
+        error,
+        json!({
+            "code": -32002,
+            "message": "Resource not found",
+            "data": {"sessionId": session_id}
+        })
+    );
+    let error = peer
+        .request_error("session/status", json!({"sessionId": 7}))
+        .await;
+    assert_eq!(error["code"], -32602);
+    let error = peer.request_error("session/unknown", json!({})).await;
+    assert_eq!(error["code"], -32601);
+
+    drop(peer.stdin);
+    let exit = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait())
+        .await
+        .expect("server exits on EOF")
+        .unwrap();
+    assert!(exit.success(), "server exited with {exit}");
+    assert_eq!(server.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn v2_session_status_reports_a_running_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, server)) = mock_slow_deepseek_server().await else {
+        eprintln!("skipping v2 running status test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request(
+        "initialize",
+        json!({
+            "protocolVersion": 2,
+            "info": {"name": "v2-test-client", "version": "1.0.0"},
+            "capabilities": {}
+        }),
+    )
+    .await;
+    let session_id = peer_new_session(&mut peer, &temp.path().to_string_lossy()).await;
+    peer.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "keep working"}]
+        }),
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let message = peer.next_message().await;
+            if message["params"]["update"]["sessionUpdate"] == "agent_message_chunk" {
+                return;
+            }
+            peer.updates.push(message);
+        }
+    })
+    .await
+    .expect("the turn should start streaming");
+    let status = peer
+        .request("session/status", json!({"sessionId": session_id}))
+        .await;
+    assert_eq!(
+        status,
+        json!({"status": "active", "state": {"state": "running"}})
+    );
+
+    peer.write(json!({
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": {"sessionId": session_id}
+    }))
+    .await;
+    let idle = next_v2_idle(&mut peer).await;
+    assert_eq!(idle["params"]["update"]["stopReason"], "cancelled");
+    let status = peer
+        .request("session/status", json!({"sessionId": session_id}))
+        .await;
+    assert_eq!(
+        status,
+        json!({"status": "active", "state": {"state": "idle"}})
+    );
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    server.abort();
+}
+
+#[tokio::test]
 async fn a_rejected_initialize_is_answered_before_the_server_exits() {
     let temp = tempfile::tempdir().unwrap();
     let cases = [
@@ -4911,6 +5208,16 @@ async fn peer_raw_initialize(peer: &mut Peer) {
         json!({"protocolVersion": 1, "clientCapabilities": {"fs": {}, "terminal": false}}),
     )
     .await;
+}
+
+async fn peer_new_session(peer: &mut Peer, cwd: &str) -> String {
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": cwd, "mcpServers": [], "additionalDirectories": []}),
+        )
+        .await;
+    session["sessionId"].as_str().unwrap().to_string()
 }
 
 async fn peer_prompt(peer: &mut Peer, cwd: &std::path::Path, text: &str) -> Value {

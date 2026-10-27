@@ -50,6 +50,7 @@ version's lifecycle and payload shapes.
 | Form elicitation | Implemented | Client capability |
 | URL elicitation | Implemented | Client capability |
 | `_session/steering` | Implemented | `_meta.steering.supported` |
+| `session/status` | Implemented (Draft RFD) | Advertised capability |
 | Steering idle return | Implemented | `idleBehavior: "promptRequired"` |
 | Agent-owned terminals | Implemented in v2 | Baseline v2 |
 | Terminal output chunks | Implemented in v2 | Baseline v2 |
@@ -63,6 +64,36 @@ version's lifecycle and payload shapes.
 
 Audio is intentionally not advertised because the DeepSeek input API used by
 this harness does not accept audio content.
+
+## Session status
+
+`session/status` follows the
+[Session Status RFD](https://agentclientprotocol.com/rfds/session-status),
+which is still a Draft. `agent-client-protocol` 3.4 has no types for it, so
+the request, response, and capability marker are written by hand and may change
+with the RFD. Both versions advertise it with an empty marker:
+`agentCapabilities.sessionCapabilities.status` in v1 and
+`capabilities.session.status` in v2.
+
+The request takes a `sessionId` and reports where that session is:
+
+| Result | Meaning |
+| --- | --- |
+| `{"status": "active"}` | The session is in memory in this server process. |
+| `{"status": "inactive"}` | The session is stored but not in memory, for example after `session/close` or a restart. |
+| `-32002` with `data.sessionId` | No such session, including a deleted one. |
+
+A missing or non-string `sessionId` is rejected with `-32602`. In v2, an
+`active` result also carries `state`, the same `running`, `requires_action`,
+or `idle` snapshot that `session/resume` sends. v1 has no foreground state, so
+its result has no `state`.
+
+The request does not load, resume, or change the session. As the RFD says,
+`active` only means the session is in memory, so a client still sends
+`session/load` (v1) or `session/resume` before prompting a session it did not
+create or resume itself. An inactive session is found by checking that its
+record file exists, without reading it, so an unreadable record is still
+reported as `inactive` and fails when resumed.
 
 ## Session configuration options
 
