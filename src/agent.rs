@@ -1196,7 +1196,7 @@ impl Harness {
             &CancellationToken::new(),
         )
         .await?;
-        runtime.state.lock().await.mcp = Some(mcp);
+        runtime.state.lock().await.mcp = Some(Arc::new(mcp));
         Ok(())
     }
 
@@ -1354,9 +1354,14 @@ impl Harness {
                 tools.push(crate::tools::ask_user_definition());
             }
             let read_only_mcp_names = {
-                let mut state = runtime.state.lock().await;
-                if let Some(mcp) = state.mcp.as_mut() {
+                let mcp = runtime.state.lock().await.mcp.clone();
+                if let Some(mcp) = mcp {
                     if let Err(error) = mcp.refresh(&cancellation).await {
+                        // A cancel that lands during the refresh ends the
+                        // turn; the refresh did not fail.
+                        if error.code == agent_client_protocol::ErrorCode::RequestCancelled {
+                            return Ok(PromptResponse::new(StopReason::Cancelled));
+                        }
                         tracing::warn!(?error, "failed to refresh MCP tools");
                         if supports_notices {
                             let _ = connection.send_notification(SessionNotification::new(
@@ -1851,8 +1856,7 @@ impl Harness {
         let terminal_call = TerminalToolCall::new(call.id.clone());
         let result = if call.function.name.starts_with("mcp__") {
             let mcp_result = {
-                let state = runtime.state.lock().await;
-                let Some(mcp) = state.mcp.as_ref() else {
+                let Some(mcp) = runtime.state.lock().await.mcp.clone() else {
                     return Err(Error::internal_error().data("MCP session is unavailable"));
                 };
                 mcp.call(&call.function.name, arguments, cancellation).await
