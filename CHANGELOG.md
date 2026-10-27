@@ -135,6 +135,12 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   the turn's own cancellation (`session/cancel`, or a v1 `$/cancel_request` for
   the prompt) now ends it; a Client-side cancel fails only that tool call, and
   the model is told the client cancelled the request.
+- In ACP v2, an `update_plan` call without an `entries` array, or with an entry
+  that has no `content`, ended the whole turn with stop reason `error`, and the
+  model saw only "Tool call failed before completion." It now fails just that
+  tool call with the reason, the turn continues, and the model can send a
+  corrected plan. A v2 call to an `mcp__` tool in a session with no MCP servers
+  also ended the turn; it now fails like a call to any other unknown MCP tool.
 
 ## 0.4.0 - 2026-10-25
 

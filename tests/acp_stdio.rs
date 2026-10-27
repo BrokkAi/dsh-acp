@@ -4769,6 +4769,112 @@ async fn v2_failed_tool_status_survives_replay() {
     assert_eq!(requests.len(), 2);
 }
 
+/// Start a v2 session with no MCP servers and send it `text`, returning once
+/// the turn is idle.
+async fn v2_prompt_until_idle(peer: &mut Peer, cwd: &std::path::Path, text: &str) -> Value {
+    peer.request(
+        "initialize",
+        json!({
+            "protocolVersion": 2,
+            "info": {"name": "v2-test-client", "version": "1.0.0"},
+            "capabilities": {}
+        }),
+    )
+    .await;
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": cwd.to_string_lossy(), "mcpServers": []}),
+        )
+        .await;
+    peer.request(
+        "session/prompt",
+        json!({
+            "sessionId": session["sessionId"],
+            "prompt": [{"type": "text", "text": text}]
+        }),
+    )
+    .await;
+    next_v2_idle(peer).await
+}
+
+#[tokio::test]
+async fn v2_an_invalid_plan_fails_only_that_tool_call() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, server)) = mock_sequence_server(vec![
+        // An entry without content is refused, but the turn goes on and the
+        // model learns why.
+        tool_call_stream(
+            "call-bad-plan",
+            "update_plan",
+            json!({"entries": [{"step": "Read the code", "status": "in_progress"}]}),
+        ),
+        tool_call_stream(
+            "call-plan",
+            "update_plan",
+            json!({"entries": [{"content": "Read the code", "status": "in_progress"}]}),
+        ),
+        mock_text_stream(),
+    ])
+    .await
+    else {
+        eprintln!("skipping v2 invalid plan test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    let idle = v2_prompt_until_idle(&mut peer, temp.path(), "Plan the work").await;
+    assert_eq!(idle["params"]["update"]["stopReason"], "end_turn");
+    let refused = final_tool_update(&peer, "call-bad-plan");
+    assert_eq!(refused["status"], "failed");
+    assert_eq!(refused["rawOutput"]["error"], "plan entry requires content");
+    assert_eq!(final_tool_update(&peer, "call-plan")["status"], "completed");
+    // Only the valid plan reaches the Client.
+    let plans: Vec<&Value> = peer
+        .updates
+        .iter()
+        .map(|update| &update["params"]["update"])
+        .filter(|update| update["sessionUpdate"] == "plan_update")
+        .collect();
+    assert_eq!(plans.len(), 1, "{plans:?}");
+    let entries = plans[0]["plan"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["content"], "Read the code");
+    assert_eq!(entries[0]["status"], "in_progress");
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 3);
+    let refused = tool_message(&requests[1], "call-bad-plan");
+    assert!(refused.contains("plan entry requires content"), "{refused}");
+}
+
+#[tokio::test]
+async fn v2_an_mcp_tool_call_without_mcp_servers_fails_only_that_call() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, server)) = mock_sequence_server(vec![
+        // No MCP server is attached, so this tool was never offered.
+        mock_named_tool_call_stream("mcp__absent__lookup"),
+        mock_text_stream(),
+    ])
+    .await
+    else {
+        eprintln!("skipping v2 missing MCP test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    let idle = v2_prompt_until_idle(&mut peer, temp.path(), "Look it up").await;
+    assert_eq!(idle["params"]["update"]["stopReason"], "end_turn");
+    assert_eq!(final_tool_update(&peer, "call-mcp")["status"], "failed");
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let failed = tool_message(&requests[1], "call-mcp");
+    assert!(failed.starts_with("MCP tool failed"), "{failed}");
+}
+
 #[tokio::test]
 async fn v2_steering_prompt_is_consumed_before_idle() {
     let temp = tempfile::tempdir().unwrap();

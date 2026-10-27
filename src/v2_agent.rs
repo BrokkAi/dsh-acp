@@ -1783,7 +1783,16 @@ impl V2Harness {
             SessionUpdate::ToolCallUpdate(update.clone()),
         )?;
         if call.function.name == "update_plan" {
-            let entries = parse_plan(&arguments)?;
+            // Like other tool failures, an invalid plan tells the model why
+            // and the turn goes on.
+            let entries = match parse_plan(&arguments) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    let result = crate::tools::error_result("Unable to update plan", &error);
+                    send_tool_result(connection, session_id, call, &result, false)?;
+                    return Ok(result);
+                }
+            };
             send_update(
                 connection,
                 session_id,
@@ -1979,11 +1988,13 @@ impl V2Harness {
             config: self.base.config.clone(),
         };
         let mut result = if call.function.name.starts_with("mcp__") {
-            let mcp_result = {
-                let Some(mcp) = runtime.state.lock().await.mcp.clone() else {
-                    return Err(Error::internal_error().data("MCP session unavailable"));
-                };
-                mcp.call(&call.function.name, arguments, cancellation).await
+            let mcp = runtime.state.lock().await.mcp.clone();
+            let mcp_result = match mcp {
+                Some(mcp) => mcp.call(&call.function.name, arguments, cancellation).await,
+                // With no MCP server attached, the model named a tool it was
+                // never offered: that fails only this call, as any unknown
+                // MCP tool does.
+                None => Err(Error::invalid_params().data("unknown MCP tool")),
             };
             match mcp_result {
                 Ok(value) => ToolResult {
