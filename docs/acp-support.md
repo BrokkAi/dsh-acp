@@ -115,6 +115,25 @@ the turn completes and carries the stop reason directly.
 Both versions persist user content, assistant output, tool calls, outcomes,
 plans, compactions, and terminal/diff state for replay.
 
+## Request cancellation
+
+ACP v1 honors `$/cancel_request` for a `session/prompt` that is still running.
+The turn stops the way it does for `session/cancel`: the model stream and the
+running tool stop, unfinished tool calls are reported and saved as failed, and
+a request still waiting on the client, such as a permission request, is
+cancelled with its own `$/cancel_request`. The prompt is then answered once:
+with error `-32800` (Request cancelled) when `$/cancel_request` alone stopped
+the turn, or with its normal result if the turn had already finished. If
+`session/cancel` or `session/close` also reaches the turn before the prompt is
+answered, the prompt ends with `stopReason: "cancelled"` as usual, which the
+request cancellation rules accept too.
+
+ACP v2 answers `session/prompt` once the user message is inserted, so a later
+`$/cancel_request` cannot stop the work it started; use `session/cancel`.
+
+Every other request, in both versions, is answered before a later
+`$/cancel_request` is read, so the notification has no effect on it.
+
 ## Permissions and workspace boundaries
 
 Reads, writes, searches, local commands, and MCP calls execute in the agent.

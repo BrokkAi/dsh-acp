@@ -75,12 +75,17 @@ impl Peer {
         }
     }
 
+    /// The next message, without answering any request the agent sends.
+    async fn read_message(&mut self) -> Value {
+        let mut line = String::new();
+        let read = self.stdout.read_line(&mut line).await.unwrap();
+        assert!(read > 0, "server closed stdout before replying");
+        serde_json::from_str(&line).expect("valid JSON-RPC")
+    }
+
     async fn next_message(&mut self) -> Value {
         loop {
-            let mut line = String::new();
-            let read = self.stdout.read_line(&mut line).await.unwrap();
-            assert!(read > 0, "server closed stdout before replying");
-            let value: Value = serde_json::from_str(&line).expect("valid JSON-RPC");
+            let value = self.read_message().await;
             if value.get("method").and_then(Value::as_str) == Some("fs/read_text_file") {
                 self.write(json!({
                     "jsonrpc": "2.0",
@@ -148,8 +153,16 @@ impl Peer {
     }
 
     async fn write(&mut self, value: Value) {
-        let mut bytes = serde_json::to_vec(&value).unwrap();
-        bytes.push(b'\n');
+        self.write_together(&[value]).await;
+    }
+
+    /// Write messages in a single write, so the agent reads them together.
+    async fn write_together(&mut self, values: &[Value]) {
+        let mut bytes = Vec::new();
+        for value in values {
+            serde_json::to_writer(&mut bytes, value).unwrap();
+            bytes.push(b'\n');
+        }
         self.stdin.write_all(&bytes).await.unwrap();
         self.stdin.flush().await.unwrap();
     }
@@ -3159,6 +3172,352 @@ async fn v2_cancel_settles_foreground_work_to_idle_cancelled() {
 }
 
 #[tokio::test]
+async fn cancel_request_ends_an_in_flight_prompt_with_request_cancelled() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, server)) = mock_slow_deepseek_server().await else {
+        eprintln!("skipping request cancellation test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer_raw_initialize(&mut peer).await;
+    let cwd = temp.path().to_string_lossy().to_string();
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": cwd, "mcpServers": [], "additionalDirectories": []}),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+    let prompt_id = peer.next_id;
+    peer.next_id += 1;
+    peer.write(json!({
+        "jsonrpc": "2.0",
+        "id": prompt_id,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "keep going until cancelled"}]
+        }
+    }))
+    .await;
+    let cancel_request = json!({
+        "jsonrpc": "2.0",
+        "method": "$/cancel_request",
+        "params": {"requestId": prompt_id}
+    });
+
+    let mut cancellation_sent = false;
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let message = peer.next_message().await;
+            if message.get("id").and_then(Value::as_u64) == Some(prompt_id) {
+                return message;
+            }
+            if !cancellation_sent
+                && message["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+            {
+                peer.write(cancel_request.clone()).await;
+                cancellation_sent = true;
+            }
+            peer.updates.push(message);
+        }
+    })
+    .await
+    .expect("request cancellation should end the turn promptly");
+    assert!(cancellation_sent);
+    assert!(response.get("result").is_none(), "{response}");
+    assert_eq!(response["error"]["code"], -32800, "{response}");
+
+    // Cancelling the answered request again changes nothing, and the session
+    // takes the next prompt because the turn has ended. `request` fails on
+    // any other response to the cancelled prompt.
+    peer.write(cancel_request).await;
+    let status = peer
+        .request(
+            "session/prompt",
+            json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "/status"}]}),
+        )
+        .await;
+    assert_eq!(status["stopReason"], "end_turn");
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn cancel_request_withdraws_a_pending_permission_and_fails_its_tool_call() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, server)) = mock_sequence_server(vec![mock_tool_call_stream()]).await else {
+        eprintln!("skipping request cancellation test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer_raw_initialize(&mut peer).await;
+    let cwd = temp.path().to_string_lossy().to_string();
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": cwd, "mcpServers": [], "additionalDirectories": []}),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+    let prompt_id = peer.next_id;
+    peer.next_id += 1;
+    peer.write(json!({
+        "jsonrpc": "2.0",
+        "id": prompt_id,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "write the sample file"}]
+        }
+    }))
+    .await;
+
+    let mut permission_id = None;
+    let mut permission_cancelled = false;
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            // Leave the permission request unanswered until the agent
+            // withdraws it.
+            let message = peer.read_message().await;
+            match message.get("method").and_then(Value::as_str) {
+                Some("session/request_permission") => {
+                    permission_id = Some(message["id"].clone());
+                    peer.write(json!({
+                        "jsonrpc": "2.0",
+                        "method": "$/cancel_request",
+                        "params": {"requestId": prompt_id}
+                    }))
+                    .await;
+                }
+                Some("$/cancel_request") => {
+                    assert_eq!(
+                        Some(&message["params"]["requestId"]),
+                        permission_id.as_ref()
+                    );
+                    permission_cancelled = true;
+                    // Answer as a client that supports cancellation must.
+                    peer.write(json!({
+                        "jsonrpc": "2.0",
+                        "id": message["params"]["requestId"],
+                        "error": {"code": -32800, "message": "Request cancelled"}
+                    }))
+                    .await;
+                }
+                Some("session/update") => peer.updates.push(message),
+                _ if message.get("id").and_then(Value::as_u64) == Some(prompt_id) => {
+                    return message;
+                }
+                _ => panic!("unexpected message: {message}"),
+            }
+        }
+    })
+    .await
+    .expect("request cancellation should end the turn promptly");
+    assert!(permission_id.is_some());
+    assert!(permission_cancelled);
+    assert_eq!(response["error"]["code"], -32800, "{response}");
+    let finished = peer
+        .updates
+        .iter()
+        .map(|update| &update["params"]["update"])
+        .rfind(|update| update["toolCallId"] == "call-1")
+        .unwrap();
+    assert_eq!(finished["status"], "failed");
+    assert!(!temp.path().join("sample.txt").exists());
+
+    let status = peer
+        .request(
+            "session/prompt",
+            json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "/status"}]}),
+        )
+        .await;
+    assert_eq!(status["stopReason"], "end_turn");
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    assert_eq!(server.await.unwrap().len(), 1);
+
+    // The turn itself saved the failed outcome. Reading the record from disk
+    // matters: loading a session also marks unanswered tool calls failed, so
+    // replay would look the same if nothing had been saved.
+    let saved: Value = serde_json::from_slice(
+        &std::fs::read(
+            temp.path()
+                .join("sessions-data/sessions")
+                .join(format!("{session_id}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        saved["tool_outcomes"]["call-1"]["status"], "failed",
+        "{saved}"
+    );
+}
+
+#[tokio::test]
+async fn session_cancel_with_cancel_request_still_ends_the_prompt_cancelled() {
+    for cancel_request_first in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let Some((base_url, server)) = mock_slow_deepseek_server().await else {
+            eprintln!("skipping cancellation test: loopback networking is unavailable");
+            return;
+        };
+        let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+        peer_raw_initialize(&mut peer).await;
+        let cwd = temp.path().to_string_lossy().to_string();
+        let session = peer
+            .request(
+                "session/new",
+                json!({"cwd": cwd, "mcpServers": [], "additionalDirectories": []}),
+            )
+            .await;
+        let session_id = session["sessionId"].as_str().unwrap().to_string();
+        let prompt_id = peer.next_id;
+        peer.next_id += 1;
+        peer.write(json!({
+            "jsonrpc": "2.0",
+            "id": prompt_id,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "keep going until cancelled"}]
+            }
+        }))
+        .await;
+        let session_cancel = json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": {"sessionId": session_id}
+        });
+        let cancel_request = json!({
+            "jsonrpc": "2.0",
+            "method": "$/cancel_request",
+            "params": {"requestId": prompt_id}
+        });
+        let mut notifications = Some(if cancel_request_first {
+            [cancel_request, session_cancel]
+        } else {
+            [session_cancel, cancel_request]
+        });
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let message = peer.next_message().await;
+                if message.get("id").and_then(Value::as_u64) == Some(prompt_id) {
+                    return message;
+                }
+                if message["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+                    && let Some(notifications) = notifications.take()
+                {
+                    // One write, so the agent has read session/cancel before
+                    // the turn can answer.
+                    peer.write_together(&notifications).await;
+                }
+                peer.updates.push(message);
+            }
+        })
+        .await
+        .expect("cancellation should complete promptly");
+        assert!(notifications.is_none());
+        assert_eq!(
+            response["result"]["stopReason"], "cancelled",
+            "cancel_request_first={cancel_request_first}: {response}"
+        );
+
+        // `request` fails on any other response to the cancelled prompt.
+        let status = peer
+            .request(
+                "session/prompt",
+                json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "/status"}]}),
+            )
+            .await;
+        assert_eq!(status["stopReason"], "end_turn");
+
+        drop(peer.stdin);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn v2_cancel_request_after_acceptance_leaves_the_work_running() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, release, server)) = mock_gated_deepseek_server().await else {
+        eprintln!("skipping v2 request cancellation test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request(
+        "initialize",
+        json!({
+            "protocolVersion": 2,
+            "info": {"name": "v2-test-client", "version": "1.0.0"},
+            "capabilities": {}
+        }),
+    )
+    .await;
+    let cwd = temp.path().to_string_lossy().to_string();
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": cwd, "mcpServers": [], "additionalDirectories": []}),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+    let prompt_id = peer.next_id;
+    let accepted = peer
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "keep working"}]
+            }),
+        )
+        .await;
+    assert!(accepted["messageId"].is_string());
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !peer
+            .updates
+            .iter()
+            .any(|update| update["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+        {
+            let message = peer.next_message().await;
+            peer.updates.push(message);
+        }
+    })
+    .await
+    .expect("the model stream should start");
+
+    // ACP v2 answered the prompt at insertion, so cancelling that request
+    // cannot stop the work it started; only session/cancel does. The list
+    // round trip makes sure the notification was handled before the model
+    // is allowed to finish.
+    peer.write(json!({
+        "jsonrpc": "2.0",
+        "method": "$/cancel_request",
+        "params": {"requestId": prompt_id}
+    }))
+    .await;
+    peer.request("session/list", json!({"cwd": cwd})).await;
+    release.send(()).unwrap();
+    let idle = next_v2_idle(&mut peer).await;
+    assert_eq!(idle["params"]["update"]["stopReason"], "end_turn");
+    assert!(
+        peer.updates
+            .iter()
+            .all(|message| message.get("id").and_then(Value::as_u64) != Some(prompt_id))
+    );
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn v2_command_reports_agent_owned_terminal_output() {
     let temp = tempfile::tempdir().unwrap();
     let Some((base_url, server)) = mock_command_server().await else {
@@ -3514,6 +3873,46 @@ async fn mock_slow_deepseek_server() -> Option<(String, tokio::task::JoinHandle<
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     });
     Some((format!("http://{address}"), task))
+}
+
+/// Streams one chunk of an answer and finishes it only after `release` fires.
+async fn mock_gated_deepseek_server() -> Option<(
+    String,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let listener = loopback_listener().await?;
+    let address = listener.local_addr().unwrap();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let _ = read_http_json_body(&mut socket).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let first = format!(
+            "data: {}\n\n",
+            json!({"choices": [{"delta": {"content": "working"}}]})
+        );
+        socket
+            .write_all(format!("{:x}\r\n{first}\r\n", first.len()).as_bytes())
+            .await
+            .unwrap();
+        released.await.unwrap();
+        let rest = encode_sse(&[
+            json!({"choices": [{"delta": {"content": " done"}, "finish_reason": "stop"}]}),
+            json!({"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}}),
+        ]);
+        socket
+            .write_all(format!("{:x}\r\n{rest}\r\n0\r\n\r\n", rest.len()).as_bytes())
+            .await
+            .unwrap();
+        socket.shutdown().await.unwrap();
+    });
+    Some((format!("http://{address}"), release, task))
 }
 
 async fn mock_command_server() -> Option<(String, tokio::task::JoinHandle<Vec<Value>>)> {

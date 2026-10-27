@@ -53,6 +53,15 @@ active work stops the model stream and tool operations, emits final tool state,
 and settles to idle with the `cancelled` reason. Idle usage covers only that
 foreground turn; per-update usage continues to track the session total.
 
+An ACP v1 prompt turn runs outside the connection's ordered dispatch, so a
+`$/cancel_request` for the prompt reaches it while it runs. The notification
+cancels a child of the token `session/cancel` uses, so the turn stops the same
+way and the session token still shows whether `session/cancel` or a close
+reached the turn. A turn stopped by `$/cancel_request` alone answers the prompt
+with `-32800`; one that `session/cancel` also reached ends with
+`stopReason: "cancelled"`. Every other request is answered from the ordered
+dispatch, before a later `$/cancel_request` can be read.
+
 ## Replay
 
 Full replay rebuilds retained conversation entities in order. Tool calls retain

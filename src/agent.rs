@@ -968,20 +968,53 @@ impl Harness {
         let harness = self.clone();
         let prompt_connection = connection.clone();
         let active_prompt = runtime.state.lock().await.active_prompt.clone();
+        let request_cancellation = responder.cancellation();
         let spawn_result = connection.spawn(async move {
-            let result = harness
-                .run_prompt(
-                    runtime.clone(),
-                    request,
-                    prompt_connection,
-                    client_capabilities,
-                    cancellation,
-                )
-                .await;
+            // `$/cancel_request` stops the turn the way `session/cancel` does,
+            // so tool calls still get their final state and are saved. It
+            // cancels only this child token, so the session token still shows
+            // whether session/cancel or a close reached the turn.
+            let turn_cancellation = cancellation.child_token();
+            let turn = harness.run_prompt(
+                runtime.clone(),
+                request,
+                prompt_connection,
+                client_capabilities,
+                turn_cancellation.clone(),
+            );
+            tokio::pin!(turn);
+            let result = tokio::select! {
+                biased;
+                result = &mut turn => result,
+                () = request_cancellation.cancelled() => {
+                    turn_cancellation.cancel();
+                    turn.await
+                }
+            };
+            // A prompt that session/cancel reached must end with `cancelled`,
+            // which `$/cancel_request` accepts too. A turn stopped by
+            // `$/cancel_request` alone answers -32800, and once the request
+            // is cancelled no other error code is valid.
+            let cancelled_by_request = request_cancellation.is_cancelled();
+            let stopped_by_request = cancelled_by_request && !cancellation.is_cancelled();
             match result {
+                Ok(response)
+                    if stopped_by_request && response.stop_reason == StopReason::Cancelled =>
+                {
+                    responder.respond_with_error(Error::request_cancelled())
+                }
                 Ok(response) => responder.respond(response),
-                Err(error) if error.code == agent_client_protocol::ErrorCode::RequestCancelled => {
+                Err(error)
+                    if error.code == agent_client_protocol::ErrorCode::RequestCancelled
+                        && !stopped_by_request =>
+                {
                     responder.respond(PromptResponse::new(StopReason::Cancelled))
+                }
+                Err(error) if cancelled_by_request => {
+                    if error.code != agent_client_protocol::ErrorCode::RequestCancelled {
+                        tracing::warn!(?error, "cancelled prompt turn failed");
+                    }
+                    responder.respond_with_error(Error::request_cancelled())
                 }
                 Err(error) => responder.respond_with_error(error),
             }
