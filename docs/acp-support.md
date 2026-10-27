@@ -108,10 +108,11 @@ reported as `inactive` and fails when resumed.
 [Agent Authentication State Query RFD](https://agentclientprotocol.com/rfds/get-auth-state),
 which is still a Draft. `agent-client-protocol` 3.4 has no types for it, so
 the response and capability marker are written by hand and may change with the
-RFD. Both versions advertise it as `status: true` in the agent's auth
-capabilities: `agentCapabilities.auth.status` in v1 and
-`capabilities.auth.status` in v2. The RFD only shows the v1 form, so v2 uses
-the same boolean.
+RFD. Both versions advertise it with a `status` field in the agent's auth
+capabilities. v1 sends `agentCapabilities.auth.status: true`, the boolean in
+the RFD's example. The RFD shows only v1, so v2 sends
+`capabilities.auth.status: {}`, because v2 capability markers are objects
+(the client's `auth.terminal` capability is `true` in v1 and `{}` in v2).
 
 The request takes no parameters other than an optional `_meta`, and the
 result is `authenticated` plus a `message` for the user:

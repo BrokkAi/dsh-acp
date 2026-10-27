@@ -1164,19 +1164,22 @@ const AUTH_PROTOCOLS: [AuthProtocol; 2] = [
     },
 ];
 
-/// Initializes `peer` and checks that it advertises `auth/status` where the
-/// RFD puts the capability for this protocol version.
+/// Initializes `peer` and checks that its auth capabilities are exactly the
+/// existing ones plus the `auth/status` marker for this protocol version.
 async fn initialize_advertising_auth_status(peer: &mut Peer, protocol: &AuthProtocol) {
     let v = protocol.version;
-    let auth = if v == 1 {
+    let (auth, expected) = if v == 1 {
         let result = peer
             .request(
                 "initialize",
                 json!({"protocolVersion": 1, "clientCapabilities": {}}),
             )
             .await;
-        assert_eq!(result["agentCapabilities"]["auth"]["logout"], json!({}));
-        result["agentCapabilities"]["auth"].clone()
+        // The RFD's v1 example uses a boolean.
+        (
+            result["agentCapabilities"]["auth"].clone(),
+            json!({"logout": {}, "status": true}),
+        )
     } else {
         let result = peer
             .request(
@@ -1188,9 +1191,13 @@ async fn initialize_advertising_auth_status(peer: &mut Peer, protocol: &AuthProt
                 }),
             )
             .await;
-        result["capabilities"]["auth"].clone()
+        // v2 capability markers are objects, and v2 has no logout marker.
+        (
+            result["capabilities"]["auth"].clone(),
+            json!({"status": {}}),
+        )
     };
-    assert_eq!(auth["status"], true, "v{v}: auth.status capability");
+    assert_eq!(auth, expected, "v{v}: auth capabilities");
 }
 
 /// Asks for the auth state and checks that the answer leaks no credential.

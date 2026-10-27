@@ -341,7 +341,7 @@ impl V2Harness {
             response,
             &[
                 ("/capabilities/session", "status", json!({})),
-                ("/capabilities/auth", "status", json!(true)),
+                ("/capabilities/auth", "status", json!({})),
             ],
         ) {
             Ok(response) => responder.respond(response),
