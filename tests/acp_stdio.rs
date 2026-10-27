@@ -1837,7 +1837,7 @@ async fn plan_mode_allows_only_read_only_http_mcp_tools() {
             .iter()
             .any(|update| { update["params"]["update"]["rawOutput"]["reason"] == "plan_mode" })
     );
-    let mcp_requests = mcp_server.await.unwrap();
+    let mcp_requests = served_mcp_requests(mcp_server).await;
     assert_eq!(
         mcp_requests
             .iter()
@@ -1935,7 +1935,7 @@ async fn resume_and_load_connect_mcp_servers_after_a_cancel() {
     drop(peer.stdin);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
     model_server.abort();
-    let mcp_requests = mcp_server.await.unwrap();
+    let mcp_requests = served_mcp_requests(mcp_server).await;
     assert_eq!(
         mcp_requests
             .iter()
@@ -2029,7 +2029,7 @@ async fn v2_resume_connects_mcp_servers_after_a_cancel() {
     drop(peer.stdin);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
     model_server.abort();
-    let mcp_requests = mcp_server.await.unwrap();
+    let mcp_requests = served_mcp_requests(mcp_server).await;
     assert_eq!(
         mcp_requests
             .iter()
@@ -3167,6 +3167,15 @@ async fn mock_http_mcp_server(
         requests
     });
     Some((format!("http://{address}"), task))
+}
+
+/// Waits for the mock MCP server to serve every request it expects, so a
+/// miscount fails the test instead of hanging it.
+async fn served_mcp_requests(server: tokio::task::JoinHandle<Vec<Value>>) -> Vec<Value> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), server)
+        .await
+        .expect("mock MCP server saw fewer requests than expected")
+        .unwrap()
 }
 
 async fn loopback_listener() -> Option<TcpListener> {
