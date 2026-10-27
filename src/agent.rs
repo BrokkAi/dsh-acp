@@ -968,18 +968,42 @@ impl Harness {
         let harness = self.clone();
         let prompt_connection = connection.clone();
         let active_prompt = runtime.state.lock().await.active_prompt.clone();
+        let request_cancellation = responder.cancellation();
         let spawn_result = connection.spawn(async move {
-            let result = harness
-                .run_prompt(
-                    runtime.clone(),
-                    request,
-                    prompt_connection,
-                    client_capabilities,
-                    cancellation,
-                )
-                .await;
+            let turn = harness.run_prompt(
+                runtime.clone(),
+                request,
+                prompt_connection,
+                client_capabilities,
+                cancellation.clone(),
+            );
+            tokio::pin!(turn);
+            // `$/cancel_request` stops the turn the way `session/cancel` does,
+            // so tool calls still get their final state and are saved.
+            let result = tokio::select! {
+                biased;
+                result = &mut turn => result,
+                () = request_cancellation.cancelled() => {
+                    cancellation.cancel();
+                    turn.await
+                }
+            };
+            // Once the request is cancelled, its only valid error is -32800.
+            // A turn that finished first keeps its result.
+            let cancelled_by_request = request_cancellation.is_cancelled();
             match result {
+                Ok(response)
+                    if cancelled_by_request && response.stop_reason == StopReason::Cancelled =>
+                {
+                    responder.respond_with_error(Error::request_cancelled())
+                }
                 Ok(response) => responder.respond(response),
+                Err(error) if cancelled_by_request => {
+                    if error.code != agent_client_protocol::ErrorCode::RequestCancelled {
+                        tracing::warn!(?error, "cancelled prompt turn failed");
+                    }
+                    responder.respond_with_error(Error::request_cancelled())
+                }
                 Err(error) if error.code == agent_client_protocol::ErrorCode::RequestCancelled => {
                     responder.respond(PromptResponse::new(StopReason::Cancelled))
                 }

@@ -187,6 +187,7 @@ ACP v1 includes:
   `session/list`, `session/delete`, and `session/close`
 - `session/prompt`, `session/cancel`, `session/set_mode`, and
   `session/set_config_option`
+- `$/cancel_request` for an in-flight `session/prompt`, answered with `-32800`
 - `session/update` streaming for agent messages, thoughts, tool calls, tool
   progress/results, modes, config, session info, and token usage
 - Agent-to-client permission, filesystem, and terminal requests
