@@ -1882,24 +1882,10 @@ impl Harness {
                 Err(error) if error.code == agent_client_protocol::ErrorCode::RequestCancelled => {
                     return Err(error);
                 }
-                Err(error) => {
-                    // The reason is in `data`; the message only names the
-                    // JSON-RPC error, which does not tell the model what
-                    // to change.
-                    let reason = error
-                        .data
-                        .as_ref()
-                        .and_then(Value::as_str)
-                        .unwrap_or(&error.message)
-                        .to_string();
-                    (
-                        ToolResult {
-                            text: format!("Unable to request user input: {reason}"),
-                            raw: json!({"error": reason}),
-                        },
-                        false,
-                    )
-                }
+                Err(error) => (
+                    crate::tools::error_result("Unable to request user input", &error),
+                    false,
+                ),
             };
             send_tool_finished(access, session_id, call, &title, &result, success, None)?;
             return Ok(result);
@@ -1924,7 +1910,7 @@ impl Harness {
                     )
                 },
             )
-            .await?;
+            .await;
             let success = result_status(&result) == ToolOutcomeStatus::Completed;
             send_tool_finished(access, session_id, call, &title, &result, success, None)?;
             return Ok(result);
@@ -2550,7 +2536,9 @@ async fn ask_user(
     };
     let request = CreateElicitationRequest::new(mode, message);
     let response: Result<CreateElicitationResponse, Error> = tokio::select! {
-        _ = cancellation.cancelled() => Err(Error::request_cancelled()),
+        // The Client may already have accepted, so a URL elicitation's ID
+        // stays reserved, though never completable, until the session closes.
+        _ = cancellation.cancelled() => return Err(Error::request_cancelled()),
         response = access
             .connection
             .as_ref()

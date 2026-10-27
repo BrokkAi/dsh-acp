@@ -246,7 +246,10 @@ impl SessionStore {
 
     /// Claim `elicitation_id` for a URL elicitation the session is about to
     /// request. ACP requires each ID to be unique among the connection's
-    /// outstanding URL elicitations, so an ID still in use is refused.
+    /// outstanding URL elicitations, so an ID still in use is refused. A
+    /// request cancelled before its answer arrives is never settled: the
+    /// Client may already have accepted it, so its ID stays reserved, and can
+    /// never be completed, until the session closes.
     pub async fn reserve_url_elicitation(&self, session_id: &str, elicitation_id: &str) -> bool {
         match self
             .url_elicitations
@@ -267,7 +270,8 @@ impl SessionStore {
 
     /// Record the Client's answer to a reserved URL elicitation. An accepted
     /// one stays outstanding until the model reports it complete or the
-    /// session closes; any other answer, or a failed request, frees the ID.
+    /// session closes; any other answer, or an error instead of an answer,
+    /// frees the ID.
     pub async fn settle_url_elicitation(
         &self,
         session_id: &str,

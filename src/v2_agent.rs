@@ -1806,38 +1806,61 @@ impl V2Harness {
                     capabilities.supports_form() || capabilities.supports_url()
                 })
         {
+            // Validate and reserve first: a refused request never waits on the
+            // user, so it reports no `requires_action`.
+            let result = match self
+                .elicitation_request(session_id, call, &arguments, capabilities)
+                .await
             {
-                let state = runtime.state.lock().await;
-                state.requires_action.store(true, Ordering::Release);
-                send_update(
-                    connection,
-                    session_id,
-                    SessionUpdate::StateUpdate(StateUpdate::RequiresAction(
-                        RequiresActionStateUpdate::new(),
-                    )),
-                )?;
-            }
-            let result = self
-                .ask_user(
-                    connection,
-                    session_id,
-                    call,
-                    &arguments,
-                    capabilities,
-                    cancellation,
-                )
-                .await;
-            {
-                let state = runtime.state.lock().await;
-                state.requires_action.store(false, Ordering::Release);
-                send_update(
-                    connection,
-                    session_id,
-                    SessionUpdate::StateUpdate(StateUpdate::Running(RunningStateUpdate::new())),
-                )?;
-            }
-            let result = result?;
-            send_tool_result(connection, session_id, call, &result, true)?;
+                Ok((request, url_elicitation_id)) => {
+                    {
+                        let state = runtime.state.lock().await;
+                        state.requires_action.store(true, Ordering::Release);
+                        send_update(
+                            connection,
+                            session_id,
+                            SessionUpdate::StateUpdate(StateUpdate::RequiresAction(
+                                RequiresActionStateUpdate::new(),
+                            )),
+                        )?;
+                    }
+                    let result = self
+                        .ask_user(
+                            connection,
+                            session_id,
+                            request,
+                            url_elicitation_id.as_deref(),
+                            cancellation,
+                        )
+                        .await;
+                    {
+                        let state = runtime.state.lock().await;
+                        state.requires_action.store(false, Ordering::Release);
+                        send_update(
+                            connection,
+                            session_id,
+                            SessionUpdate::StateUpdate(StateUpdate::Running(
+                                RunningStateUpdate::new(),
+                            )),
+                        )?;
+                    }
+                    result
+                }
+                Err(error) => Err(error),
+            };
+            // Like other tool failures, a refused or failed request tells the
+            // model why and the turn goes on; only cancellation ends it.
+            let (result, success) = match result {
+                Ok(result) => (result, true),
+                Err(error) if error.code == agent_client_protocol::ErrorCode::RequestCancelled => {
+                    return Err(error);
+                }
+                Err(error) => (
+                    crate::tools::error_result("Unable to request user input", &error),
+                    false,
+                ),
+            };
+            send_tool_result(connection, session_id, call, &result, success)?;
             return Ok(result);
         }
         // Only a protocol notification to the Client: it needs no permission,
@@ -1852,7 +1875,7 @@ impl V2Harness {
                         .send_notification(v2::CompleteElicitationNotification::new(elicitation_id))
                 },
             )
-            .await?;
+            .await;
             let success = result_status(&result) == ToolOutcomeStatus::Completed;
             send_tool_result(connection, session_id, call, &result, success)?;
             return Ok(result);
@@ -2011,15 +2034,15 @@ impl V2Harness {
         Ok(result)
     }
 
-    async fn ask_user(
+    /// Validate an `ask_user` call and build its request, reserving a URL
+    /// elicitation's ID. Returns that ID with the request.
+    async fn elicitation_request(
         &self,
-        connection: &V2ConnectionTo<Client>,
         session_id: &v2::SessionId,
         call: &crate::model::ToolCall,
         arguments: &Value,
         capabilities: &v2::ClientCapabilities,
-        cancellation: &CancellationToken,
-    ) -> Result<ToolResult, Error> {
+    ) -> Result<(v2::CreateElicitationRequest, Option<String>), Error> {
         let message = arguments
             .get("message")
             .and_then(Value::as_str)
@@ -2080,12 +2103,28 @@ impl V2Harness {
                 .string("response", true);
             v2::ElicitationMode::Form(v2::ElicitationFormMode::new(scope, schema))
         };
-        let request = v2::CreateElicitationRequest::new(mode, message);
+        Ok((
+            v2::CreateElicitationRequest::new(mode, message),
+            url_elicitation_id,
+        ))
+    }
+
+    async fn ask_user(
+        &self,
+        connection: &V2ConnectionTo<Client>,
+        session_id: &v2::SessionId,
+        request: v2::CreateElicitationRequest,
+        url_elicitation_id: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<ToolResult, Error> {
         let response: Result<v2::CreateElicitationResponse, Error> = tokio::select! {
-            _ = cancellation.cancelled() => Err(Error::request_cancelled()),
+            // The Client may already have accepted, so a URL elicitation's ID
+            // stays reserved, though never completable, until the session
+            // closes.
+            _ = cancellation.cancelled() => return Err(Error::request_cancelled()),
             response = connection.send_request(request).block_task() => response,
         };
-        if let Some(elicitation_id) = &url_elicitation_id {
+        if let Some(elicitation_id) = url_elicitation_id {
             let accepted = response
                 .as_ref()
                 .is_ok_and(|response| matches!(response.action, v2::ElicitationAction::Accept(_)));
@@ -2099,7 +2138,7 @@ impl V2Harness {
                 // Consent, not completion. What the user enters out of band
                 // must stay out of the model's context, so URL content is not
                 // read.
-                if let Some(elicitation_id) = &url_elicitation_id {
+                if let Some(elicitation_id) = url_elicitation_id {
                     return Ok(crate::tools::url_elicitation_accepted(elicitation_id));
                 }
                 ToolResult {

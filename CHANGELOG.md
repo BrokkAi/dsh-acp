@@ -120,11 +120,16 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   set with `providers/set` is still used in its place.
 - `ask_user` sent a model-chosen URL `elicitation_id` again even while an
   earlier request with that ID was still outstanding, which ACP forbids. It now
-  refuses the request with an error that says to omit the ID so one is
-  generated.
-- In ACP v1, an `ask_user` request that could not be sent told the model only
-  the JSON-RPC error name, such as "Invalid params". It now gives the reason,
-  for example that the URL must use HTTPS.
+  fails the tool call and tells the model to omit the ID so one is generated.
+  An ID whose request was cancelled before the Client answered stays reserved
+  until the session closes, because the Client may already have accepted it.
+- An `ask_user` request that could not be sent, or that the Client answered
+  with an error, did not tell the model why. In ACP v1 the model saw only the
+  JSON-RPC error name, such as "Invalid params". In ACP v2 the whole turn ended
+  with stop reason `error`, and the model saw only "Tool call failed before
+  completion." Both versions now fail just that tool call with the reason, for
+  example that the URL must use HTTPS, and the turn continues. In ACP v2, a
+  request refused before it is sent no longer reports `requires_action`.
 
 ## 0.4.0 - 2026-10-25
 

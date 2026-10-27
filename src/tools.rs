@@ -404,7 +404,7 @@ pub fn ask_user_definition() -> Value {
             "properties": {
                 "message": {"type": "string", "description": "The question to show the user."},
                 "url": {"type": "string", "description": "Optional HTTPS URL for an out-of-band interaction."},
-                "elicitation_id": {"type": "string", "description": "Stable identifier for a URL interaction. Generated when omitted. Must differ from every URL interaction that has not been reported complete."}
+                "elicitation_id": {"type": "string", "description": "Optional identifier for a URL interaction; omit it to have one generated. An ID still in use by a URL interaction that was not reported complete is refused."}
             },
             "required": ["message"],
             "additionalProperties": false
@@ -442,6 +442,22 @@ pub fn url_elicitation_accepted(elicitation_id: &str) -> ToolResult {
     }
 }
 
+/// A failed tool result for `error`, with the reason from its `data`. The
+/// message alone only names the JSON-RPC error, which does not tell the model
+/// what to change.
+pub fn error_result(context: &str, error: &agent_client_protocol::Error) -> ToolResult {
+    let reason = error
+        .data
+        .as_ref()
+        .and_then(Value::as_str)
+        .unwrap_or(&error.message)
+        .to_string();
+    ToolResult {
+        text: format!("{context}: {reason}"),
+        raw: json!({"error": reason}),
+    }
+}
+
 /// Run `complete_url_elicitation`: take the session's accepted URL
 /// elicitation with the given ID and `send` its `elicitation/complete`. An ID
 /// that is unknown, already completed, or another session's fails the call
@@ -451,18 +467,18 @@ pub async fn complete_url_elicitation(
     session_id: &str,
     arguments: &Value,
     send: impl FnOnce(String) -> Result<(), agent_client_protocol::Error>,
-) -> Result<ToolResult, agent_client_protocol::Error> {
+) -> ToolResult {
     let Some(elicitation_id) = arguments.get("elicitation_id").and_then(Value::as_str) else {
-        return Ok(ToolResult {
+        return ToolResult {
             text: "complete_url_elicitation requires an elicitation_id.".to_string(),
             raw: json!({"error": "missing elicitation_id"}),
-        });
+        };
     };
     if !store
         .complete_url_elicitation(session_id, elicitation_id)
         .await
     {
-        return Ok(ToolResult {
+        return ToolResult {
             text: format!(
                 "No accepted URL elicitation {elicitation_id} is awaiting completion in this session. Nothing was reported to the client."
             ),
@@ -470,13 +486,15 @@ pub async fn complete_url_elicitation(
                 "error": "no pending URL elicitation",
                 "elicitation_id": elicitation_id
             }),
-        });
+        };
     }
-    send(elicitation_id.to_string())?;
-    Ok(ToolResult {
+    if let Err(error) = send(elicitation_id.to_string()) {
+        return error_result("Unable to report the URL elicitation complete", &error);
+    }
+    ToolResult {
         text: format!("Reported URL elicitation {elicitation_id} complete to the client."),
         raw: json!({"elicitation_id": elicitation_id, "completed": true}),
-    })
+    }
 }
 
 pub fn permission_required(name: &str) -> bool {

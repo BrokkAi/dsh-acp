@@ -241,7 +241,10 @@ for client-provided tools.
 `ask_user` sends a session-scoped `elicitation/create` tied to its tool call.
 It uses form mode, or URL mode when the model passes a URL and the Client
 advertises URL elicitation. A URL must use HTTPS outside localhost and must not
-embed credentials.
+embed credentials. In both versions, a request refused before it is sent, or
+answered with an error, fails that tool call with the reason and the turn
+continues; only cancellation ends the turn. ACP v2 reports `requires_action`
+only once the request has been sent.
 
 Accepting a URL elicitation means only that the user consented to open the
 URL. The harness has no callback that observes the external interaction, so the
@@ -256,10 +259,14 @@ another session fails the tool call and sends nothing.
 
 Each `elicitationId` is unique among the connection's outstanding URL
 elicitations, so `ask_user` refuses a model-chosen ID that is still
-outstanding. Accepted IDs are held in memory for the connection and never
-written to disk. They survive cancellation, later turns, and `session/load` or
-`session/resume` on the same connection, because the external interaction may
-still finish. They are dropped without a completion when the session is closed
-or deleted, or when the process exits. Replay does not resend
+outstanding: the tool call fails and tells the model to omit the ID so one is
+generated. Accepted IDs are held in memory for the connection and never
+written to disk. They survive `session/cancel`, later turns, and `session/load`
+or `session/resume` on the same connection, because the external interaction
+may still finish. If a turn is cancelled while its `elicitation/create` is
+still unanswered, the Client may already have accepted it, so the ID stays
+reserved, but can never be completed, until the session is closed or deleted.
+Pending and reserved IDs are dropped without a completion when the session is
+closed or deleted, or when the process exits. Replay does not resend
 `elicitation/complete`, and a fork does not inherit the source session's
 pending IDs.
