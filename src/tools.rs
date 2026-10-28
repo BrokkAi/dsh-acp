@@ -442,14 +442,16 @@ pub fn url_elicitation_accepted(elicitation_id: &str) -> ToolResult {
     }
 }
 
-/// Why `error` failed: its `data` as text when it is a string, otherwise
-/// compact JSON. The message alone only names the JSON-RPC error, which does
-/// not tell the model what to change, so it is used only without `data`.
+/// Why `error` failed. A string `data` is the reason. A message that only
+/// names the JSON-RPC error does not tell the model what to change, so under
+/// one, other `data` is shown as compact JSON; a message written for this
+/// failure already explains it and is kept.
 pub fn error_reason(error: &agent_client_protocol::Error) -> String {
+    let generic = error.message == agent_client_protocol::Error::from(error.code).message;
     match &error.data {
-        Some(Value::String(reason)) => reason.clone(),
-        Some(Value::Null) | None => error.message.clone(),
-        Some(data) => data.to_string(),
+        Some(Value::String(reason)) if !reason.trim().is_empty() => reason.clone(),
+        Some(data) if generic && !data.is_null() && !data.is_string() => data.to_string(),
+        _ => error.message.clone(),
     }
 }
 
@@ -1643,6 +1645,13 @@ mod tests {
             error_reason(&Error::invalid_params().data(Value::Null)),
             "Invalid params"
         );
+        assert_eq!(
+            error_reason(&Error::invalid_params().data(" ")),
+            "Invalid params"
+        );
+        let mut explained = Error::internal_error().data(json!({"resultType": "input_required"}));
+        explained.message = "MCP server asked for more input".to_string();
+        assert_eq!(error_reason(&explained), "MCP server asked for more input");
     }
 
     #[test]

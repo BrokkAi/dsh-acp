@@ -6814,12 +6814,10 @@ async fn an_mcp_over_acp_call_that_needs_more_input_fails_without_a_retry() {
 
         let requests = model_server.await.unwrap();
         let results = tool_results(&requests[1]);
-        assert!(
-            // v1 shows the data and v2 the message until #60 makes them agree.
-            results[0].starts_with("MCP tool failed")
-                && (results[0].contains("input_required")
-                    || results[0].contains("asked for more input")),
-            "v{version}: {results:?}"
+        assert_eq!(
+            results[0],
+            "MCP tool failed: MCP server asked for more input, which dsh-acp does not support",
+            "v{version}"
         );
 
         drop(peer.stdin);
