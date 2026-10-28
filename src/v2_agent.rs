@@ -2022,10 +2022,7 @@ impl V2Harness {
                     text: crate::mcp::mcp_result_text(&value),
                     raw: value,
                 },
-                Err(error) => ToolResult {
-                    text: format!("MCP tool failed: {}", error.message),
-                    raw: json!({"error": error.message}),
-                },
+                Err(error) => crate::tools::error_result("MCP tool failed", &error),
             }
         } else {
             match crate::tools::execute(
@@ -2039,10 +2036,7 @@ impl V2Harness {
             .await
             {
                 Ok(result) => result,
-                Err(error) => ToolResult {
-                    text: format!("Tool failed: {}", error.message),
-                    raw: json!({"error": error.message}),
-                },
+                Err(error) => crate::tools::error_result("Tool failed", &error),
             }
         };
         if call.function.name == "run_command" {

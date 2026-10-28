@@ -442,16 +442,22 @@ pub fn url_elicitation_accepted(elicitation_id: &str) -> ToolResult {
     }
 }
 
-/// A failed tool result for `error`, with the reason from its `data`. The
-/// message alone only names the JSON-RPC error, which does not tell the model
-/// what to change.
+/// Why `error` failed. A string `data` is the reason. A message that only
+/// names the JSON-RPC error does not tell the model what to change, so under
+/// one, other `data` is shown as compact JSON; a message written for this
+/// failure already explains it and is kept.
+pub fn error_reason(error: &agent_client_protocol::Error) -> String {
+    let generic = error.message == agent_client_protocol::Error::from(error.code).message;
+    match &error.data {
+        Some(Value::String(reason)) if !reason.trim().is_empty() => reason.clone(),
+        Some(data) if generic && !data.is_null() && !data.is_string() => data.to_string(),
+        _ => error.message.clone(),
+    }
+}
+
+/// A failed tool result for `error`, with the reason from [`error_reason`].
 pub fn error_result(context: &str, error: &agent_client_protocol::Error) -> ToolResult {
-    let reason = error
-        .data
-        .as_ref()
-        .and_then(Value::as_str)
-        .unwrap_or(&error.message)
-        .to_string();
+    let reason = error_reason(error);
     ToolResult {
         text: format!("{context}: {reason}"),
         raw: json!({"error": reason}),
@@ -480,13 +486,9 @@ pub fn ask_user_failed(error: &agent_client_protocol::Error) -> ToolResult {
 /// the turn's own cancellation ends the turn.
 pub fn permission_request_failed(error: &agent_client_protocol::Error) -> ToolResult {
     let reason = if error.code == agent_client_protocol::ErrorCode::RequestCancelled {
-        "the client cancelled the permission request"
+        "the client cancelled the permission request".to_string()
     } else {
-        error
-            .data
-            .as_ref()
-            .and_then(Value::as_str)
-            .unwrap_or(&error.message)
+        error_reason(error)
     };
     ToolResult {
         text: format!("Permission was not granted, so the tool call did not run: {reason}"),
@@ -1626,6 +1628,31 @@ fn lexical_path(cwd: &Path, path: &str) -> PathBuf {
 mod tests {
     use super::*;
     use crate::config::ReasoningEffort;
+
+    #[test]
+    fn error_reason_prefers_data_over_the_error_name() {
+        use agent_client_protocol::Error;
+        assert_eq!(
+            error_reason(&Error::invalid_params().data("missing path")),
+            "missing path"
+        );
+        assert_eq!(
+            error_reason(&Error::internal_error().data(json!({"status": 502}))),
+            r#"{"status":502}"#
+        );
+        assert_eq!(error_reason(&Error::invalid_params()), "Invalid params");
+        assert_eq!(
+            error_reason(&Error::invalid_params().data(Value::Null)),
+            "Invalid params"
+        );
+        assert_eq!(
+            error_reason(&Error::invalid_params().data(" ")),
+            "Invalid params"
+        );
+        let mut explained = Error::internal_error().data(json!({"resultType": "input_required"}));
+        explained.message = "MCP server asked for more input".to_string();
+        assert_eq!(error_reason(&explained), "MCP server asked for more input");
+    }
 
     #[test]
     fn html_conversion_removes_scripts_and_tags() {

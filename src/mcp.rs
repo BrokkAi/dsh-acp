@@ -197,7 +197,7 @@ impl McpSession {
                     failures.push(format!(
                         "MCP server `{}` could not list its tools: {}",
                         client.name(),
-                        error_detail(&error)
+                        crate::tools::error_reason(&error)
                     ));
                 }
             }
@@ -282,16 +282,6 @@ fn registration_unavailable(error: &Error) -> bool {
         .and_then(|data| data.pointer("/acpError/code"))
         .and_then(Value::as_i64)
         == Some(i64::from(MCP_SERVER_UNAVAILABLE))
-}
-
-/// What went wrong, for a message that names the server. Stdio and HTTP
-/// failures carry their detail in `data`, under a generic message.
-fn error_detail(error: &Error) -> String {
-    match &error.data {
-        Some(Value::String(detail)) => detail.clone(),
-        Some(data) if error.message == Error::internal_error().message => data.to_string(),
-        _ => error.message.clone(),
-    }
 }
 
 /// A `serverId` names one registration, so declaring it twice for a session
@@ -1002,7 +992,7 @@ impl HttpTransport {
 
         let response = tokio::select! {
             _ = cancellation.cancelled() => return Err(Error::request_cancelled()),
-            response = request.send() => response.map_err(Error::into_internal_error)?,
+            response = request.send() => response.map_err(http_error)?,
         };
         if let Some(session_id) = response
             .headers()
@@ -1016,7 +1006,7 @@ impl HttpTransport {
             let text = response.text().await.unwrap_or_default();
             return Err(Error::internal_error().data(json!({
                 "status": status.as_u16(),
-                "message": text
+                "message": truncate_body(&text)
             })));
         }
         if body.get("id").is_none() {
@@ -1033,10 +1023,44 @@ impl HttpTransport {
         } else {
             tokio::select! {
                 _ = cancellation.cancelled() => Err(Error::request_cancelled()),
-                response = response.json::<Value>() => response.map_err(Error::into_internal_error),
+                response = response.json::<Value>() => response.map_err(http_error),
             }
         }
     }
+}
+
+/// A failed HTTP exchange with an MCP server, with its causes, which
+/// reqwest's own message omits ("error sending request" without "Connection
+/// refused"). The URL is left out: it can carry credentials, and this detail
+/// reaches the model when a tool call fails.
+fn http_error(error: reqwest::Error) -> Error {
+    let error = error.without_url();
+    let mut message = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !message.contains(&cause_text) {
+            message.push_str(": ");
+            message.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    Error::internal_error().data(message)
+}
+
+/// The most of an error response body kept for the model. A proxy's error
+/// page can be large, and only its start says what went wrong.
+const ERROR_BODY_BYTES: usize = 2048;
+
+fn truncate_body(body: &str) -> String {
+    if body.len() <= ERROR_BODY_BYTES {
+        return body.to_string();
+    }
+    let mut boundary = ERROR_BODY_BYTES;
+    while !body.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    format!("{}[...truncated...]", &body[..boundary])
 }
 
 async fn read_mcp_sse_response(
@@ -1055,7 +1079,7 @@ async fn read_mcp_sse_response(
         let Some(chunk) = next else {
             break;
         };
-        let chunk = chunk.map_err(Error::into_internal_error)?;
+        let chunk = chunk.map_err(http_error)?;
         buffer.extend_from_slice(&chunk);
         while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
             let raw = buffer.drain(..=newline).collect::<Vec<_>>();
@@ -1101,6 +1125,26 @@ fn extract_mcp_response(value: Value) -> Result<Value, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn http_errors_keep_their_cause_and_drop_the_url() {
+        // Nothing listens on the discard port, so the connection is refused.
+        let error = reqwest::get("http://user:secret@127.0.0.1:9/mcp?token=secret")
+            .await
+            .unwrap_err();
+        let reason = crate::tools::error_reason(&http_error(error));
+        assert!(!reason.contains("secret"), "{reason}");
+        assert_ne!(reason, "error sending request", "{reason}");
+    }
+
+    #[test]
+    fn error_bodies_are_cut_on_a_char_boundary() {
+        assert_eq!(truncate_body("short"), "short");
+        let body = "é".repeat(ERROR_BODY_BYTES);
+        let truncated = truncate_body(&body);
+        assert!(truncated.ends_with("[...truncated...]"));
+        assert!(truncated.len() <= ERROR_BODY_BYTES + "[...truncated...]".len());
+    }
 
     #[test]
     fn tool_names_are_protocol_safe_and_deterministic() {

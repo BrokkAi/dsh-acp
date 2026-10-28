@@ -5797,6 +5797,64 @@ async fn an_mcp_tool_call_without_mcp_servers_fails_only_that_call() {
 }
 
 #[tokio::test]
+async fn failed_tool_calls_tell_the_model_and_client_the_reason() {
+    // Each failure's JSON-RPC message names only its code ("Invalid
+    // params"); the reason is in its data.
+    let failures = [
+        ("call-unknown", "Tool failed: unknown built-in tool: bogus"),
+        (
+            "call-bad-plan",
+            "Unable to update plan: plan entry requires content",
+        ),
+        ("call-mcp", "MCP tool failed: unknown MCP tool"),
+    ];
+    for version in [1, 2] {
+        let temp = tempfile::tempdir().unwrap();
+        let Some((base_url, server)) = mock_sequence_server(vec![
+            tool_call_stream("call-unknown", "bogus", json!({})),
+            tool_call_stream(
+                "call-bad-plan",
+                "update_plan",
+                json!({"entries": [{"step": "Read the code", "status": "pending"}]}),
+            ),
+            mock_named_tool_call_stream("mcp__absent__lookup"),
+            mock_text_stream(),
+        ])
+        .await
+        else {
+            eprintln!("skipping failed tool reason test: loopback networking is unavailable");
+            return;
+        };
+        let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+        let stop_reason = if version == 1 {
+            peer_raw_initialize(&mut peer).await;
+            peer_prompt(&mut peer, temp.path(), "Try the tools").await["stopReason"].clone()
+        } else {
+            v2_prompt_until_idle(&mut peer, temp.path(), "Try the tools").await["params"]["update"]
+                ["stopReason"]
+                .clone()
+        };
+        assert_eq!(stop_reason, "end_turn", "v{version}");
+        for (call, text) in failures {
+            let finished = final_tool_update(&peer, call);
+            assert_eq!(finished["status"], "failed", "v{version}: {finished}");
+            assert!(
+                finished.to_string().contains(text),
+                "v{version}: {finished}"
+            );
+        }
+
+        drop(peer.stdin);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 4, "v{version}");
+        for (index, (call, text)) in failures.into_iter().enumerate() {
+            assert_eq!(tool_message(&requests[index + 1], call), text, "v{version}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn v2_steering_prompt_is_consumed_before_idle() {
     let temp = tempfile::tempdir().unwrap();
     let Some((base_url, server)) = mock_steering_server().await else {
@@ -6756,12 +6814,10 @@ async fn an_mcp_over_acp_call_that_needs_more_input_fails_without_a_retry() {
 
         let requests = model_server.await.unwrap();
         let results = tool_results(&requests[1]);
-        assert!(
-            // v1 shows the data and v2 the message until #60 makes them agree.
-            results[0].starts_with("MCP tool failed")
-                && (results[0].contains("input_required")
-                    || results[0].contains("asked for more input")),
-            "v{version}: {results:?}"
+        assert_eq!(
+            results[0],
+            "MCP tool failed: MCP server asked for more input, which dsh-acp does not support",
+            "v{version}"
         );
 
         drop(peer.stdin);
