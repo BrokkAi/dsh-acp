@@ -1931,10 +1931,7 @@ impl Harness {
             let plan = match parse_plan(&arguments) {
                 Ok(plan) => plan,
                 Err(error) => {
-                    let result = ToolResult {
-                        text: format!("Unable to update plan: {}", error.message),
-                        raw: json!({"error": error.message}),
-                    };
+                    let result = crate::tools::error_result("Unable to update plan", &error);
                     send_tool_finished(access, session_id, call, &title, &result, false, None)?;
                     return Ok(result);
                 }
@@ -2105,16 +2102,7 @@ impl Harness {
                 Err(error) if error.code == agent_client_protocol::ErrorCode::RequestCancelled => {
                     return Err(error);
                 }
-                Err(error) => {
-                    let message = error.message.clone();
-                    ToolResult {
-                        text: format!(
-                            "MCP tool failed: {}",
-                            error.data.unwrap_or_else(|| Value::String(message.clone()))
-                        ),
-                        raw: json!({"error": message}),
-                    }
-                }
+                Err(error) => crate::tools::error_result("MCP tool failed", &error),
             }
         } else {
             match execute_tool(
@@ -2131,16 +2119,7 @@ impl Harness {
                 Err(error) if error.code == agent_client_protocol::ErrorCode::RequestCancelled => {
                     return Err(error);
                 }
-                Err(error) => {
-                    let message = error.message.clone();
-                    ToolResult {
-                        text: format!(
-                            "Tool failed: {}",
-                            error.data.unwrap_or_else(|| Value::String(message.clone()))
-                        ),
-                        raw: json!({"error": message}),
-                    }
-                }
+                Err(error) => crate::tools::error_result("Tool failed", &error),
             }
         };
         let success = result.raw.get("error").is_none()

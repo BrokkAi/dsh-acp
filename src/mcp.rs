@@ -1002,7 +1002,7 @@ impl HttpTransport {
 
         let response = tokio::select! {
             _ = cancellation.cancelled() => return Err(Error::request_cancelled()),
-            response = request.send() => response.map_err(Error::into_internal_error)?,
+            response = request.send() => response.map_err(http_error)?,
         };
         if let Some(session_id) = response
             .headers()
@@ -1033,10 +1033,16 @@ impl HttpTransport {
         } else {
             tokio::select! {
                 _ = cancellation.cancelled() => Err(Error::request_cancelled()),
-                response = response.json::<Value>() => response.map_err(Error::into_internal_error),
+                response = response.json::<Value>() => response.map_err(http_error),
             }
         }
     }
+}
+
+/// A failed HTTP exchange with an MCP server. The URL is left out: it can
+/// carry credentials, and this detail reaches the model when a tool call fails.
+fn http_error(error: reqwest::Error) -> Error {
+    Error::into_internal_error(error.without_url())
 }
 
 async fn read_mcp_sse_response(
@@ -1055,7 +1061,7 @@ async fn read_mcp_sse_response(
         let Some(chunk) = next else {
             break;
         };
-        let chunk = chunk.map_err(Error::into_internal_error)?;
+        let chunk = chunk.map_err(http_error)?;
         buffer.extend_from_slice(&chunk);
         while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
             let raw = buffer.drain(..=newline).collect::<Vec<_>>();
