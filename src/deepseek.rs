@@ -223,14 +223,17 @@ impl DeepSeekClient {
         let status = response.status();
         if !status.is_success() {
             let retry_after = retry_after(&response);
-            let body = tokio::select! {
-                _ = cancellation.cancelled() => return Err(AttemptFailure::permanent(Error::request_cancelled())),
-                body = response.text() => body,
+            let body = match read_provider_prefix(response, PROVIDER_MAX_ERROR_BYTES, cancellation)
+                .await
+            {
+                Ok(body) => body,
+                Err(_) if cancellation.is_cancelled() => {
+                    return Err(AttemptFailure::permanent(Error::request_cancelled()));
+                }
+                Err(_) => Vec::new(),
             };
-            let detail = body
-                .ok()
-                .map(|body| extract_api_error(&body).unwrap_or(body))
-                .unwrap_or_default();
+            let body = String::from_utf8_lossy(&body);
+            let detail = extract_api_error(&body).unwrap_or_else(|| body.into_owned());
             let message = format!("DeepSeek API returned HTTP {status}: {detail}");
             return Err(
                 if status == reqwest::StatusCode::UNAUTHORIZED
@@ -271,10 +274,13 @@ impl DeepSeekClient {
             .to_ascii_lowercase();
 
         if content_type.contains("application/json") {
-            let bytes = tokio::select! {
-                _ = cancellation.cancelled() => return Err(AttemptFailure::permanent(Error::request_cancelled())),
-                body = response.bytes() => body.map_err(|error| AttemptFailure::transient(http_error(error)))?,
-            };
+            let bytes = read_provider_body(
+                response,
+                PROVIDER_MAX_JSON_BYTES,
+                cancellation,
+                "DeepSeek JSON response",
+            )
+            .await?;
             let mut completion = Completion::default();
             ingest_json_response(&bytes, &mut completion, on_event)
                 .map_err(AttemptFailure::permanent)?;
@@ -287,6 +293,7 @@ impl DeepSeekClient {
         let mut pending_data = String::new();
         let mut saw_data = false;
         let mut saw_done = false;
+        let mut streamed_bytes = 0usize;
 
         loop {
             let next = tokio::select! {
@@ -297,6 +304,21 @@ impl DeepSeekClient {
                 break;
             };
             let chunk = chunk.map_err(|error| AttemptFailure::transient(http_error(error)))?;
+            streamed_bytes = streamed_bytes.saturating_add(chunk.len());
+            if streamed_bytes > PROVIDER_MAX_STREAM_BYTES {
+                return Err(AttemptFailure::permanent(Error::internal_error().data(
+                    format!(
+                        "DeepSeek response exceeded the {PROVIDER_MAX_STREAM_BYTES}-byte stream limit"
+                    ),
+                )));
+            }
+            if byte_buffer.len().saturating_add(chunk.len()) > PROVIDER_MAX_EVENT_BYTES {
+                return Err(AttemptFailure::permanent(Error::internal_error().data(
+                    format!(
+                        "DeepSeek SSE input exceeded the {PROVIDER_MAX_EVENT_BYTES}-byte event limit"
+                    ),
+                )));
+            }
             byte_buffer.extend_from_slice(&chunk);
 
             while let Some(newline) = byte_buffer.iter().position(|byte| *byte == b'\n') {
@@ -322,6 +344,17 @@ impl DeepSeekClient {
                         continue;
                     }
                     saw_data = true;
+                    if pending_data
+                        .len()
+                        .saturating_add(data.len() + usize::from(!pending_data.is_empty()))
+                        > PROVIDER_MAX_EVENT_BYTES
+                    {
+                        return Err(AttemptFailure::permanent(Error::internal_error().data(
+                            format!(
+                                "DeepSeek SSE event exceeded the {PROVIDER_MAX_EVENT_BYTES}-byte limit"
+                            ),
+                        )));
+                    }
                     if pending_data.is_empty() {
                         pending_data.push_str(data);
                     } else {
@@ -338,6 +371,13 @@ impl DeepSeekClient {
         } else if !saw_data && !byte_buffer.is_empty() {
             // Some compatible gateways label a single JSON response as an SSE
             // stream. Accept it rather than losing an otherwise valid response.
+            if byte_buffer.len() > PROVIDER_MAX_JSON_BYTES {
+                return Err(AttemptFailure::permanent(Error::internal_error().data(
+                    format!(
+                        "DeepSeek JSON response exceeded the {PROVIDER_MAX_JSON_BYTES}-byte limit"
+                    ),
+                )));
+            }
             ingest_json_response(&byte_buffer, &mut completion, on_event)
                 .map_err(AttemptFailure::permanent)?;
             return ensure_not_empty(completion);
@@ -363,6 +403,73 @@ impl DeepSeekClient {
 
 /// How many times one completion may be requested before giving up.
 const MAX_ATTEMPTS: u32 = 3;
+const PROVIDER_MAX_ERROR_BYTES: usize = 64 * 1024;
+const PROVIDER_MAX_JSON_BYTES: usize = 16 * 1024 * 1024;
+const PROVIDER_MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
+const PROVIDER_MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
+const PROVIDER_MAX_TOOL_CALLS: usize = 128;
+
+async fn read_provider_body(
+    response: reqwest::Response,
+    limit: usize,
+    cancellation: &CancellationToken,
+    label: &str,
+) -> Result<Vec<u8>, AttemptFailure> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(AttemptFailure::permanent(
+            Error::internal_error().data(format!("{label} exceeded the {limit}-byte limit")),
+        ));
+    }
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::with_capacity(limit.min(32 * 1024));
+    loop {
+        let next = tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Err(AttemptFailure::permanent(Error::request_cancelled()));
+            }
+            next = stream.next() => next,
+        };
+        let Some(chunk) = next else {
+            return Ok(bytes);
+        };
+        let chunk = chunk.map_err(|error| AttemptFailure::transient(http_error(error)))?;
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(AttemptFailure::permanent(
+                Error::internal_error().data(format!("{label} exceeded the {limit}-byte limit")),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+}
+
+async fn read_provider_prefix(
+    response: reqwest::Response,
+    limit: usize,
+    cancellation: &CancellationToken,
+) -> Result<Vec<u8>, AttemptFailure> {
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::with_capacity(limit);
+    loop {
+        let next = tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Err(AttemptFailure::permanent(Error::request_cancelled()));
+            }
+            next = stream.next() => next,
+        };
+        let Some(chunk) = next else {
+            return Ok(bytes);
+        };
+        let chunk = chunk.map_err(|error| AttemptFailure::transient(http_error(error)))?;
+        let take = limit.saturating_sub(bytes.len()).min(chunk.len());
+        bytes.extend_from_slice(&chunk[..take]);
+        if take < chunk.len() || bytes.len() == limit {
+            return Ok(bytes);
+        }
+    }
+}
 
 /// A failed attempt, and whether asking again could succeed.
 struct AttemptFailure {
@@ -502,6 +609,11 @@ fn ingest_json_response(
             }
         }
         if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+            if tool_calls.len() > PROVIDER_MAX_TOOL_CALLS {
+                return Err(Error::internal_error().data(format!(
+                    "DeepSeek response exceeded the {PROVIDER_MAX_TOOL_CALLS}-tool-call limit"
+                )));
+            }
             for (index, call) in tool_calls.iter().enumerate() {
                 let mut accumulator = ToolCallAccumulator {
                     id: call
@@ -567,7 +679,16 @@ fn ingest_stream_data(
             }
             if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in tool_calls {
-                    let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let raw_index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+                    let Ok(index) = usize::try_from(raw_index) else {
+                        return Err(Error::internal_error()
+                            .data(format!("DeepSeek tool call index {raw_index} is too large")));
+                    };
+                    if index >= PROVIDER_MAX_TOOL_CALLS {
+                        return Err(Error::internal_error().data(format!(
+                            "DeepSeek tool call index {index} exceeded the {PROVIDER_MAX_TOOL_CALLS}-call limit"
+                        )));
+                    }
                     // The public completion object is the source of truth. A
                     // parallel accumulator is created on first use below.
                     if completion.tool_calls.len() <= index {
@@ -691,6 +812,62 @@ mod tests {
             disable_web: true,
             trace: false,
         }
+    }
+
+    #[tokio::test]
+    async fn provider_http_bodies_fail_cleanly_over_the_limit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            socket.write_all(&[b'x'; 64]).await.unwrap();
+        });
+        let response = reqwest::get(format!("http://{address}")).await.unwrap();
+        let failure = read_provider_body(
+            response,
+            16,
+            &CancellationToken::new(),
+            "test provider response",
+        )
+        .await
+        .unwrap_err();
+        assert!(!failure.retryable);
+        assert!(
+            crate::tools::error_reason(&failure.error).contains("16-byte limit"),
+            "{:?}",
+            failure.error
+        );
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn provider_tool_call_indices_are_bounded() {
+        let mut completion = Completion::default();
+        let event = json!({
+            "choices": [{"delta": {"tool_calls": [{
+                "index": u64::MAX,
+                "function": {"name": "tool", "arguments": "{}"}
+            }]}}]
+        })
+        .to_string();
+        let mut events = Vec::new();
+        let error = ingest_stream_data(&event, &mut completion, &mut |event| {
+            events.push(event);
+        })
+        .unwrap_err();
+        assert!(
+            crate::tools::error_reason(&error).contains("128-call limit"),
+            "{error:?}"
+        );
+        assert!(events.is_empty());
     }
 
     #[test]

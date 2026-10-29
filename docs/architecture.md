@@ -161,6 +161,11 @@ Provider and MCP headers are supplied by configuration and are not persisted as
 session data. Instruction files are canonicalized against their source root,
 limited to regular files, and capped at 1 MiB.
 
+External input is bounded while reading: provider streams to 64 MiB, JSON to
+16 MiB, MCP messages to 8 MiB, and MCP tool metadata to 1 MiB. MCP pagination
+is capped at 100 pages and 1,024 tools. Workspace line reads scan at most
+64 MiB, edits read at most 8 MiB, and searches read at most 16 MiB per file.
+
 `--listen` binds loopback unless `--listen-allow-remote` is given. Every request
 needs the bearer token, compared in constant time. The token comes from
 `DSH_ACP_LISTEN_TOKEN` or is generated from the operating system's random

@@ -17,7 +17,7 @@ use agent_client_protocol::{
 use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout},
     sync::Mutex,
 };
@@ -28,6 +28,13 @@ use crate::tools::function_tool;
 /// The only MCP revision MCP-over-ACP carries. It is stateless: every request
 /// names its version and capabilities, and there is no `initialize`.
 const MCP_OVER_ACP_VERSION: &str = "2026-07-28";
+const MCP_MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+const MCP_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MCP_MAX_TOOL_METADATA_BYTES: usize = 1024 * 1024;
+const MCP_MAX_TOOLS_PER_PAGE: usize = 512;
+const MCP_MAX_TOOLS: usize = 1024;
+const MCP_MAX_TOOL_PAGES: usize = 100;
+const MCP_MAX_CURSOR_BYTES: usize = 4096;
 
 /// The ACP connection a session was set up on. Its client serves the
 /// session's MCP-over-ACP servers, in that connection's protocol version.
@@ -493,15 +500,35 @@ impl McpClient {
     ) -> Result<Vec<McpToolDescription>, Error> {
         let mut tools = Vec::new();
         let mut cursor = None::<String>;
+        let mut seen_cursors = HashSet::new();
+        let mut pages = 0;
         loop {
+            if pages >= MCP_MAX_TOOL_PAGES {
+                return Err(Error::internal_error().data(format!(
+                    "MCP tools/list exceeded the {MCP_MAX_TOOL_PAGES}-page limit"
+                )));
+            }
+            pages += 1;
             let params = cursor
                 .as_ref()
                 .map_or_else(|| json!({}), |cursor| json!({"cursor": cursor}));
             let response = self.request("tools/list", params, cancellation).await?;
             let (mut page, next_cursor) = parse_tool_list_page(&response)?;
+            if tools.len().saturating_add(page.len()) > MCP_MAX_TOOLS {
+                return Err(Error::internal_error().data(format!(
+                    "MCP tools/list exceeded the {MCP_MAX_TOOLS}-tool limit"
+                )));
+            }
             tools.append(&mut page);
             match next_cursor {
-                Some(next) if !next.is_empty() => cursor = Some(next),
+                Some(next) if !next.is_empty() => {
+                    if !seen_cursors.insert(next.clone()) {
+                        return Err(Error::internal_error().data(format!(
+                            "MCP tools/list repeated pagination cursor `{next}`"
+                        )));
+                    }
+                    cursor = Some(next);
+                }
                 _ => break,
             }
         }
@@ -602,17 +629,30 @@ impl AcpTransport {
         };
         match outcome {
             AcpMcpOutcome::Result(result) => self.complete_result(result),
-            AcpMcpOutcome::Error(error) => Err(failure(
-                format!(
-                    "MCP server returned error {}: {}",
-                    error.get("code").unwrap_or(&Value::Null),
-                    error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                ),
-                error,
-            )),
+            AcpMcpOutcome::Error(error) => {
+                let size = serde_json::to_vec(&error)
+                    .map_err(Error::into_internal_error)?
+                    .len();
+                if size > MCP_MAX_RESPONSE_BYTES {
+                    return Err(failure(
+                        format!(
+                            "MCP-over-ACP error exceeded the {MCP_MAX_RESPONSE_BYTES}-byte limit"
+                        ),
+                        json!({"limit": MCP_MAX_RESPONSE_BYTES, "actual": size}),
+                    ));
+                }
+                Err(failure(
+                    format!(
+                        "MCP server returned error {}: {}",
+                        error.get("code").unwrap_or(&Value::Null),
+                        error
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                    ),
+                    error,
+                ))
+            }
         }
     }
 
@@ -620,6 +660,15 @@ impl AcpTransport {
     /// needs more input asks for it with `input_required`, which needs client
     /// capabilities this agent does not declare.
     fn complete_result(&self, result: Value) -> Result<Value, Error> {
+        let size = serde_json::to_vec(&result)
+            .map_err(Error::into_internal_error)?
+            .len();
+        if size > MCP_MAX_RESPONSE_BYTES {
+            return Err(failure(
+                format!("MCP-over-ACP response exceeded the {MCP_MAX_RESPONSE_BYTES}-byte limit"),
+                json!({"limit": MCP_MAX_RESPONSE_BYTES, "actual": size}),
+            ));
+        }
         match result.get("resultType") {
             None => Ok(result),
             Some(Value::String(kind)) if kind == "complete" => Ok(result),
@@ -675,7 +724,22 @@ fn parse_tool_list_page(value: &Value) -> Result<(Vec<McpToolDescription>, Optio
         .ok_or_else(|| {
             Error::internal_error().data("MCP tools/list response has no tools array")
         })?;
-    let tools = tools
+    if tools.len() > MCP_MAX_TOOLS_PER_PAGE {
+        return Err(Error::internal_error().data(format!(
+            "MCP tools/list page exceeded the {MCP_MAX_TOOLS_PER_PAGE}-tool limit"
+        )));
+    }
+    for tool in tools {
+        let size = serde_json::to_vec(tool)
+            .map_err(Error::into_internal_error)?
+            .len();
+        if size > MCP_MAX_TOOL_METADATA_BYTES {
+            return Err(Error::internal_error().data(format!(
+                "MCP tool metadata exceeded the {MCP_MAX_TOOL_METADATA_BYTES}-byte limit"
+            )));
+        }
+    }
+    let tools: Vec<McpToolDescription> = tools
         .iter()
         .filter_map(|tool| {
             Some(McpToolDescription {
@@ -697,6 +761,14 @@ fn parse_tool_list_page(value: &Value) -> Result<(Vec<McpToolDescription>, Optio
         .get("nextCursor")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
+    if next_cursor
+        .as_ref()
+        .is_some_and(|cursor| cursor.len() > MCP_MAX_CURSOR_BYTES)
+    {
+        return Err(Error::internal_error().data(format!(
+            "MCP pagination cursor exceeded the {MCP_MAX_CURSOR_BYTES}-byte limit"
+        )));
+    }
     Ok((tools, next_cursor))
 }
 
@@ -705,6 +777,40 @@ struct StdioTransport {
     stdout: BufReader<ChildStdout>,
     child: Child,
     next_id: u64,
+}
+
+enum BoundedLine {
+    Line(Vec<u8>),
+    Eof,
+    TooLarge,
+}
+
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> std::io::Result<BoundedLine> {
+    let mut line = Vec::with_capacity(limit.min(8192));
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(if line.is_empty() {
+                BoundedLine::Eof
+            } else {
+                BoundedLine::Line(line)
+            });
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |position| position + 1);
+        if line.len().saturating_add(take) > limit {
+            reader.consume(take);
+            return Ok(BoundedLine::TooLarge);
+        }
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            return Ok(BoundedLine::Line(line));
+        }
+    }
 }
 
 /// Environment variables a stdio MCP server may inherit from the agent.
@@ -899,24 +1005,33 @@ impl StdioTransport {
         }))
         .await?;
 
-        let mut line = String::new();
         loop {
-            line.clear();
-            let read = tokio::select! {
+            let line = tokio::select! {
                 _ = cancellation.cancelled() => return Err(Error::request_cancelled()),
-                result = self.stdout.read_line(&mut line) => result.map_err(Error::into_internal_error)?,
+                result = read_bounded_line(&mut self.stdout, MCP_MAX_LINE_BYTES) => {
+                    result.map_err(Error::into_internal_error)?
+                }
             };
-            if read == 0 {
-                return Err(Error::internal_error().data(format!(
-                    "MCP server exited with status {:?}",
-                    self.child
-                        .try_wait()
-                        .ok()
-                        .flatten()
-                        .and_then(|status| status.code())
-                )));
-            }
-            let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+            let line = match line {
+                BoundedLine::Line(line) => line,
+                BoundedLine::Eof => {
+                    return Err(Error::internal_error().data(format!(
+                        "MCP server exited with status {:?}",
+                        self.child
+                            .try_wait()
+                            .ok()
+                            .flatten()
+                            .and_then(|status| status.code())
+                    )));
+                }
+                BoundedLine::TooLarge => {
+                    let _ = self.child.kill().await;
+                    return Err(Error::internal_error().data(format!(
+                        "MCP stdio response exceeded the {MCP_MAX_LINE_BYTES}-byte line limit"
+                    )));
+                }
+            };
+            let Ok(value) = serde_json::from_slice::<Value>(&line) else {
                 continue;
             };
             if value.get("id").and_then(Value::as_u64) != Some(id) {
@@ -1103,7 +1218,14 @@ impl HttpTransport {
         }
         let status = response.status();
         if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
+            let bytes = match read_http_prefix(response, ERROR_BODY_BYTES, cancellation).await {
+                Ok(bytes) => bytes,
+                Err(_) if cancellation.is_cancelled() => {
+                    return Err(Error::request_cancelled());
+                }
+                Err(_) => Vec::new(),
+            };
+            let text = String::from_utf8_lossy(&bytes);
             return Err(Error::internal_error().data(json!({
                 "status": status.as_u16(),
                 "message": truncate_body(&text)
@@ -1121,10 +1243,14 @@ impl HttpTransport {
         if content_type.contains("text/event-stream") {
             read_mcp_sse_response(response, cancellation, body.get("id").cloned()).await
         } else {
-            tokio::select! {
-                _ = cancellation.cancelled() => Err(Error::request_cancelled()),
-                response = response.json::<Value>() => response.map_err(http_error),
-            }
+            let bytes = read_http_body(
+                response,
+                MCP_MAX_RESPONSE_BYTES,
+                cancellation,
+                "MCP HTTP response",
+            )
+            .await?;
+            serde_json::from_slice(&bytes).map_err(Error::into_internal_error)
         }
     }
 }
@@ -1146,6 +1272,65 @@ fn http_error(error: reqwest::Error) -> Error {
         source = cause.source();
     }
     Error::internal_error().data(message)
+}
+
+async fn read_http_body(
+    response: reqwest::Response,
+    limit: usize,
+    cancellation: &CancellationToken,
+    label: &str,
+) -> Result<Vec<u8>, Error> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(
+            Error::internal_error().data(format!("{label} exceeded the {limit}-byte limit"))
+        );
+    }
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::with_capacity(limit.min(32 * 1024));
+    loop {
+        let next = tokio::select! {
+            _ = cancellation.cancelled() => return Err(Error::request_cancelled()),
+            next = stream.next() => next,
+        };
+        let Some(chunk) = next else {
+            return Ok(bytes);
+        };
+        let chunk = chunk.map_err(http_error)?;
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(
+                Error::internal_error().data(format!("{label} exceeded the {limit}-byte limit"))
+            );
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+}
+
+async fn read_http_prefix(
+    response: reqwest::Response,
+    limit: usize,
+    cancellation: &CancellationToken,
+) -> Result<Vec<u8>, Error> {
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::with_capacity(limit);
+    loop {
+        let next = tokio::select! {
+            _ = cancellation.cancelled() => return Err(Error::request_cancelled()),
+            next = stream.next() => next,
+        };
+        let Some(chunk) = next else {
+            return Ok(bytes);
+        };
+        let chunk = chunk.map_err(http_error)?;
+        let remaining = limit.saturating_sub(bytes.len());
+        let take = remaining.min(chunk.len());
+        bytes.extend_from_slice(&chunk[..take]);
+        if take < chunk.len() || bytes.len() == limit {
+            return Ok(bytes);
+        }
+    }
 }
 
 /// The most of an error response body kept for the model. A proxy's error
@@ -1180,6 +1365,11 @@ async fn read_mcp_sse_response(
             break;
         };
         let chunk = chunk.map_err(http_error)?;
+        if buffer.len().saturating_add(chunk.len()) > MCP_MAX_LINE_BYTES {
+            return Err(Error::internal_error().data(format!(
+                "MCP SSE input exceeded the {MCP_MAX_LINE_BYTES}-byte line limit"
+            )));
+        }
         buffer.extend_from_slice(&chunk);
         while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
             let raw = buffer.drain(..=newline).collect::<Vec<_>>();
@@ -1199,10 +1389,17 @@ async fn read_mcp_sse_response(
                 continue;
             }
             if let Some(payload) = line.strip_prefix("data:") {
+                let payload = payload.trim_start();
+                let added = payload.len() + usize::from(!data.is_empty());
+                if data.len().saturating_add(added) > MCP_MAX_RESPONSE_BYTES {
+                    return Err(Error::internal_error().data(format!(
+                        "MCP SSE event exceeded the {MCP_MAX_RESPONSE_BYTES}-byte limit"
+                    )));
+                }
                 if !data.is_empty() {
                     data.push('\n');
                 }
-                data.push_str(payload.trim_start());
+                data.push_str(payload);
             }
         }
     }
@@ -1244,6 +1441,69 @@ mod tests {
         let truncated = truncate_body(&body);
         assert!(truncated.ends_with("[...truncated...]"));
         assert!(truncated.len() <= ERROR_BODY_BYTES + "[...truncated...]".len());
+    }
+
+    #[tokio::test]
+    async fn stdio_lines_are_read_without_crossing_the_limit() {
+        let input = b"short\nthis line is too long\n";
+        let mut reader = BufReader::new(input.as_slice());
+        let BoundedLine::Line(line) = read_bounded_line(&mut reader, 32).await.unwrap() else {
+            panic!("the short line should be readable");
+        };
+        assert_eq!(line, b"short\n");
+        assert!(matches!(
+            read_bounded_line(&mut reader, 8).await.unwrap(),
+            BoundedLine::TooLarge
+        ));
+    }
+
+    #[test]
+    fn mcp_tool_metadata_and_cursors_are_bounded() {
+        let too_many = json!({
+            "tools": (0..MCP_MAX_TOOLS_PER_PAGE + 1)
+                .map(|index| json!({"name": format!("tool-{index}")}))
+                .collect::<Vec<_>>()
+        });
+        assert!(parse_tool_list(&too_many).is_err());
+
+        let oversized = json!({
+            "tools": [{
+                "name": "large",
+                "description": "x".repeat(MCP_MAX_TOOL_METADATA_BYTES)
+            }]
+        });
+        assert!(parse_tool_list(&oversized).is_err());
+
+        let long_cursor = json!({
+            "tools": [],
+            "nextCursor": "x".repeat(MCP_MAX_CURSOR_BYTES + 1)
+        });
+        assert!(parse_tool_list(&long_cursor).is_err());
+    }
+
+    #[tokio::test]
+    async fn oversized_http_mcp_bodies_fail_cleanly() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            socket.write_all(&[b'x'; 64]).await.unwrap();
+        });
+        let response = reqwest::get(format!("http://{address}")).await.unwrap();
+        let error = read_http_body(response, 16, &CancellationToken::new(), "test MCP response")
+            .await
+            .unwrap_err();
+        assert!(
+            crate::tools::error_reason(&error).contains("16-byte limit"),
+            "{error:?}"
+        );
+        server.await.unwrap();
     }
 
     #[test]
@@ -1447,6 +1707,33 @@ mod tests {
         "#;
         let message = connect_error(shell_server("chatty", script, &[])).await;
         assert!(message.contains("MCP server `chatty`"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_mcp_tool_cursors_fail_instead_of_looping() {
+        let script = r#"
+            read -r line
+            echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+            read -r line
+            read -r line
+            echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[],"nextCursor":"again"}}'
+            read -r line
+            echo '{"jsonrpc":"2.0","id":3,"result":{"tools":[],"nextCursor":"again"}}'
+            while read -r line; do :; done
+        "#;
+        let error = McpSession::connect(
+            &[shell_server("cursor", script, &[])],
+            None,
+            Duration::from_secs(10),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a repeated cursor should fail setup");
+        assert!(
+            crate::tools::error_reason(&error).contains("repeated pagination cursor"),
+            "{error:?}"
+        );
     }
 
     #[cfg(unix)]

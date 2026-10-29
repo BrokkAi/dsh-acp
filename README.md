@@ -320,6 +320,25 @@ rejects loopback, private, shared/CGNAT, link-local, multicast, documentation,
 benchmark, and other reserved ranges, connects directly, and does not use
 ambient proxy settings.
 
+## Input limits
+
+External and workspace inputs have fixed byte and count limits:
+
+- `read_file` scans at most 64 MiB to locate the requested lines and returns at
+  most `--tool-output-bytes`; `edit_file` reads files up to 8 MiB. A search
+  reads at most 16 MiB per file and visits at most 100,000 filesystem entries.
+- A stdio MCP line, HTTP MCP JSON response, or MCP SSE event is limited to
+  8 MiB. MCP error text is kept to 2 KiB.
+- MCP tool listing allows at most 512 tools per page, 1,024 tools total, 100
+  pages, 1 MiB of metadata per tool, and a 4 KiB pagination cursor. Repeated
+  cursors fail instead of looping.
+- A DeepSeek response is limited to 64 MiB of streamed input. Inline JSON is
+  limited to 16 MiB, an SSE event to 8 MiB, error text to 64 KiB, and one
+  response to 128 tool calls.
+
+An input over a limit fails with a bounded error instead of being fully
+buffered.
+
 File, directory, and search tools always use local directory capabilities, so
 the checked workspace root and the connected file operation cannot be changed
 between approval and execution. In v1, a command may use the ACP client's
@@ -456,6 +475,8 @@ security boundaries, and concurrency model.
   client explicitly configures for that server.
 - `web_fetch` validates each redirect hop, rejects non-global DNS answers, and
   connects only to the public addresses that passed policy.
+- MCP, provider, and workspace inputs are bounded while they are read, so an
+  oversized response or file cannot be fully buffered.
 - Credentials are read from launch configuration or provider requests and are
   not written to session transcripts.
 - `--listen` is opt-in, loopback-only unless `--listen-allow-remote` is given,
