@@ -554,6 +554,10 @@ impl V2Harness {
             Ok(runtime) => runtime,
             Err(error) => return responder.respond_with_error(error),
         };
+        let requested_cwd = match crate::workspace::canonical_directory(&request.cwd.0) {
+            Ok(cwd) => cwd,
+            Err(error) => return responder.respond_with_error(error),
+        };
         let additional_directories = absolute_paths(request.additional_directories.clone());
         if let Err(error) = crate::session::validate_roots(&request.cwd.0, &additional_directories)
         {
@@ -561,11 +565,11 @@ impl V2Harness {
         }
         let instructions = {
             let state = runtime.state.lock().await;
-            if state.record.cwd != request.cwd.0 {
+            if state.record.cwd != requested_cwd {
                 return responder.respond_with_error(Error::invalid_params().data(format!(
                     "session cwd mismatch: stored {}, requested {}",
                     state.record.cwd.display(),
-                    request.cwd.0.display()
+                    requested_cwd.display()
                 )));
             }
             match self.base.store.session_instructions(
@@ -587,6 +591,9 @@ impl V2Harness {
             return responder.respond_with_error(error);
         }
         instructions.install(&mut runtime.state.lock().await.record);
+        if let Err(error) = self.base.store.refresh_workspace(&runtime).await {
+            return responder.respond_with_error(error);
+        }
         if let Err(error) = self.base.store.save(&runtime).await {
             return responder.respond_with_error(error);
         }
@@ -624,6 +631,10 @@ impl V2Harness {
             Ok(runtime) => runtime,
             Err(error) => return responder.respond_with_error(error),
         };
+        let requested_cwd = match crate::workspace::canonical_directory(&request.cwd.0) {
+            Ok(cwd) => cwd,
+            Err(error) => return responder.respond_with_error(error),
+        };
         if source_runtime
             .state
             .lock()
@@ -636,11 +647,11 @@ impl V2Harness {
             );
         }
         let source = source_runtime.snapshot().await;
-        if source.cwd != request.cwd.0 {
+        if source.cwd != requested_cwd {
             return responder.respond_with_error(Error::invalid_params().data(format!(
                 "session cwd mismatch: stored {}, requested {}",
                 source.cwd.display(),
-                request.cwd.0.display()
+                requested_cwd.display()
             )));
         }
         let system_prompt = match v2_client_system_prompt(request.system_prompt.as_ref()) {
@@ -651,7 +662,7 @@ impl V2Harness {
             .base
             .store
             .create(
-                request.cwd.into_inner(),
+                requested_cwd,
                 absolute_paths(request.additional_directories),
                 system_prompt,
                 Some(source.id.clone()),
@@ -1780,6 +1791,13 @@ impl V2Harness {
             }
         };
         let record = runtime.snapshot().await;
+        let workspace = runtime
+            .state
+            .lock()
+            .await
+            .workspace
+            .clone()
+            .ok_or_else(|| Error::internal_error().data("session workspace is unavailable"))?;
         let title = tool_title(&call.function.name, &arguments);
         let read_only_mcp = runtime
             .state
@@ -1795,7 +1813,7 @@ impl V2Harness {
         let preview = if refused_in_plan_mode {
             None
         } else {
-            crate::tools::preview_diff(&record, &call.function.name, &arguments).await
+            crate::tools::preview_diff(&workspace, &call.function.name, &arguments).await
         };
         let update = ToolCallUpdate::new(call.id.clone())
             .name(call.function.name.clone())
@@ -1923,7 +1941,7 @@ impl V2Harness {
             return Ok(result);
         }
         let needs_permission =
-            crate::tools::permission_required(&record, &call.function.name, &arguments)
+            crate::tools::permission_required(&workspace, &call.function.name, &arguments)
                 || call.function.name.starts_with("mcp__");
         let approval_key =
             crate::tools::session_approval_key(&record, &call.function.name, &arguments);
@@ -2008,6 +2026,7 @@ impl V2Harness {
             connection: None,
             client: Default::default(),
             config: self.base.config.clone(),
+            workspace,
         };
         let mut result = if call.function.name.starts_with("mcp__") {
             let mcp = runtime.state.lock().await.mcp.clone();

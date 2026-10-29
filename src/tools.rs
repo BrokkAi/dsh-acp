@@ -1,4 +1,5 @@
 use std::{
+    io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -10,14 +11,13 @@ use agent_client_protocol::{
         ClientCapabilities, CreateTerminalRequest, EnvVariable, KillTerminalRequest,
         ReleaseTerminalRequest, SessionNotification, SessionUpdate, Terminal, TerminalId,
         TerminalOutputRequest, ToolCallContent, ToolCallStatus, ToolCallUpdate,
-        ToolCallUpdateFields, WaitForTerminalExitRequest, WriteTextFileRequest,
+        ToolCallUpdateFields, WaitForTerminalExitRequest,
     },
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
-use walkdir::WalkDir;
 
 use crate::{
     config::{Config, PermissionMode},
@@ -33,6 +33,7 @@ pub struct ToolAccess {
     pub connection: Option<ConnectionTo<Client>>,
     pub client: ClientCapabilities,
     pub config: Config,
+    pub workspace: std::sync::Arc<crate::workspace::WorkspaceRoots>,
 }
 
 /// The ACP v1 tool call a command runs for. When the command runs in the
@@ -538,18 +539,27 @@ pub async fn complete_url_elicitation(
 /// Whether this tool call needs an ACP permission decision. Network egress is
 /// always gated, and a read gets its own decision when its lexical or resolved
 /// path looks like credential material.
-pub fn permission_required(session: &SessionRecord, name: &str, arguments: &Value) -> bool {
+pub fn permission_required(
+    workspace: &crate::workspace::WorkspaceRoots,
+    name: &str,
+    arguments: &Value,
+) -> bool {
     match name {
         "web_fetch" => true,
         "read_file" => {
             let Some(path) = arguments.get("path").and_then(Value::as_str) else {
                 return false;
             };
-            let candidate = candidate_path(session, path);
-            is_sensitive_path(&candidate)
-                || candidate
-                    .canonicalize()
-                    .is_ok_and(|resolved| is_sensitive_path(&resolved))
+            let Ok(candidate) = workspace.resolve(path) else {
+                return false;
+            };
+            is_sensitive_path(&candidate.absolute)
+                || workspace
+                    .root_dir(candidate.root_index)
+                    .canonicalize(&candidate.relative)
+                    .is_ok_and(|resolved| {
+                        is_sensitive_path(&workspace.root_path(candidate.root_index).join(resolved))
+                    })
         }
         _ => matches!(
             name,
@@ -684,8 +694,8 @@ pub async fn execute(
 
     match name {
         "read_file" => read_file(access, session, &arguments, cancellation).await,
-        "list_directory" => list_directory(session, &arguments, cancellation),
-        "search_files" => search_files(session, &arguments, cancellation),
+        "list_directory" => list_directory(&access.workspace, &arguments, cancellation),
+        "search_files" => search_files(&access.workspace, &arguments, cancellation),
         "write_file" => write_file(access, session, &arguments, cancellation).await,
         "edit_file" => edit_file(access, session, &arguments, cancellation).await,
         "run_command" => {
@@ -699,11 +709,19 @@ pub async fn execute(
 
 async fn read_file(
     access: &ToolAccess,
-    session: &SessionRecord,
+    _session: &SessionRecord,
     arguments: &Value,
     cancellation: &CancellationToken,
 ) -> Result<ToolResult, agent_client_protocol::Error> {
-    let path = resolve_existing_path(session, required_string(arguments, "path")?)?;
+    let (path, mut file) = access
+        .workspace
+        .open_existing(required_string(arguments, "path")?)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let content = String::from_utf8(bytes).map_err(|_| {
+        agent_client_protocol::Error::invalid_request().data("workspace file is not valid UTF-8")
+    })?;
     let start = arguments
         .get("start_line")
         .and_then(Value::as_u64)
@@ -714,49 +732,20 @@ async fn read_file(
         .and_then(Value::as_u64)
         .unwrap_or(4000)
         .min(10_000) as usize;
-    let client_range = access.client.fs.read_text_file && access.connection.is_some();
-    let content = if client_range {
-        let connection = access
-            .connection
-            .as_ref()
-            .expect("client range request requires an ACP v1 connection");
-        let request = agent_client_protocol::schema::v1::ReadTextFileRequest::new(
-            session.id.clone(),
-            path.clone(),
-        )
-        .line(Some(start as u32))
-        .limit(Some(limit as u32));
-        tokio::select! {
-            _ = cancellation.cancelled() => return Err(agent_client_protocol::Error::request_cancelled()),
-            response = connection.send_request(request).block_task() => {
-                response?.content
-            }
-        }
-    } else {
-        tokio::select! {
-            _ = cancellation.cancelled() => return Err(agent_client_protocol::Error::request_cancelled()),
-            result = tokio::fs::read_to_string(&path) => result.map_err(|error| {
-                agent_client_protocol::Error::resource_not_found(Some(format!("file://{}", path.display())))
-                    .data(error.to_string())
-            })?,
-        }
-    };
-
-    let selected = if client_range {
-        content
-    } else {
-        content
-            .lines()
-            .skip(start.saturating_sub(1))
-            .take(limit)
-            .map(|line| format!("{line}\n"))
-            .collect::<String>()
-    };
+    if cancellation.is_cancelled() {
+        return Err(agent_client_protocol::Error::request_cancelled());
+    }
+    let selected = content
+        .lines()
+        .skip(start.saturating_sub(1))
+        .take(limit)
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
     let selected = truncate(&selected, access.config.tool_output_bytes);
     Ok(ToolResult {
         text: selected.clone(),
         raw: json!({
-            "path": path,
+            "path": path.absolute,
             "content": selected,
             "start_line": start,
             "limit": limit
@@ -765,14 +754,20 @@ async fn read_file(
 }
 
 fn list_directory(
-    session: &SessionRecord,
+    workspace: &crate::workspace::WorkspaceRoots,
     arguments: &Value,
     cancellation: &CancellationToken,
 ) -> Result<ToolResult, agent_client_protocol::Error> {
-    let root = match arguments.get("path").and_then(Value::as_str) {
-        Some(path) => resolve_existing_path(session, path)?,
-        None => session.cwd.clone(),
-    };
+    let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
+    let root = workspace.resolve(path)?;
+    let directory = workspace
+        .root_dir(root.root_index)
+        .open_dir(if root.relative.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            &root.relative
+        })
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
     let depth = arguments
         .get("depth")
         .and_then(Value::as_u64)
@@ -789,41 +784,85 @@ fn list_directory(
         .clamp(1, 5000) as usize;
 
     let mut entries = Vec::new();
-    for entry in WalkDir::new(&root)
-        .min_depth(1)
-        .max_depth(depth)
-        .follow_links(false)
-        .into_iter()
-    {
-        if cancellation.is_cancelled() {
-            return Err(agent_client_protocol::Error::request_cancelled());
-        }
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let relative = entry.path().strip_prefix(&root).unwrap_or(entry.path());
-        if !include_hidden && is_hidden_path(relative) {
-            continue;
-        }
-        if !include_hidden && is_noisy_directory(relative) {
-            continue;
-        }
-        let suffix = if entry.file_type().is_dir() { "/" } else { "" };
-        entries.push(format!("{}{}", relative.display(), suffix));
-        if entries.len() >= max_entries {
-            break;
-        }
-    }
+    let options = DirectoryWalkOptions {
+        max_depth: depth,
+        include_hidden,
+        max_entries,
+    };
+    collect_directory_entries(
+        &directory,
+        Path::new(""),
+        1,
+        &options,
+        cancellation,
+        &mut entries,
+    )?;
     entries.sort();
-    let text = truncate(&entries.join("\n"), session_output_budget(session, 131_072));
+    let text = truncate(&entries.join("\n"), 131_072);
     Ok(ToolResult {
         text: text.clone(),
-        raw: json!({"root": root, "entries": text, "count": entries.len()}),
+        raw: json!({"root": root.absolute, "entries": text, "count": entries.len()}),
     })
 }
 
+struct DirectoryWalkOptions {
+    max_depth: usize,
+    include_hidden: bool,
+    max_entries: usize,
+}
+
+fn collect_directory_entries(
+    directory: &cap_std::fs::Dir,
+    prefix: &Path,
+    current_depth: usize,
+    options: &DirectoryWalkOptions,
+    cancellation: &CancellationToken,
+    entries: &mut Vec<String>,
+) -> Result<(), agent_client_protocol::Error> {
+    if entries.len() >= options.max_entries {
+        return Ok(());
+    }
+    let children = directory
+        .read_dir(".")
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    for child in children {
+        if cancellation.is_cancelled() {
+            return Err(agent_client_protocol::Error::request_cancelled());
+        }
+        let Ok(child) = child else {
+            continue;
+        };
+        let relative = prefix.join(child.file_name());
+        if !options.include_hidden && (is_hidden_path(&relative) || is_noisy_directory(&relative)) {
+            continue;
+        }
+        let file_type = child
+            .file_type()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        let suffix = if file_type.is_dir() { "/" } else { "" };
+        entries.push(format!("{}{}", relative.display(), suffix));
+        if entries.len() >= options.max_entries {
+            return Ok(());
+        }
+        if file_type.is_dir() && current_depth < options.max_depth {
+            let child_dir = child
+                .open_dir()
+                .map_err(agent_client_protocol::Error::into_internal_error)?;
+            collect_directory_entries(
+                &child_dir,
+                &relative,
+                current_depth + 1,
+                options,
+                cancellation,
+                entries,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn search_files(
-    session: &SessionRecord,
+    workspace: &crate::workspace::WorkspaceRoots,
     arguments: &Value,
     cancellation: &CancellationToken,
 ) -> Result<ToolResult, agent_client_protocol::Error> {
@@ -845,15 +884,21 @@ fn search_files(
         .map(regex::Regex::new)
         .transpose()
         .map_err(|error| agent_client_protocol::Error::invalid_params().data(error.to_string()))?;
-    let root = match arguments.get("path").and_then(Value::as_str) {
-        Some(path) => resolve_existing_path(session, path)?,
-        None => session.cwd.clone(),
-    };
-    if is_sensitive_path(&root) {
+    let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
+    let root = workspace.resolve(path)?;
+    if is_sensitive_path(&root.absolute) {
         return Err(agent_client_protocol::Error::invalid_request().data(
             "search_files does not search credential-like paths; read an individual file with an explicit permission decision instead",
         ));
     }
+    let directory = workspace
+        .root_dir(root.root_index)
+        .open_dir(if root.relative.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            &root.relative
+        })
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
     let max_results = arguments
         .get("max_results")
         .and_then(Value::as_u64)
@@ -861,40 +906,85 @@ fn search_files(
         .clamp(1, 2000) as usize;
 
     let mut matches = Vec::new();
-    for entry in WalkDir::new(&root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| {
-            entry.path().strip_prefix(&root).map_or(true, |relative| {
-                !is_noisy_directory(relative)
-                    && !is_hidden_path(relative)
-                    && !is_sensitive_path(relative)
-            })
-        })
-    {
+    search_directory(
+        &directory,
+        Path::new(""),
+        &regex,
+        path_filter.as_ref(),
+        max_results,
+        cancellation,
+        &mut matches,
+    )?;
+    let text = truncate(&matches.join("\n"), 131_072);
+    Ok(ToolResult {
+        text: text.clone(),
+        raw: json!({"root": root.absolute, "matches": text, "count": matches.len()}),
+    })
+}
+
+fn search_directory(
+    directory: &cap_std::fs::Dir,
+    prefix: &Path,
+    regex: &regex::Regex,
+    path_filter: Option<&regex::Regex>,
+    max_results: usize,
+    cancellation: &CancellationToken,
+    matches: &mut Vec<String>,
+) -> Result<(), agent_client_protocol::Error> {
+    if matches.len() >= max_results {
+        return Ok(());
+    }
+    let children = directory
+        .read_dir(".")
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    for child in children {
         if cancellation.is_cancelled() {
             return Err(agent_client_protocol::Error::request_cancelled());
         }
-        let Ok(entry) = entry else {
+        let Ok(child) = child else {
             continue;
         };
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        if entry
-            .metadata()
-            .is_ok_and(|metadata| metadata.len() > 16 * 1024 * 1024)
+        let relative = prefix.join(child.file_name());
+        if is_hidden_path(&relative)
+            || is_noisy_directory(&relative)
+            || is_sensitive_path(&relative)
         {
             continue;
         }
-        let relative = entry.path().strip_prefix(&root).unwrap_or(entry.path());
-        if path_filter
-            .as_ref()
-            .is_some_and(|filter| !filter.is_match(&relative.to_string_lossy()))
+        let file_type = child
+            .file_type()
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+        if file_type.is_dir() {
+            let child_dir = child
+                .open_dir()
+                .map_err(agent_client_protocol::Error::into_internal_error)?;
+            search_directory(
+                &child_dir,
+                &relative,
+                regex,
+                path_filter,
+                max_results,
+                cancellation,
+                matches,
+            )?;
+            continue;
+        }
+        if !file_type.is_file()
+            || path_filter.is_some_and(|filter| !filter.is_match(&relative.to_string_lossy()))
         {
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(entry.path()) else {
+        let Ok(mut file) = child.open() else {
+            continue;
+        };
+        if crate::workspace::reject_unsafe_file(&file).is_err()
+            || file
+                .metadata()
+                .is_ok_and(|metadata| metadata.len() > 16 * 1024 * 1024)
+        {
+            continue;
+        }
+        let Ok(content) = read_open_text(&mut file) else {
             continue;
         };
         if content.as_bytes().contains(&0) {
@@ -909,63 +999,48 @@ fn search_files(
                     truncate(line, 500)
                 ));
                 if matches.len() >= max_results {
-                    break;
+                    return Ok(());
                 }
             }
         }
         if matches.len() >= max_results {
-            break;
+            return Ok(());
         }
     }
-    let text = truncate(&matches.join("\n"), 131_072);
-    Ok(ToolResult {
-        text: text.clone(),
-        raw: json!({"root": root, "matches": text, "count": matches.len()}),
-    })
+    Ok(())
 }
 
 async fn write_file(
     access: &ToolAccess,
-    session: &SessionRecord,
+    _session: &SessionRecord,
     arguments: &Value,
     cancellation: &CancellationToken,
 ) -> Result<ToolResult, agent_client_protocol::Error> {
-    let path = resolve_writable_path(session, required_string(arguments, "path")?)?;
     let content = required_string(arguments, "content")?.to_string();
     let create_directories = arguments
         .get("create_directories")
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    if create_directories && let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let (path, mut file) = access
+        .workspace
+        .open_writable(required_string(arguments, "path")?, create_directories)?;
+    if cancellation.is_cancelled() {
+        return Err(agent_client_protocol::Error::request_cancelled());
     }
-    let old_text = tokio::fs::read_to_string(&path).await.ok();
-    if access.client.fs.write_text_file
-        && let Some(connection) = access.connection.as_ref()
-    {
-        let response = tokio::select! {
-            _ = cancellation.cancelled() => return Err(agent_client_protocol::Error::request_cancelled()),
-            response = connection
-                .send_request(WriteTextFileRequest::new(
-                    session.id.clone(),
-                    path.clone(),
-                    content.clone(),
-                ))
-                .block_task() => response?,
-        };
-        drop(response);
-    } else {
-        tokio::select! {
-            _ = cancellation.cancelled() => return Err(agent_client_protocol::Error::request_cancelled()),
-            result = tokio::fs::write(&path, &content) => result.map_err(agent_client_protocol::Error::into_internal_error)?,
-        }
-    }
+    let old_text = read_open_text(&mut file).ok();
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.set_len(0))
+        .and_then(|_| file.write_all(content.as_bytes()))
+        .and_then(|_| file.flush())
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
     Ok(ToolResult {
-        text: format!("Wrote {} bytes to {}", content.len(), path.display()),
+        text: format!(
+            "Wrote {} bytes to {}",
+            content.len(),
+            path.absolute.display()
+        ),
         raw: json!({
-            "path": path,
+            "path": path.absolute,
             "bytes": content.len(),
             "_old_text": old_text,
             "_new_text": content
@@ -975,36 +1050,52 @@ async fn write_file(
 
 async fn edit_file(
     access: &ToolAccess,
-    session: &SessionRecord,
+    _session: &SessionRecord,
     arguments: &Value,
     cancellation: &CancellationToken,
 ) -> Result<ToolResult, agent_client_protocol::Error> {
-    let path = resolve_existing_path(session, required_string(arguments, "path")?)?;
     let old_text = required_string(arguments, "old_text")?;
     let new_text = required_string(arguments, "new_text")?;
     let replace_all = arguments
         .get("replace_all")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let original = tokio::fs::read_to_string(&path)
-        .await
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let (path, mut file) = access
+        .workspace
+        .open_writable(required_string(arguments, "path")?, false)?;
+    let original =
+        read_open_text(&mut file).map_err(agent_client_protocol::Error::into_internal_error)?;
     let (updated, occurrences) = replace_text(&original, old_text, new_text, replace_all)?;
-    let write_args = json!({"path": path, "content": updated.clone(), "create_directories": false});
-    let mut result = write_file(access, session, &write_args, cancellation).await?;
-    result.text = format!(
-        "Replaced {} occurrence(s) in {}",
-        occurrences.min(if replace_all { occurrences } else { 1 }),
-        path.display()
-    );
-    result.raw = json!({
-        "path": path,
-        "occurrences": occurrences,
-        "replace_all": replace_all,
-        "_old_text": original,
-        "_new_text": updated
-    });
-    Ok(result)
+    if cancellation.is_cancelled() {
+        return Err(agent_client_protocol::Error::request_cancelled());
+    }
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.set_len(0))
+        .and_then(|_| file.write_all(updated.as_bytes()))
+        .and_then(|_| file.flush())
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    Ok(ToolResult {
+        text: format!(
+            "Replaced {} occurrence(s) in {}",
+            occurrences.min(if replace_all { occurrences } else { 1 }),
+            path.absolute.display()
+        ),
+        raw: json!({
+            "path": path.absolute,
+            "occurrences": occurrences,
+            "replace_all": replace_all,
+            "_old_text": original,
+            "_new_text": updated
+        }),
+    })
+}
+
+fn read_open_text(file: &mut cap_std::fs::File) -> std::io::Result<String> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 /// The text `edit_file` writes: `old_text` must occur exactly once unless
@@ -1042,35 +1133,38 @@ fn replace_text(
 /// found or ambiguous, a path outside the workspace roots) or the current file
 /// is not UTF-8 text. The tool then reports its own error when it runs.
 pub async fn preview_diff(
-    session: &SessionRecord,
+    workspace: &crate::workspace::WorkspaceRoots,
     tool: &str,
     arguments: &Value,
 ) -> Option<PersistedDiff> {
     match tool {
         "edit_file" => {
-            let path =
-                resolve_existing_path(session, required_string(arguments, "path").ok()?).ok()?;
+            let (path, mut file) = workspace
+                .open_existing(required_string(arguments, "path").ok()?)
+                .ok()?;
             let old_text = required_string(arguments, "old_text").ok()?;
             let new_text = required_string(arguments, "new_text").ok()?;
             let replace_all = arguments
                 .get("replace_all")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let original = tokio::fs::read_to_string(&path).await.ok()?;
+            let original = read_open_text(&mut file).ok()?;
             let (updated, _) = replace_text(&original, old_text, new_text, replace_all).ok()?;
             Some(PersistedDiff {
-                path: path.to_str()?.to_string(),
+                path: path.absolute.to_str()?.to_string(),
                 old_text: Some(original),
                 new_text: updated,
             })
         }
         "write_file" => {
-            let path =
-                resolve_writable_path(session, required_string(arguments, "path").ok()?).ok()?;
+            let requested = required_string(arguments, "path").ok()?;
+            let path = workspace.resolve(requested).ok()?;
             let content = required_string(arguments, "content").ok()?;
-            let old_text = match tokio::fs::read_to_string(&path).await {
-                Ok(text) => Some(text),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            let old_text = match workspace.open_existing(requested) {
+                Ok((_, mut file)) => Some(read_open_text(&mut file).ok()?),
+                Err(error) if error.code == agent_client_protocol::ErrorCode::ResourceNotFound => {
+                    None
+                }
                 // Not text, a directory, or unreadable: showing it as a new
                 // file would hide that the write replaces something.
                 Err(_) => return None,
@@ -1080,16 +1174,19 @@ pub async fn preview_diff(
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
             if old_text.is_none() && !create_directories {
-                let parent = path.parent()?;
-                if !tokio::fs::metadata(parent)
-                    .await
-                    .is_ok_and(|metadata| metadata.is_dir())
-                {
+                let current = workspace.root_dir(path.root_index);
+                if !path.relative.parent().is_some_and(|parent| {
+                    current.is_dir(if parent.as_os_str().is_empty() {
+                        Path::new(".")
+                    } else {
+                        parent
+                    })
+                }) {
                     return None;
                 }
             }
             Some(PersistedDiff {
-                path: path.to_str()?.to_string(),
+                path: path.absolute.to_str()?.to_string(),
                 old_text,
                 new_text: content.to_string(),
             })
@@ -1655,24 +1752,6 @@ fn resolve_existing_path(
     Ok(canonical)
 }
 
-fn resolve_writable_path(
-    session: &SessionRecord,
-    path: &str,
-) -> Result<PathBuf, agent_client_protocol::Error> {
-    let path = normalize_lexically(&candidate_path(session, path));
-    let existing_ancestor = path
-        .ancestors()
-        .find(|ancestor| ancestor.exists())
-        .ok_or_else(|| {
-            agent_client_protocol::Error::invalid_params().data("path has no existing ancestor")
-        })?;
-    let canonical_ancestor = existing_ancestor
-        .canonicalize()
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-    ensure_in_roots(session, &canonical_ancestor)?;
-    Ok(path)
-}
-
 fn candidate_path(session: &SessionRecord, path: &str) -> PathBuf {
     let path = Path::new(path);
     if path.is_absolute() {
@@ -1700,22 +1779,6 @@ fn ensure_in_roots(
             path.display()
         )))
     }
-}
-
-fn normalize_lexically(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::Normal(part) => normalized.push(part),
-        }
-    }
-    normalized
 }
 
 fn is_noisy_directory(path: &Path) -> bool {
@@ -1754,10 +1817,6 @@ fn truncate(value: &str, max_bytes: usize) -> String {
         &value[..boundary],
         max_bytes
     )
-}
-
-fn session_output_budget(_session: &SessionRecord, fallback: usize) -> usize {
-    fallback
 }
 
 async fn read_limited<R: tokio::io::AsyncRead + Unpin>(
@@ -1920,7 +1979,7 @@ mod tests {
     #[test]
     fn lexical_normalization_stays_absolute() {
         assert_eq!(
-            normalize_lexically(Path::new("/a/b/../c")),
+            crate::workspace::normalize_lexically(Path::new("/a/b/../c")),
             PathBuf::from("/a/c")
         );
     }
@@ -2050,24 +2109,25 @@ mod tests {
         std::fs::write(cwd.join(".env"), "DEEPSEEK_API_KEY=secret\n").unwrap();
         std::fs::write(cwd.join("README.md"), "public documentation\n").unwrap();
         let session = session_in(&cwd);
+        let workspace = crate::workspace::WorkspaceRoots::open(&cwd, &[]).unwrap();
 
         assert!(!permission_required(
-            &session,
+            &workspace,
             "read_file",
             &json!({"path": "README.md"})
         ));
         assert!(permission_required(
-            &session,
+            &workspace,
             "read_file",
             &json!({"path": ".env"})
         ));
         assert!(permission_required(
-            &session,
+            &workspace,
             "read_file",
             &json!({"path": "deploy/credentials.json"})
         ));
         assert!(permission_required(
-            &session,
+            &workspace,
             "web_fetch",
             &json!({"url": "https://example.com/docs"})
         ));
@@ -2105,9 +2165,9 @@ mod tests {
         let cwd = temp.path().canonicalize().unwrap();
         std::fs::write(cwd.join(".env"), "DEEPSEEK_API_KEY=secret\n").unwrap();
         std::os::unix::fs::symlink(".env", cwd.join("notes.txt")).unwrap();
-        let session = session_in(&cwd);
+        let workspace = crate::workspace::WorkspaceRoots::open(&cwd, &[]).unwrap();
         assert!(permission_required(
-            &session,
+            &workspace,
             "read_file",
             &json!({"path": "notes.txt"})
         ));
@@ -2119,9 +2179,9 @@ mod tests {
         let cwd = temp.path().canonicalize().unwrap();
         std::fs::write(cwd.join("public.txt"), "TOKEN public\n").unwrap();
         std::fs::write(cwd.join("secrets.json"), "TOKEN private\n").unwrap();
-        let session = session_in(&cwd);
+        let workspace = crate::workspace::WorkspaceRoots::open(&cwd, &[]).unwrap();
         let result = search_files(
-            &session,
+            &workspace,
             &json!({"query": "TOKEN"}),
             &CancellationToken::new(),
         )
@@ -2130,7 +2190,7 @@ mod tests {
         assert!(!result.text.contains("secrets.json"), "{}", result.text);
         assert!(!result.text.contains("private"), "{}", result.text);
         let direct = search_files(
-            &session,
+            &workspace,
             &json!({"query": "TOKEN", "path": "secrets.json"}),
             &CancellationToken::new(),
         )
@@ -2172,16 +2232,16 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cwd = temp.path().canonicalize().unwrap();
         std::fs::write(cwd.join("a.txt"), "one two two\n").unwrap();
-        let session = session_in(&cwd);
+        let workspace = crate::workspace::WorkspaceRoots::open(&cwd, &[]).unwrap();
         let edit = |old: &str, replace_all: bool| json!({"path": "a.txt", "old_text": old, "new_text": "2", "replace_all": replace_all});
 
-        let diff = preview_diff(&session, "edit_file", &edit("one", false))
+        let diff = preview_diff(&workspace, "edit_file", &edit("one", false))
             .await
             .unwrap();
         assert_eq!(diff.path, cwd.join("a.txt").to_str().unwrap());
         assert_eq!(diff.old_text.as_deref(), Some("one two two\n"));
         assert_eq!(diff.new_text, "2 two two\n");
-        let all = preview_diff(&session, "edit_file", &edit("two", true))
+        let all = preview_diff(&workspace, "edit_file", &edit("two", true))
             .await
             .unwrap();
         assert_eq!(all.new_text, "one 2 2\n");
@@ -2192,24 +2252,28 @@ mod tests {
 
         // Ambiguous, missing text, missing file: the tool would fail.
         assert!(
-            preview_diff(&session, "edit_file", &edit("two", false))
+            preview_diff(&workspace, "edit_file", &edit("two", false))
                 .await
                 .is_none()
         );
         assert!(
-            preview_diff(&session, "edit_file", &edit("three", false))
+            preview_diff(&workspace, "edit_file", &edit("three", false))
                 .await
                 .is_none()
         );
         let missing = json!({"path": "b.txt", "old_text": "x", "new_text": "y"});
         assert!(
-            preview_diff(&session, "edit_file", &missing)
+            preview_diff(&workspace, "edit_file", &missing)
                 .await
                 .is_none()
         );
         std::fs::write(cwd.join("binary.bin"), [0xff, 0xfe, b'x']).unwrap();
         let binary = json!({"path": "binary.bin", "old_text": "x", "new_text": "y"});
-        assert!(preview_diff(&session, "edit_file", &binary).await.is_none());
+        assert!(
+            preview_diff(&workspace, "edit_file", &binary)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2217,15 +2281,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cwd = temp.path().canonicalize().unwrap();
         std::fs::write(cwd.join("a.txt"), "old\n").unwrap();
-        let session = session_in(&cwd);
+        let workspace = crate::workspace::WorkspaceRoots::open(&cwd, &[]).unwrap();
         let write = |path: &str| json!({"path": path, "content": "new\n"});
 
-        let replaced = preview_diff(&session, "write_file", &write("a.txt"))
+        let replaced = preview_diff(&workspace, "write_file", &write("a.txt"))
             .await
             .unwrap();
         assert_eq!(replaced.old_text.as_deref(), Some("old\n"));
         assert_eq!(replaced.new_text, "new\n");
-        let created = preview_diff(&session, "write_file", &write("sub/b.txt"))
+        let created = preview_diff(&workspace, "write_file", &write("sub/b.txt"))
             .await
             .unwrap();
         assert_eq!(created.path, cwd.join("sub/b.txt").to_str().unwrap());
@@ -2233,13 +2297,13 @@ mod tests {
         assert!(!cwd.join("sub").exists());
         let no_parent = json!({"path": "sub/b.txt", "content": "x", "create_directories": false});
         assert!(
-            preview_diff(&session, "write_file", &no_parent)
+            preview_diff(&workspace, "write_file", &no_parent)
                 .await
                 .is_none()
         );
         std::fs::write(cwd.join("binary.bin"), [0xff, 0xfe]).unwrap();
         assert!(
-            preview_diff(&session, "write_file", &write("binary.bin"))
+            preview_diff(&workspace, "write_file", &write("binary.bin"))
                 .await
                 .is_none()
         );
@@ -2252,20 +2316,28 @@ mod tests {
         std::fs::write(&secret, "secret\n").unwrap();
         let temp = tempfile::tempdir().unwrap();
         let cwd = temp.path().canonicalize().unwrap();
-        let session = session_in(&cwd);
+        let workspace = crate::workspace::WorkspaceRoots::open(&cwd, &[]).unwrap();
         let secret_path = secret.to_str().unwrap();
 
         let edit = json!({"path": secret_path, "old_text": "secret", "new_text": "x"});
-        assert!(preview_diff(&session, "edit_file", &edit).await.is_none());
+        assert!(preview_diff(&workspace, "edit_file", &edit).await.is_none());
         let write = json!({"path": secret_path, "content": "x"});
-        assert!(preview_diff(&session, "write_file", &write).await.is_none());
+        assert!(
+            preview_diff(&workspace, "write_file", &write)
+                .await
+                .is_none()
+        );
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&secret, cwd.join("link.txt")).unwrap();
             let edit = json!({"path": "link.txt", "old_text": "secret", "new_text": "x"});
-            assert!(preview_diff(&session, "edit_file", &edit).await.is_none());
+            assert!(preview_diff(&workspace, "edit_file", &edit).await.is_none());
             let write = json!({"path": "link.txt", "content": "x"});
-            assert!(preview_diff(&session, "write_file", &write).await.is_none());
+            assert!(
+                preview_diff(&workspace, "write_file", &write)
+                    .await
+                    .is_none()
+            );
         }
     }
 

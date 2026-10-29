@@ -321,11 +321,13 @@ patch in v2). When the change cannot be worked out, for example because the
 text to replace is not in the file, they carry no diff and the tool reports
 the error when it runs.
 
-ACP v1 may delegate text file access and terminal execution to a capable client.
-A command that runs in the client's terminal puts that terminal in its tool
-call as soon as the client creates it. The final update keeps the terminal and
-adds the result text only if the command failed; replay after `session/load`
-shows the result text, because the terminal has been released.
+File, directory, and search tools use local capability-confined operations in
+both protocol versions, so they do not re-resolve a workspace root path after
+approval. ACP v1 may still delegate terminal execution to a capable client. A
+command that runs in the client's terminal puts that terminal in its tool call
+as soon as the client creates it. The final update keeps the terminal and adds
+the result text only if the command failed; replay after `session/load` shows
+the result text, because the terminal has been released.
 ACP v2 has no client filesystem or terminal execution methods; use an MCP server,
 such as an MCP-over-ACP server, for client-provided tools.
 
