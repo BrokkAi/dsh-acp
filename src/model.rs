@@ -607,6 +607,8 @@ pub struct SessionState {
     /// Cloned out before any MCP request, so the state lock is never held
     /// while waiting on an MCP server and `session/cancel` can reach the turn.
     pub mcp: Option<Arc<crate::mcp::McpSession>>,
+    /// Stable directory capabilities for the session's canonical roots.
+    pub workspace: Option<Arc<crate::workspace::WorkspaceRoots>>,
 }
 
 impl SessionRuntime {
@@ -623,6 +625,7 @@ impl SessionRuntime {
                 prompt_seq: 0,
                 session_approvals: std::collections::HashSet::new(),
                 mcp: None,
+                workspace: None,
             })),
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             turn_lock: Arc::new(tokio::sync::Mutex::new(())),

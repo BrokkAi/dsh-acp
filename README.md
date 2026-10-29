@@ -15,8 +15,8 @@ and falls back to ACP v1 for older clients. It serves ACP over stdio, or over
 streamable HTTP and WebSocket with `--listen`.
 
 It is not a chat-only adapter. The agent can stream reasoning and responses,
-call filesystem and terminal operations through the ACP client, run local
-fallback tools, use permission prompts, consume MCP servers, persist and replay
+run capability-confined local file tools, use terminal operations through the
+ACP client, use permission prompts, consume MCP servers, persist and replay
 sessions, switch modes and models, and report token usage.
 
 > `dsh-acp` is an independent community project. DeepSeek is a product of its
@@ -320,10 +320,10 @@ rejects loopback, private, shared/CGNAT, link-local, multicast, documentation,
 benchmark, and other reserved ranges, connects directly, and does not use
 ambient proxy settings.
 
-In v1, when the ACP client advertises filesystem and terminal capabilities,
-the corresponding reverse requests are used. Local implementations are
-available as fallbacks. ACP v2 no longer exposes those client capabilities, so
-v2 uses the local workspace tools directly.
+File, directory, and search tools always use local directory capabilities, so
+the checked workspace root and the connected file operation cannot be changed
+between approval and execution. In v1, a command may use the ACP client's
+terminal capability; without it, commands run locally.
 
 MCP tools are exposed to the model as
 `mcp__<server>__<tool>`. Stdio servers, modern streamable HTTP servers, and
@@ -447,7 +447,8 @@ security boundaries, and concurrency model.
 ## Security model
 
 - File tools are confined to the session `cwd` and additional workspace roots,
-  with symlink and lexical escape checks.
+  using canonical root handles rather than re-resolving root paths per
+  operation. Files with multiple hard links are rejected.
 - Writes, commands, MCP calls, sensitive-file reads, and web requests require
   ACP permission unless the session policy or a narrowly scoped in-session
   "allow always" decision authorizes them.

@@ -727,6 +727,10 @@ impl Harness {
             Ok(runtime) => runtime,
             Err(error) => return responder.respond_with_error(error),
         };
+        let requested_cwd = match crate::workspace::canonical_directory(&request.cwd) {
+            Ok(cwd) => cwd,
+            Err(error) => return responder.respond_with_error(error),
+        };
         if runtime
             .state
             .lock()
@@ -745,11 +749,11 @@ impl Harness {
         }
         let instructions = {
             let state = runtime.state.lock().await;
-            if state.record.cwd != request.cwd {
+            if state.record.cwd != requested_cwd {
                 return responder.respond_with_error(Error::invalid_params().data(format!(
                     "session cwd mismatch: stored {}, requested {}",
                     state.record.cwd.display(),
-                    request.cwd.display()
+                    requested_cwd.display()
                 )));
             }
             match self.store.session_instructions(
@@ -773,6 +777,9 @@ impl Harness {
             return responder.respond_with_error(error);
         }
         instructions.install(&mut runtime.state.lock().await.record);
+        if let Err(error) = self.store.refresh_workspace(&runtime).await {
+            return responder.respond_with_error(error);
+        }
         if let Err(error) = self.store.save(&runtime).await {
             return responder.respond_with_error(error);
         }
@@ -810,6 +817,10 @@ impl Harness {
             Ok(runtime) => runtime,
             Err(error) => return responder.respond_with_error(error),
         };
+        let requested_cwd = match crate::workspace::canonical_directory(&request.cwd) {
+            Ok(cwd) => cwd,
+            Err(error) => return responder.respond_with_error(error),
+        };
         if runtime
             .state
             .lock()
@@ -823,11 +834,11 @@ impl Harness {
         }
         let instructions = {
             let state = runtime.state.lock().await;
-            if state.record.cwd != request.cwd {
+            if state.record.cwd != requested_cwd {
                 return responder.respond_with_error(Error::invalid_params().data(format!(
                     "session cwd mismatch: stored {}, requested {}",
                     state.record.cwd.display(),
-                    request.cwd.display()
+                    requested_cwd.display()
                 )));
             }
             if let Err(error) =
@@ -857,6 +868,9 @@ impl Harness {
             return responder.respond_with_error(error);
         }
         instructions.install(&mut runtime.state.lock().await.record);
+        if let Err(error) = self.store.refresh_workspace(&runtime).await {
+            return responder.respond_with_error(error);
+        }
         if let Err(error) = self.store.save(&runtime).await {
             return responder.respond_with_error(error);
         }
@@ -879,6 +893,10 @@ impl Harness {
             Ok(runtime) => runtime,
             Err(error) => return responder.respond_with_error(error),
         };
+        let requested_cwd = match crate::workspace::canonical_directory(&request.cwd) {
+            Ok(cwd) => cwd,
+            Err(error) => return responder.respond_with_error(error),
+        };
         if source_runtime
             .state
             .lock()
@@ -891,11 +909,11 @@ impl Harness {
             );
         }
         let source = source_runtime.snapshot().await;
-        if source.cwd != request.cwd {
+        if source.cwd != requested_cwd {
             return responder.respond_with_error(Error::invalid_params().data(format!(
                 "session cwd mismatch: stored {}, requested {}",
                 source.cwd.display(),
-                request.cwd.display()
+                requested_cwd.display()
             )));
         }
         let system_prompt = match client_system_prompt(request.system_prompt.as_ref()) {
@@ -905,7 +923,7 @@ impl Harness {
         let runtime = match self
             .store
             .create(
-                request.cwd,
+                requested_cwd,
                 request.additional_directories,
                 system_prompt,
                 Some(source.id.clone()),
@@ -1519,10 +1537,18 @@ impl Harness {
             .elicitation
             .as_ref()
             .is_some_and(|capabilities| capabilities.supports_url());
+        let workspace = runtime
+            .state
+            .lock()
+            .await
+            .workspace
+            .clone()
+            .ok_or_else(|| Error::internal_error().data("session workspace is unavailable"))?;
         let access = ToolAccess {
             connection: Some(connection.clone()),
             client: client_capabilities,
             config: self.config.clone(),
+            workspace,
         };
         let mut final_usage = initial_record.usage;
         // ACP v1 defines the prompt response's usage as this turn's; the record
@@ -1917,7 +1943,7 @@ impl Harness {
         let preview = if refused_in_plan_mode {
             None
         } else {
-            crate::tools::preview_diff(&record, &call.function.name, &arguments).await
+            crate::tools::preview_diff(&access.workspace, &call.function.name, &arguments).await
         };
         access
             .connection
@@ -2035,7 +2061,7 @@ impl Harness {
         }
 
         let needs_permission =
-            crate::tools::permission_required(&record, &call.function.name, &arguments)
+            crate::tools::permission_required(&access.workspace, &call.function.name, &arguments)
                 || call.function.name.starts_with("mcp__");
         if needs_permission && !cancellation.is_cancelled() {
             let record = runtime.snapshot().await;

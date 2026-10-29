@@ -107,7 +107,12 @@ impl SessionStore {
         system_prompt: Option<ClientSystemPrompt>,
         parent_session_id: Option<String>,
     ) -> Result<SessionRuntime, Error> {
-        validate_roots(&cwd, &additional_directories)?;
+        let workspace = crate::workspace::WorkspaceRoots::open(&cwd, &additional_directories)?;
+        let cwd = workspace.cwd().to_path_buf();
+        let additional_directories = workspace
+            .additional()
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
         let mut record = SessionRecord::new(
             cwd,
             additional_directories,
@@ -119,6 +124,7 @@ impl SessionStore {
         );
         record.install_system_prompt(self.effective_system_prompt(&record)?);
         let runtime = SessionRuntime::new(record.clone());
+        runtime.state.lock().await.workspace = Some(Arc::new(workspace));
         self.save_record(&record).await?;
         self.sessions
             .lock()
@@ -135,15 +141,36 @@ impl SessionStore {
         // the stored record between this read and the insert below, where the
         // session's next save would overwrite the new title.
         let _write_guard = self.write_lock.lock().await;
-        let record = self.read_record(id).await?;
-        let mut record = record;
+        let mut record = self.read_record(id).await?;
+        let workspace = crate::workspace::WorkspaceRoots::open_stored(
+            &record.cwd,
+            &record.additional_directories,
+        )?;
+        record.cwd = workspace.cwd().to_path_buf();
+        record.additional_directories = workspace
+            .additional()
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
         // Before pending steering is appended after the interrupted calls.
         record.close_interrupted_tool_calls();
         record.flush_pending_steering();
         record.install_system_prompt(self.effective_system_prompt(&record)?);
         let runtime = SessionRuntime::new(record);
+        runtime.state.lock().await.workspace = Some(Arc::new(workspace));
         let mut sessions = self.sessions.lock().await;
         Ok(sessions.entry(id.to_string()).or_insert(runtime).clone())
+    }
+
+    /// Reopen the root capabilities after a load or resume changes the
+    /// session's additional directories.
+    pub async fn refresh_workspace(&self, runtime: &SessionRuntime) -> Result<(), Error> {
+        let record = runtime.snapshot().await;
+        let workspace = crate::workspace::WorkspaceRoots::open_stored(
+            &record.cwd,
+            &record.additional_directories,
+        )?;
+        runtime.state.lock().await.workspace = Some(Arc::new(workspace));
+        Ok(())
     }
 
     /// Finds a session without loading it, unlike [`Self::get`].
@@ -430,7 +457,7 @@ impl SessionStore {
             .filter(|root| seen.insert(*root));
         for root in roots {
             let path = root.join("AGENTS.md");
-            let Some(instructions) = read_instructions(root, &path)? else {
+            let Some(instructions) = read_instructions(root)? else {
                 continue;
             };
             prompt.push_str("\nUntrusted instruction file at ");
@@ -461,7 +488,16 @@ impl SessionStore {
         system_prompt: Option<ClientSystemPrompt>,
     ) -> Result<SessionInstructions, Error> {
         let mut candidate = record.clone();
-        candidate.additional_directories = additional_directories;
+        let additional_directories = additional_directories
+            .iter()
+            .map(|path| crate::workspace::canonical_directory(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        let workspace =
+            crate::workspace::WorkspaceRoots::open_stored(&candidate.cwd, &additional_directories)?;
+        candidate.additional_directories = workspace
+            .additional()
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
         if let Some(system_prompt) = system_prompt.clone() {
             candidate.set_client_system_prompt(system_prompt);
         }
@@ -524,55 +560,26 @@ impl SessionInstructions {
     }
 }
 
-fn read_instructions(root: &Path, path: &Path) -> Result<Option<String>, Error> {
-    let root = root.canonicalize().map_err(|error| {
+fn read_instructions(root: &Path) -> Result<Option<String>, Error> {
+    let path = root.join("AGENTS.md");
+    let workspace = crate::workspace::WorkspaceRoots::open(root, &[]).map_err(|error| {
         Error::internal_error().data(format!(
-            "failed to resolve instruction root {}: {error}",
-            root.display()
+            "failed to resolve instruction root {}: {}",
+            root.display(),
+            crate::tools::error_reason(&error)
         ))
     })?;
-    let target = match path.canonicalize() {
-        Ok(target) => target,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    let file = match workspace.open_existing("AGENTS.md") {
+        Ok((_, file)) => file,
+        Err(error) if error.code == ErrorCode::ResourceNotFound => return Ok(None),
         Err(error) => {
-            return Err(Error::internal_error().data(format!(
-                "failed to resolve instructions from {}: {error}",
-                path.display()
+            return Err(Error::invalid_params().data(format!(
+                "failed to open instructions from {}: {}",
+                path.display(),
+                crate::tools::error_reason(&error)
             )));
         }
     };
-    if !target.starts_with(&root) {
-        return Err(Error::invalid_params().data(format!(
-            "instructions from {} resolve outside allowed root {}",
-            path.display(),
-            root.display()
-        )));
-    }
-    let metadata = std::fs::metadata(&target).map_err(|error| {
-        Error::internal_error().data(format!(
-            "failed to inspect instructions from {}: {error}",
-            path.display()
-        ))
-    })?;
-    if !metadata.is_file() {
-        return Err(Error::invalid_params().data(format!(
-            "instructions from {} are not a regular file",
-            path.display()
-        )));
-    }
-    if metadata.len() > MAX_INSTRUCTION_BYTES {
-        return Err(Error::invalid_params().data(format!(
-            "instructions from {} exceed the {} byte limit",
-            path.display(),
-            MAX_INSTRUCTION_BYTES
-        )));
-    }
-    let file = std::fs::File::open(&target).map_err(|error| {
-        Error::internal_error().data(format!(
-            "failed to open instructions from {}: {error}",
-            path.display()
-        ))
-    })?;
     let metadata = file.metadata().map_err(|error| {
         Error::internal_error().data(format!(
             "failed to inspect opened instructions from {}: {error}",
@@ -649,24 +656,7 @@ pub fn session_title(record: &SessionRecord) -> Option<String> {
 }
 
 pub(crate) fn validate_roots(cwd: &Path, additional: &[PathBuf]) -> Result<(), Error> {
-    if !cwd.is_absolute() {
-        return Err(Error::invalid_params().data("session cwd must be absolute"));
-    }
-    if !cwd.is_dir() {
-        return Err(Error::resource_not_found(Some(cwd.display().to_string())));
-    }
-    for path in additional {
-        if !path.is_absolute() {
-            return Err(Error::invalid_params().data(format!(
-                "additional directory must be absolute: {}",
-                path.display()
-            )));
-        }
-        if !path.is_dir() {
-            return Err(Error::resource_not_found(Some(path.display().to_string())));
-        }
-    }
-    Ok(())
+    crate::workspace::WorkspaceRoots::open(cwd, additional).map(drop)
 }
 
 #[cfg(test)]
@@ -708,6 +698,52 @@ mod tests {
         store.save(&runtime).await.unwrap();
         assert!(store.list(None).await.unwrap().is_empty());
         assert!(store.get("../../outside").await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn creates_sessions_with_canonical_root_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let additional = temp.path().join("additional");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&additional).unwrap();
+        std::os::unix::fs::symlink(&workspace, temp.path().join("workspace-link")).unwrap();
+        std::os::unix::fs::symlink(&additional, temp.path().join("additional-link")).unwrap();
+        let config = Config {
+            api_key: None,
+            base_url: "http://localhost".to_string(),
+            default_model: "deepseek-flash".to_string(),
+            models: vec!["deepseek-flash".to_string()],
+            data_dir: temp.path().join("data"),
+            permission_mode: PermissionMode::Ask,
+            system_prompt: None,
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::High,
+            context_chars: 1000,
+            tool_output_bytes: 1000,
+            http_timeout: std::time::Duration::from_secs(1),
+            mcp_connect_timeout: std::time::Duration::from_secs(1),
+            disable_web: true,
+            trace: false,
+        };
+        let store = SessionStore::open(&config).await.unwrap();
+        let runtime = store
+            .create(
+                temp.path().join("workspace-link"),
+                vec![temp.path().join("additional-link")],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let record = runtime.snapshot().await;
+        assert_eq!(record.cwd, workspace.canonicalize().unwrap());
+        assert_eq!(
+            record.additional_directories,
+            [additional.canonicalize().unwrap()]
+        );
+        assert!(runtime.state.lock().await.workspace.is_some());
     }
 
     #[tokio::test]

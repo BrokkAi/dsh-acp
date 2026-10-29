@@ -146,8 +146,11 @@ lossy text reconstruction.
 
 ## Security boundaries
 
-Workspace roots are canonicalized and checked before tool access. Writable paths
-check the nearest existing ancestor before creating files. `web_fetch` follows
+Workspace roots are canonicalized and opened as directory capabilities when a
+session is created or loaded. File, directory, search, preview, and mutation
+operations are relative to those handles, so replacing a root or ancestor path
+after approval does not redirect them. Existing files with multiple hard links
+are rejected because their other names cannot be confined. `web_fetch` follows
 redirects itself, rejects every address in a DNS answer unless it is globally
 routable, and pins the validated addresses as the request resolver. It bypasses
 ambient proxy configuration so the checked address is the connected address.
