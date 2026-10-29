@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    ffi::OsString,
     process::Stdio,
     sync::{Arc, PoisonError, RwLock, RwLockReadGuard},
     time::Duration,
@@ -706,6 +707,104 @@ struct StdioTransport {
     next_id: u64,
 }
 
+/// Environment variables a stdio MCP server may inherit from the agent.
+///
+/// MCP servers are third-party programs. They get only the values needed to
+/// start and run normally; credentials and toolchain injection variables must
+/// be named explicitly in the server's `env` configuration.
+const MCP_INHERITED_ENV: &[&str] = &[
+    // Unix process basics.
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "TZ",
+    "TERM",
+    "COLORTERM",
+    // Common locale settings.
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_ADDRESS",
+    "LC_COLLATE",
+    "LC_CTYPE",
+    "LC_IDENTIFICATION",
+    "LC_MEASUREMENT",
+    "LC_MESSAGES",
+    "LC_MONETARY",
+    "LC_NAME",
+    "LC_NUMERIC",
+    "LC_PAPER",
+    "LC_TELEPHONE",
+    "LC_TIME",
+    // Windows process basics. Environment names are case-insensitive there.
+    "ALLUSERSPROFILE",
+    "APPDATA",
+    "COMMONPROGRAMFILES",
+    "COMMONPROGRAMFILES(X86)",
+    "COMMONPROGRAMW6432",
+    "COMSPEC",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LOCALAPPDATA",
+    "NUMBER_OF_PROCESSORS",
+    "OS",
+    "PATHEXT",
+    "PROCESSOR_ARCHITECTURE",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "PROGRAMW6432",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "WINDIR",
+];
+
+fn environment_names_match(left: &str, right: &str) -> bool {
+    if cfg!(windows) {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
+}
+
+/// The environment passed to a stdio MCP process. Explicit server variables
+/// win over an inherited baseline value with the same name.
+fn stdio_mcp_environment(
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+    configured: &[EnvVariable],
+) -> Vec<(OsString, OsString)> {
+    let mut environment = inherited
+        .into_iter()
+        .filter(|(name, _)| {
+            name.to_str().is_some_and(|name| {
+                MCP_INHERITED_ENV
+                    .iter()
+                    .any(|allowed| environment_names_match(name, allowed))
+            })
+        })
+        .filter(|(name, _)| {
+            !name.to_str().is_some_and(|name| {
+                configured
+                    .iter()
+                    .any(|variable| environment_names_match(name, &variable.name))
+            })
+        })
+        .collect::<Vec<_>>();
+    environment.extend(configured.iter().map(|variable| {
+        (
+            OsString::from(&variable.name),
+            OsString::from(&variable.value),
+        )
+    }));
+    environment
+}
+
 impl StdioTransport {
     fn spawn(
         command: &std::path::Path,
@@ -719,8 +818,9 @@ impl StdioTransport {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        for variable in env {
-            process.env(&variable.name, &variable.value);
+        process.env_clear();
+        for (name, value) in stdio_mcp_environment(std::env::vars_os(), env) {
+            process.env(name, value);
         }
         let mut child = process.spawn().map_err(Error::into_internal_error)?;
         let stdin = child
@@ -1144,6 +1244,48 @@ mod tests {
         let truncated = truncate_body(&body);
         assert!(truncated.ends_with("[...truncated...]"));
         assert!(truncated.len() <= ERROR_BODY_BYTES + "[...truncated...]".len());
+    }
+
+    #[test]
+    fn stdio_mcp_environment_is_allowlisted_and_explicit_values_win() {
+        let inherited = [
+            (OsString::from("PATH"), OsString::from("/usr/bin")),
+            (
+                OsString::from("DEEPSEEK_API_KEY"),
+                OsString::from("ambient-provider-secret"),
+            ),
+            (
+                OsString::from("AWS_SECRET_ACCESS_KEY"),
+                OsString::from("ambient-cloud-secret"),
+            ),
+            (
+                OsString::from("EXPLICIT_MCP_TOKEN"),
+                OsString::from("ambient-value"),
+            ),
+        ];
+        let configured = [EnvVariable::new("EXPLICIT_MCP_TOKEN", "configured-value")];
+
+        let environment = stdio_mcp_environment(inherited, &configured);
+
+        assert!(environment.contains(&(OsString::from("PATH"), OsString::from("/usr/bin"))));
+        assert!(
+            !environment
+                .iter()
+                .any(|(name, _)| name == "DEEPSEEK_API_KEY")
+        );
+        assert!(
+            !environment
+                .iter()
+                .any(|(name, _)| name == "AWS_SECRET_ACCESS_KEY")
+        );
+        assert_eq!(
+            environment
+                .iter()
+                .filter(|(name, _)| name == "EXPLICIT_MCP_TOKEN")
+                .map(|(_, value)| value.as_os_str())
+                .collect::<Vec<_>>(),
+            [OsString::from("configured-value").as_os_str()]
+        );
     }
 
     #[test]

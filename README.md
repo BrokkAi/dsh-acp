@@ -322,6 +322,12 @@ MCP tools are exposed to the model as
 servers the ACP client provides over the ACP connection (MCP-over-ACP, a draft
 RFD) are supported; a session can declare multiple servers.
 
+Stdio MCP servers receive only a small platform baseline (`PATH`, home and
+temporary-directory locations, locale, and Windows process basics). They do
+not inherit provider or other ambient credentials. Put every additional
+environment value a server needs, including secrets from a secret manager, in
+that server's explicit `env` configuration.
+
 An MCP-over-ACP server is declared with `"type": "acp"`, a `name`, and the
 client's `serverId`. Each MCP request is an `mcp/message` request to the
 client, using MCP 2026-07-28 with no `initialize` handshake. The agent does
@@ -436,6 +442,8 @@ security boundaries, and concurrency model.
   with symlink and lexical escape checks.
 - Writes, commands, and MCP calls request ACP permission unless policy or an
   in-session "allow always" decision authorizes them.
+- Stdio MCP processes receive an allowlisted environment plus variables the
+  client explicitly configures for that server.
 - `web_fetch` rejects loopback, private, link-local, multicast, and unsafe
   redirect targets.
 - Credentials are read from launch configuration or provider requests and are

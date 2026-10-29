@@ -5210,6 +5210,59 @@ fn silent_stdio_mcp_server(pid_file: &std::path::Path) -> Value {
     })
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn a_stdio_mcp_server_gets_only_explicit_secrets() {
+    let temp = tempfile::tempdir().unwrap();
+    let observation = temp.path().join("mcp-environment.txt");
+    let script = r#"
+        if [ "${DEEPSEEK_API_KEY+x}" = x ]; then
+            printf 'provider-secret-present' > "$1"
+        else
+            printf 'provider-secret-absent' > "$1"
+        fi
+        printf '\n%s' "${EXPLICIT_MCP_TOKEN-unset}" >> "$1"
+        read -r line
+        echo '{"jsonrpc":"2.0","id":1,"result":{}}'
+        read -r line
+        read -r line
+        echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}'
+        while read -r line; do :; done
+    "#;
+    let mut peer = spawn_peer(temp.path(), Some("http://127.0.0.1:1")).await;
+    peer.request("initialize", json!({"protocolVersion": 1}))
+        .await;
+    peer.request(
+        "session/new",
+        json!({
+            "cwd": temp.path().to_string_lossy(),
+            "mcpServers": [{
+                "name": "environment-check",
+                "command": "/bin/sh",
+                "args": [
+                    "-c",
+                    script,
+                    "sh",
+                    observation.to_string_lossy()
+                ],
+                "env": [{
+                    "name": "EXPLICIT_MCP_TOKEN",
+                    "value": "configured-secret"
+                }]
+            }],
+            "additionalDirectories": []
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        std::fs::read_to_string(observation).unwrap(),
+        "provider-secret-absent\nconfigured-secret"
+    );
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+}
+
 /// Sends a lifecycle request that declares a silent MCP server to a peer
 /// started with a one-second connect timeout. It must fail promptly with an
 /// error naming the server and the setting, with the server process gone.
