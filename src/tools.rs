@@ -1,5 +1,5 @@
 use std::{
-    io::{Read, Seek, SeekFrom, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -27,6 +27,11 @@ use crate::{
     },
     session::SessionStore,
 };
+
+const MAX_FILE_SCAN_BYTES: usize = 64 * 1024 * 1024;
+const MAX_EDIT_FILE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SEARCH_FILE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SEARCH_ENTRIES: usize = 100_000;
 
 #[derive(Clone)]
 pub struct ToolAccess {
@@ -716,12 +721,6 @@ async fn read_file(
     let (path, mut file) = access
         .workspace
         .open_existing(required_string(arguments, "path")?)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(agent_client_protocol::Error::into_internal_error)?;
-    let content = String::from_utf8(bytes).map_err(|_| {
-        agent_client_protocol::Error::invalid_request().data("workspace file is not valid UTF-8")
-    })?;
     let start = arguments
         .get("start_line")
         .and_then(Value::as_u64)
@@ -735,22 +734,112 @@ async fn read_file(
     if cancellation.is_cancelled() {
         return Err(agent_client_protocol::Error::request_cancelled());
     }
-    let selected = content
-        .lines()
-        .skip(start.saturating_sub(1))
-        .take(limit)
-        .map(|line| format!("{line}\n"))
-        .collect::<String>();
-    let selected = truncate(&selected, access.config.tool_output_bytes);
+    let (selected, truncated) =
+        read_selected_lines(&mut file, start, limit, access.config.tool_output_bytes)
+            .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let mut selected = if truncated {
+        String::from_utf8_lossy(&selected).into_owned()
+    } else {
+        String::from_utf8(selected).map_err(|_| {
+            agent_client_protocol::Error::invalid_request()
+                .data("workspace file is not valid UTF-8")
+        })?
+    };
+    if truncated {
+        selected.push_str(&format!(
+            "\n\n[... output truncated at {} bytes ...]",
+            access.config.tool_output_bytes
+        ));
+    }
     Ok(ToolResult {
         text: selected.clone(),
         raw: json!({
             "path": path.absolute,
             "content": selected,
             "start_line": start,
-            "limit": limit
+            "limit": limit,
+            "truncated": truncated
         }),
     })
+}
+
+fn read_selected_lines(
+    file: &mut cap_std::fs::File,
+    start_line: usize,
+    line_limit: usize,
+    output_limit: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut reader = BufReader::new(file);
+    let mut scanned = 0usize;
+    for _ in 1..start_line {
+        if !consume_line(&mut reader, &mut scanned)? {
+            return Ok((Vec::new(), false));
+        }
+    }
+
+    let mut output = Vec::with_capacity(output_limit.min(32 * 1024));
+    let mut truncated = false;
+    for _ in 0..line_limit {
+        loop {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                if !truncated
+                    && output.last().is_some_and(|byte| *byte != b'\n')
+                    && output.len() < output_limit
+                {
+                    output.push(b'\n');
+                }
+                return Ok((output, truncated));
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let available_take = newline.map_or(available.len(), |position| position + 1);
+            scanned = scanned.saturating_add(available_take);
+            if scanned > MAX_FILE_SCAN_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "file scan exceeded the {MAX_FILE_SCAN_BYTES}-byte limit before the requested range"
+                    ),
+                ));
+            }
+            let remaining = output_limit.saturating_sub(output.len());
+            let take = remaining.min(available_take);
+            output.extend_from_slice(&available[..take]);
+            reader.consume(available_take);
+            if take < available_take {
+                truncated = true;
+                return Ok((output, truncated));
+            }
+            if newline.is_some() {
+                break;
+            }
+        }
+    }
+    Ok((output, truncated))
+}
+
+fn consume_line<R: BufRead>(reader: &mut R, scanned: &mut usize) -> std::io::Result<bool> {
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(false);
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |position| position + 1);
+        *scanned = scanned.saturating_add(take);
+        if *scanned > MAX_FILE_SCAN_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "file scan exceeded the {MAX_FILE_SCAN_BYTES}-byte limit before the requested range"
+                ),
+            ));
+        }
+        reader.consume(take);
+        if newline.is_some() {
+            return Ok(true);
+        }
+    }
 }
 
 fn list_directory(
@@ -906,12 +995,16 @@ fn search_files(
         .clamp(1, 2000) as usize;
 
     let mut matches = Vec::new();
+    let mut options = SearchOptions {
+        regex: &regex,
+        path_filter: path_filter.as_ref(),
+        max_results,
+        visited: 0,
+    };
     search_directory(
         &directory,
         Path::new(""),
-        &regex,
-        path_filter.as_ref(),
-        max_results,
+        &mut options,
         cancellation,
         &mut matches,
     )?;
@@ -922,16 +1015,21 @@ fn search_files(
     })
 }
 
+struct SearchOptions<'a> {
+    regex: &'a regex::Regex,
+    path_filter: Option<&'a regex::Regex>,
+    max_results: usize,
+    visited: usize,
+}
+
 fn search_directory(
     directory: &cap_std::fs::Dir,
     prefix: &Path,
-    regex: &regex::Regex,
-    path_filter: Option<&regex::Regex>,
-    max_results: usize,
+    options: &mut SearchOptions<'_>,
     cancellation: &CancellationToken,
     matches: &mut Vec<String>,
 ) -> Result<(), agent_client_protocol::Error> {
-    if matches.len() >= max_results {
+    if matches.len() >= options.max_results {
         return Ok(());
     }
     let children = directory
@@ -944,6 +1042,14 @@ fn search_directory(
         let Ok(child) = child else {
             continue;
         };
+        options.visited += 1;
+        if options.visited > MAX_SEARCH_ENTRIES {
+            return Err(
+                agent_client_protocol::Error::invalid_request().data(format!(
+                    "search_files exceeded the {MAX_SEARCH_ENTRIES}-entry limit"
+                )),
+            );
+        }
         let relative = prefix.join(child.file_name());
         if is_hidden_path(&relative)
             || is_noisy_directory(&relative)
@@ -958,19 +1064,13 @@ fn search_directory(
             let child_dir = child
                 .open_dir()
                 .map_err(agent_client_protocol::Error::into_internal_error)?;
-            search_directory(
-                &child_dir,
-                &relative,
-                regex,
-                path_filter,
-                max_results,
-                cancellation,
-                matches,
-            )?;
+            search_directory(&child_dir, &relative, options, cancellation, matches)?;
             continue;
         }
         if !file_type.is_file()
-            || path_filter.is_some_and(|filter| !filter.is_match(&relative.to_string_lossy()))
+            || options
+                .path_filter
+                .is_some_and(|filter| !filter.is_match(&relative.to_string_lossy()))
         {
             continue;
         }
@@ -984,26 +1084,26 @@ fn search_directory(
         {
             continue;
         }
-        let Ok(content) = read_open_text(&mut file) else {
+        let Ok(content) = read_open_text(&mut file, MAX_SEARCH_FILE_BYTES) else {
             continue;
         };
         if content.as_bytes().contains(&0) {
             continue;
         }
         for (line_index, line) in content.lines().enumerate() {
-            if regex.is_match(line) {
+            if options.regex.is_match(line) {
                 matches.push(format!(
                     "{}:{}:{}",
                     relative.display(),
                     line_index + 1,
                     truncate(line, 500)
                 ));
-                if matches.len() >= max_results {
+                if matches.len() >= options.max_results {
                     return Ok(());
                 }
             }
         }
-        if matches.len() >= max_results {
+        if matches.len() >= options.max_results {
             return Ok(());
         }
     }
@@ -1027,7 +1127,7 @@ async fn write_file(
     if cancellation.is_cancelled() {
         return Err(agent_client_protocol::Error::request_cancelled());
     }
-    let old_text = read_open_text(&mut file).ok();
+    let old_text = read_open_text(&mut file, MAX_EDIT_FILE_BYTES).ok();
     file.seek(SeekFrom::Start(0))
         .and_then(|_| file.set_len(0))
         .and_then(|_| file.write_all(content.as_bytes()))
@@ -1063,8 +1163,8 @@ async fn edit_file(
     let (path, mut file) = access
         .workspace
         .open_writable(required_string(arguments, "path")?, false)?;
-    let original =
-        read_open_text(&mut file).map_err(agent_client_protocol::Error::into_internal_error)?;
+    let original = read_open_text(&mut file, MAX_EDIT_FILE_BYTES)
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
     let (updated, occurrences) = replace_text(&original, old_text, new_text, replace_all)?;
     if cancellation.is_cancelled() {
         return Err(agent_client_protocol::Error::request_cancelled());
@@ -1090,10 +1190,22 @@ async fn edit_file(
     })
 }
 
-fn read_open_text(file: &mut cap_std::fs::File) -> std::io::Result<String> {
+fn read_open_text(file: &mut cap_std::fs::File, limit: usize) -> std::io::Result<String> {
+    if file.metadata()?.len() > limit as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file exceeds the {limit}-byte read limit"),
+        ));
+    }
     file.seek(SeekFrom::Start(0))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    let mut bytes = Vec::with_capacity(limit.min(32 * 1024));
+    Read::take(file, limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file exceeds the {limit}-byte read limit"),
+        ));
+    }
     String::from_utf8(bytes)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
@@ -1148,7 +1260,7 @@ pub async fn preview_diff(
                 .get("replace_all")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let original = read_open_text(&mut file).ok()?;
+            let original = read_open_text(&mut file, MAX_EDIT_FILE_BYTES).ok()?;
             let (updated, _) = replace_text(&original, old_text, new_text, replace_all).ok()?;
             Some(PersistedDiff {
                 path: path.absolute.to_str()?.to_string(),
@@ -1161,7 +1273,7 @@ pub async fn preview_diff(
             let path = workspace.resolve(requested).ok()?;
             let content = required_string(arguments, "content").ok()?;
             let old_text = match workspace.open_existing(requested) {
-                Ok((_, mut file)) => Some(read_open_text(&mut file).ok()?),
+                Ok((_, mut file)) => Some(read_open_text(&mut file, MAX_EDIT_FILE_BYTES).ok()?),
                 Err(error) if error.code == agent_client_protocol::ErrorCode::ResourceNotFound => {
                     None
                 }
@@ -1982,6 +2094,34 @@ mod tests {
             crate::workspace::normalize_lexically(Path::new("/a/b/../c")),
             PathBuf::from("/a/c")
         );
+    }
+
+    #[test]
+    fn line_ranges_are_read_incrementally_and_output_is_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        std::fs::write(cwd.join("lines.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        let workspace = crate::workspace::WorkspaceRoots::open(&cwd, &[]).unwrap();
+        let (_, mut file) = workspace.open_existing("lines.txt").unwrap();
+        let (selected, truncated) = read_selected_lines(&mut file, 2, 2, 1024).unwrap();
+        assert_eq!(selected, b"two\nthree\n");
+        assert!(!truncated);
+
+        let (_, mut file) = workspace.open_existing("lines.txt").unwrap();
+        let (selected, truncated) = read_selected_lines(&mut file, 1, 4, 5).unwrap();
+        assert_eq!(selected, b"one\nt");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn full_text_reads_reject_files_over_the_configured_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        std::fs::write(cwd.join("large.txt"), "more than four bytes").unwrap();
+        let workspace = crate::workspace::WorkspaceRoots::open(&cwd, &[]).unwrap();
+        let (_, mut file) = workspace.open_existing("large.txt").unwrap();
+        let error = read_open_text(&mut file, 4).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

@@ -303,6 +303,11 @@ and directories, including a resolved symlink target, require a separate
 file-scoped permission decision. Searches skip those paths, and a search whose
 root is itself credential-like is refused.
 
+Workspace reads, edits, and searches enforce the byte and entry limits listed
+in the README. MCP responses and DeepSeek streams are likewise bounded while
+being read; exceeding a limit fails the request without first buffering the
+whole input.
+
 A permission request that the Client answers with an error grants nothing. In
 both versions the tool does not run, its call fails with the reason, and the
 turn continues, as after a denial. That includes a Client that cancels the
