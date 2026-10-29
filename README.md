@@ -123,6 +123,7 @@ The binary is `target/release/dsh-acp`.
 --reasoning-effort <EFFORT>      Thinking effort (default: high)
 --context-chars <N>              Approximate context budget
 --tool-output-bytes <N>          Per-tool output cap
+--mcp-connect-timeout-secs <N>   MCP server setup limit (default: 60)
 --disable-web                    Disable web_fetch
 --trace                          Detailed diagnostics on stderr
 --listen <ADDR>                  Serve HTTP and WebSocket at ADDR instead of stdio
@@ -240,18 +241,37 @@ before reporting `idle`. An idle steering request with its default behavior
 starts a new detached turn; with `idleBehavior: "promptRequired"`, it returns
 `promptRequired` so the Client can retain and submit the prompt itself.
 
+Both protocol versions also implement `session/status` from the Draft
+[Session Status RFD](https://agentclientprotocol.com/rfds/session-status),
+advertised as `sessionCapabilities.status` in v1 and `session.status` in v2.
+It reports whether a session is in memory (`active`) or only stored
+(`inactive`) without loading it, and returns `-32002` for an unknown session.
+A v2 `active` result also carries the foreground state. See
+[docs/acp-support.md](docs/acp-support.md#session-status).
+
+They also implement `session/set_title` from the Draft
+[Client-Set Session Titles RFD](https://agentclientprotocol.com/rfds/session-set-title),
+advertised as `sessionCapabilities.setTitle` in v1 and `session.setTitle` in
+v2. It renames a session whether or not it is loaded and returns the
+normalized title it stored, and later prompts no longer replace that title
+with a generated one. See
+[docs/acp-support.md](docs/acp-support.md#session-titles).
+
 ACP v1 includes:
 
 - `initialize`, agent info, capabilities, auth/logout, and optional provider
   configuration APIs
 - `session/new`, `session/load`, `session/resume`, `session/fork`,
-  `session/list`, `session/delete`, and `session/close`
+  `session/list`, `session/delete`, `session/close`, `session/status`, and
+  `session/set_title`
 - `session/prompt`, `session/cancel`, `session/set_mode`, and
   `session/set_config_option`
+- `$/cancel_request` for an in-flight `session/prompt`, answered with `-32800`
 - `session/update` streaming for agent messages, thoughts, tool calls, tool
   progress/results, modes, config, session info, and token usage
 - Agent-to-client permission, filesystem, and terminal requests
-- MCP stdio and streamable HTTP server declarations and tool calls
+- MCP stdio, streamable HTTP, and MCP-over-ACP server declarations and tool
+  calls
 - Session persistence, pagination, replay, forking, system prompts, additional
   workspace roots, and end-of-turn token usage
 
@@ -259,10 +279,15 @@ Both protocol versions advertise the `deepseek-api-key` login method and expose
 their corresponding authentication and logout requests. Credentials still come
 from the launch environment, CLI, or provider configuration; the protocol login
 method re-enables a configured provider rather than carrying a secret inline.
+Clients can ask whether a credential is configured, without logging in, through
+`auth/status` from the Draft
+[Agent Authentication State Query RFD](https://agentclientprotocol.com/rfds/get-auth-state),
+advertised as `auth.status` in the agent's capabilities. See
+[docs/acp-support.md](docs/acp-support.md#authentication-status).
 
 Legacy SSE-only MCP transports are best effort and are not advertised.
-MCP-over-ACP requires a proxy component and is not advertised by this
-standalone agent.
+MCP-over-ACP follows a draft RFD and is advertised in both protocol versions;
+see [MCP-over-ACP](docs/acp-support.md#mcp-over-acp).
 
 ## Tools
 
@@ -272,6 +297,7 @@ Built-in model tools:
 | --- | --- |
 | `update_plan` | Publish a complete ACP-visible execution plan |
 | `ask_user` | Request structured input through ACP elicitation |
+| `complete_url_elicitation` | Report a finished URL elicitation to the client |
 | `read_file` | Read text with line ranges |
 | `list_directory` | Bounded recursive directory listing |
 | `search_files` | Regex content search with path filtering |
@@ -292,8 +318,24 @@ available as fallbacks. ACP v2 no longer exposes those client capabilities, so
 v2 uses the local workspace tools directly.
 
 MCP tools are exposed to the model as
-`mcp__<server>__<tool>`. Both stdio servers and modern streamable HTTP servers
-are supported; a session can declare multiple servers.
+`mcp__<server>__<tool>`. Stdio servers, modern streamable HTTP servers, and
+servers the ACP client provides over the ACP connection (MCP-over-ACP, a draft
+RFD) are supported; a session can declare multiple servers.
+
+An MCP-over-ACP server is declared with `"type": "acp"`, a `name`, and the
+client's `serverId`. Each MCP request is an `mcp/message` request to the
+client, using MCP 2026-07-28 with no `initialize` handshake. The agent does
+not contact the server during session setup; its tools are first listed at the
+start of the next turn, then refreshed each model round like other servers'.
+
+Each stdio or HTTP server has `--mcp-connect-timeout-secs` seconds (default
+60) to start, complete the MCP handshake, and list its tools when a session is
+created, loaded, resumed, or forked. Servers connect one after another, so a
+request that declares several servers can take up to that many times the
+limit. A server that misses the deadline fails that request with an error
+naming the server, and the stdio server processes started for the request are
+killed. The limit does not apply to tool calls, to the tool list refresh during
+a turn, or to MCP-over-ACP servers.
 
 ## DeepSeek behavior
 
@@ -333,9 +375,15 @@ carried is marked failed rather than run with truncated arguments, and the
 client is sent a warning notice when it supports notices.
 
 `ask_user` uses ACP form elicitation by default. When the Client advertises URL
-elicitation, the model may also request an HTTPS URL with an optional stable
-`elicitation_id`. Embedded URL credentials and plain HTTP outside localhost are
-rejected.
+elicitation, the model may also request an HTTPS URL with an optional
+`elicitation_id`; one is generated when it is omitted, and an ID still in use
+is refused. Embedded URL credentials and plain HTTP outside localhost are
+rejected. Accepting a URL only means the user agreed to open it, so the result
+gives the model the elicitation ID; after it has verified the external step
+finished, the model calls `complete_url_elicitation`, which sends
+`elicitation/complete` for that ID. That tool is offered only to Clients that
+advertise URL elicitation. See [docs/acp-support.md](docs/acp-support.md#elicitation)
+for the lifecycle of pending IDs.
 
 Session model and permission configuration is available through ACP config
 options. The in-conversation commands `/help`, `/plan`, `/agent`, `/model`,

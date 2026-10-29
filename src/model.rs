@@ -343,6 +343,13 @@ pub struct SessionRecord {
     pub additional_directories: Vec<std::path::PathBuf>,
     #[serde(default)]
     pub title: Option<String>,
+    /// Whether `title` was set with `session/set_title`. A generated title
+    /// only fills a missing one, and this keeps a turn whose save fails from
+    /// putting back the title it replaced. Records stored before
+    /// `session/set_title` support have no flag, so their titles count as
+    /// generated.
+    #[serde(default)]
+    pub title_set_by_client: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
     pub config: SessionConfig,
@@ -388,6 +395,7 @@ impl SessionRecord {
             cwd,
             additional_directories,
             title: None,
+            title_set_by_client: false,
             created_at: now,
             updated_at: now,
             config: SessionConfig {
@@ -424,6 +432,12 @@ impl SessionRecord {
     pub fn set_client_system_prompt(&mut self, prompt: ClientSystemPrompt) {
         self.system_prompt_mode = prompt.mode;
         self.system_prompt = Some(prompt.text);
+    }
+
+    /// Store a title the client chose with `session/set_title`.
+    pub fn set_client_title(&mut self, title: &str) {
+        self.title = Some(title.to_string());
+        self.title_set_by_client = true;
     }
 
     pub fn install_system_prompt(&mut self, prompt: String) {
@@ -572,6 +586,11 @@ pub struct SessionRuntime {
     pub lifecycle: Arc<tokio::sync::Mutex<()>>,
     pub turn_lock: Arc<tokio::sync::Mutex<()>>,
     pub closed: Arc<std::sync::atomic::AtomicBool>,
+    /// The same flag as `SessionState::active_prompt`, readable without the
+    /// state lock, which can be held across an MCP call.
+    pub active_prompt: Arc<std::sync::atomic::AtomicBool>,
+    /// The same flag as `SessionState::requires_action`, likewise.
+    pub requires_action: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -585,17 +604,21 @@ pub struct SessionState {
     /// Keys of the tool calls allowed for this session
     /// (`crate::tools::session_approval_key`).
     pub session_approvals: std::collections::HashSet<String>,
-    pub mcp: Option<crate::mcp::McpSession>,
+    /// Cloned out before any MCP request, so the state lock is never held
+    /// while waiting on an MCP server and `session/cancel` can reach the turn.
+    pub mcp: Option<Arc<crate::mcp::McpSession>>,
 }
 
 impl SessionRuntime {
     pub fn new(record: SessionRecord) -> Self {
+        let active_prompt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let requires_action = Arc::new(std::sync::atomic::AtomicBool::new(false));
         Self {
             state: Arc::new(tokio::sync::Mutex::new(SessionState {
                 record,
                 cancellation: tokio_util::sync::CancellationToken::new(),
-                active_prompt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                requires_action: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                active_prompt: active_prompt.clone(),
+                requires_action: requires_action.clone(),
                 activity_notify: Arc::new(tokio::sync::Notify::new()),
                 prompt_seq: 0,
                 session_approvals: std::collections::HashSet::new(),
@@ -604,6 +627,8 @@ impl SessionRuntime {
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             turn_lock: Arc::new(tokio::sync::Mutex::new(())),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            active_prompt,
+            requires_action,
         }
     }
 

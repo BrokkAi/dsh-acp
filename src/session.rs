@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use agent_client_protocol::Error;
+use agent_client_protocol::{Error, ErrorCode};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -15,17 +15,42 @@ use crate::{
 
 const MAX_INSTRUCTION_BYTES: u64 = 1024 * 1024;
 
+/// Whether the store knows a session, as `session/status` reports it and
+/// [`SessionStore::set_client_title`] found it.
+pub enum SessionPresence {
+    /// In memory.
+    Active(SessionRuntime),
+    /// Stored but not in memory.
+    Inactive,
+    /// Neither in memory nor stored.
+    Unknown,
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionStore {
     directory: PathBuf,
     data_dir: PathBuf,
     sessions: Arc<Mutex<HashMap<String, SessionRuntime>>>,
     deleted: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// URL elicitations outstanding on this connection, by `elicitationId`.
+    /// Each stdio process or accepted `--listen` connection has its own store,
+    /// so these IDs never cross connections. They are never persisted: a
+    /// completion may only be reported to the Client that received the
+    /// original request.
+    url_elicitations: Arc<Mutex<HashMap<String, UrlElicitation>>>,
     write_lock: Arc<Mutex<()>>,
     configured_prompt: Option<Arc<str>>,
     default_model: Arc<str>,
     default_permission: crate::config::PermissionMode,
     default_reasoning_effort: crate::config::ReasoningEffort,
+}
+
+#[derive(Clone, Debug)]
+struct UrlElicitation {
+    session_id: String,
+    /// The user consented to open the URL. The interaction then runs out of
+    /// band until the model reports that it finished.
+    accepted: bool,
 }
 
 impl SessionStore {
@@ -46,6 +71,7 @@ impl SessionStore {
             data_dir: config.data_dir.clone(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             deleted: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            url_elicitations: Arc::new(Mutex::new(HashMap::new())),
             write_lock: Arc::new(Mutex::new(())),
             configured_prompt: config.configured_system_prompt().map(Arc::from),
             default_model: Arc::from(config.default_model.as_str()),
@@ -65,6 +91,7 @@ impl SessionStore {
             data_dir: self.data_dir.clone(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             deleted: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            url_elicitations: Arc::new(Mutex::new(HashMap::new())),
             write_lock: Arc::new(Mutex::new(())),
             configured_prompt: self.configured_prompt.clone(),
             default_model: self.default_model.clone(),
@@ -104,6 +131,10 @@ impl SessionStore {
         if let Some(runtime) = self.sessions.lock().await.get(id).cloned() {
             return Ok(runtime);
         }
+        // Loading under the write lock keeps `set_client_title` from changing
+        // the stored record between this read and the insert below, where the
+        // session's next save would overwrite the new title.
+        let _write_guard = self.write_lock.lock().await;
         let record = self.read_record(id).await?;
         let mut record = record;
         // Before pending steering is appended after the interrupted calls.
@@ -113,6 +144,79 @@ impl SessionStore {
         let runtime = SessionRuntime::new(record);
         let mut sessions = self.sessions.lock().await;
         Ok(sessions.entry(id.to_string()).or_insert(runtime).clone())
+    }
+
+    /// Finds a session without loading it, unlike [`Self::get`].
+    ///
+    /// A stored session is only checked for a record file, not read, so an
+    /// unreadable record is reported as inactive and fails when resumed.
+    pub async fn presence(&self, id: &str) -> Result<SessionPresence, Error> {
+        if validate_session_id(id).is_err() {
+            return Ok(SessionPresence::Unknown);
+        }
+        if let Some(runtime) = self.sessions.lock().await.get(id).cloned() {
+            return Ok(SessionPresence::Active(runtime));
+        }
+        if self.deleted.lock().await.contains(id) {
+            return Ok(SessionPresence::Unknown);
+        }
+        match tokio::fs::metadata(self.record_path(id)).await {
+            Ok(metadata) if metadata.is_file() => Ok(SessionPresence::Inactive),
+            Ok(_) => Ok(SessionPresence::Unknown),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(SessionPresence::Unknown)
+            }
+            Err(error) => Err(Error::into_internal_error(error)),
+        }
+    }
+
+    /// Stores a title the client chose, and reports where the session was.
+    ///
+    /// A session in memory gets the title there and is saved. A stored session
+    /// is updated on disk without loading it, so it stays inactive and nothing
+    /// else in its record changes. Neither changes `updated_at`, which tracks
+    /// the session's activity. An `Unknown` session, including a deleted one,
+    /// is left alone.
+    ///
+    /// Another process with the session in memory does not see the new title,
+    /// and its next save of the session puts its own title back.
+    pub async fn set_client_title(&self, id: &str, title: &str) -> Result<SessionPresence, Error> {
+        if validate_session_id(id).is_err() {
+            return Ok(SessionPresence::Unknown);
+        }
+        let _write_guard = self.write_lock.lock().await;
+        if self.deleted.lock().await.contains(id) {
+            return Ok(SessionPresence::Unknown);
+        }
+        let runtime = self.sessions.lock().await.get(id).cloned();
+        if let Some(runtime) = runtime {
+            let previous = {
+                let mut state = runtime.state.lock().await;
+                let previous = (state.record.title.clone(), state.record.title_set_by_client);
+                state.record.set_client_title(title);
+                previous
+            };
+            let snapshot = runtime.snapshot().await;
+            if let Err(error) = self.write_record(&snapshot).await {
+                // Nothing else is saved while the write lock is held, and a
+                // turn leaves a client title alone, so this restores exactly
+                // what is stored.
+                let mut state = runtime.state.lock().await;
+                (state.record.title, state.record.title_set_by_client) = previous;
+                return Err(error);
+            }
+            return Ok(SessionPresence::Active(runtime));
+        }
+        let mut record = match self.read_record(id).await {
+            Ok(record) => record,
+            Err(error) if error.code == ErrorCode::ResourceNotFound => {
+                return Ok(SessionPresence::Unknown);
+            }
+            Err(error) => return Err(error),
+        };
+        record.set_client_title(title);
+        self.write_record(&record).await?;
+        Ok(SessionPresence::Inactive)
     }
 
     pub async fn save(&self, runtime: &SessionRuntime) -> Result<(), Error> {
@@ -193,6 +297,7 @@ impl SessionStore {
                 .store(true, std::sync::atomic::Ordering::Release);
             runtime.state.lock().await.cancellation.cancel();
         }
+        self.forget_url_elicitations(id).await;
         let _write_guard = self.write_lock.lock().await;
         match tokio::fs::remove_file(self.record_path(id)).await {
             Ok(()) => Ok(()),
@@ -210,7 +315,89 @@ impl SessionStore {
                 .store(true, std::sync::atomic::Ordering::Release);
             runtime.state.lock().await.cancellation.cancel();
         }
+        self.forget_url_elicitations(id).await;
         Ok(())
+    }
+
+    /// Claim `elicitation_id` for a URL elicitation the session is about to
+    /// request. ACP requires each ID to be unique among the connection's
+    /// outstanding URL elicitations, so an ID still in use is refused. A
+    /// request cancelled before its answer arrives is never settled: the
+    /// Client may already have accepted it, so its ID stays reserved, and can
+    /// never be completed, until the session closes.
+    pub async fn reserve_url_elicitation(
+        &self,
+        session_id: &str,
+        elicitation_id: &str,
+    ) -> Result<(), Error> {
+        let mut elicitations = self.url_elicitations.lock().await;
+        // A session deleted while its turn still runs has already had its
+        // elicitations dropped, so nothing would free a new reservation.
+        // Close and delete remove the runtime before taking this lock.
+        if !self.sessions.lock().await.contains_key(session_id) {
+            return Err(Error::request_cancelled());
+        }
+        match elicitations.entry(elicitation_id.to_string()) {
+            std::collections::hash_map::Entry::Occupied(_) => Err(Error::invalid_params().data(
+                format!(
+                    "elicitation ID {elicitation_id} is still in use by a URL elicitation that was not reported complete; omit elicitation_id to generate a new one"
+                ),
+            )),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(UrlElicitation {
+                    session_id: session_id.to_string(),
+                    accepted: false,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    /// Record the Client's answer to a reserved URL elicitation. An accepted
+    /// one stays outstanding until the model reports it complete or the
+    /// session closes; any other answer, or an error instead of an answer,
+    /// frees the ID.
+    pub async fn settle_url_elicitation(
+        &self,
+        session_id: &str,
+        elicitation_id: &str,
+        accepted: bool,
+    ) {
+        let mut elicitations = self.url_elicitations.lock().await;
+        let Some(elicitation) = elicitations
+            .get_mut(elicitation_id)
+            .filter(|elicitation| elicitation.session_id == session_id && !elicitation.accepted)
+        else {
+            return;
+        };
+        if accepted {
+            elicitation.accepted = true;
+        } else {
+            elicitations.remove(elicitation_id);
+        }
+    }
+
+    /// Take an accepted URL elicitation of the session so its completion can
+    /// be reported. Unknown, unanswered, already completed, and other
+    /// sessions' IDs return `false` and are left alone.
+    pub async fn complete_url_elicitation(&self, session_id: &str, elicitation_id: &str) -> bool {
+        let mut elicitations = self.url_elicitations.lock().await;
+        let pending = elicitations.get(elicitation_id).is_some_and(|elicitation| {
+            elicitation.session_id == session_id && elicitation.accepted
+        });
+        if pending {
+            elicitations.remove(elicitation_id);
+        }
+        pending
+    }
+
+    /// Drop a closed or deleted session's URL elicitations without reporting
+    /// them complete: closing says nothing about whether they finished.
+    async fn forget_url_elicitations(&self, session_id: &str) {
+        self.url_elicitations
+            .lock()
+            .await
+            .retain(|_, elicitation| elicitation.session_id != session_id);
     }
 
     pub fn effective_system_prompt(&self, record: &SessionRecord) -> Result<String, Error> {
@@ -482,6 +669,8 @@ pub(crate) fn validate_roots(cwd: &Path, additional: &[PathBuf]) -> Result<(), E
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+
     use super::*;
     use crate::config::{PermissionMode, ReasoningEffort};
 
@@ -501,6 +690,7 @@ mod tests {
             context_chars: 1000,
             tool_output_bytes: 1000,
             http_timeout: std::time::Duration::from_secs(1),
+            mcp_connect_timeout: std::time::Duration::from_secs(1),
             disable_web: true,
             trace: false,
         };
@@ -516,6 +706,219 @@ mod tests {
         store.save(&runtime).await.unwrap();
         assert!(store.list(None).await.unwrap().is_empty());
         assert!(store.get("../../outside").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn presence_finds_stored_sessions_without_loading_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            api_key: None,
+            base_url: "http://localhost".to_string(),
+            default_model: "deepseek-flash".to_string(),
+            models: vec!["deepseek-flash".to_string()],
+            data_dir: temp.path().join("data"),
+            permission_mode: PermissionMode::Ask,
+            system_prompt: None,
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::High,
+            context_chars: 1000,
+            tool_output_bytes: 1000,
+            http_timeout: std::time::Duration::from_secs(1),
+            mcp_connect_timeout: std::time::Duration::from_secs(1),
+            disable_web: true,
+            trace: false,
+        };
+        let store = SessionStore::open(&config).await.unwrap();
+        let runtime = store
+            .create(temp.path().to_path_buf(), Vec::new(), None, None)
+            .await
+            .unwrap();
+        let id = runtime.snapshot().await.id;
+        assert!(matches!(
+            store.presence(&id).await.unwrap(),
+            SessionPresence::Active(_)
+        ));
+
+        // A second store over the same directory stands in for a restart.
+        let restarted = SessionStore::open(&config).await.unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                restarted.presence(&id).await.unwrap(),
+                SessionPresence::Inactive
+            ));
+        }
+        assert!(restarted.sessions.lock().await.is_empty());
+
+        store.close(&id).await.unwrap();
+        assert!(matches!(
+            store.presence(&id).await.unwrap(),
+            SessionPresence::Inactive
+        ));
+        store.delete(&id).await.unwrap();
+        for id in [id.as_str(), "dsh-unknown", "", "../../outside"] {
+            assert!(
+                matches!(store.presence(id).await.unwrap(), SessionPresence::Unknown),
+                "{id:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn url_elicitations_complete_once_and_only_for_their_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            api_key: None,
+            base_url: "http://localhost".to_string(),
+            default_model: "deepseek-flash".to_string(),
+            models: vec!["deepseek-flash".to_string()],
+            data_dir: temp.path().join("data"),
+            permission_mode: PermissionMode::Ask,
+            system_prompt: None,
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::High,
+            context_chars: 1000,
+            tool_output_bytes: 1000,
+            http_timeout: std::time::Duration::from_secs(1),
+            mcp_connect_timeout: std::time::Duration::from_secs(1),
+            disable_web: true,
+            trace: false,
+        };
+        let store = SessionStore::open(&config).await.unwrap();
+        let mut sessions = Vec::new();
+        for _ in 0..3 {
+            let runtime = store
+                .create(temp.path().to_path_buf(), Vec::new(), None, None)
+                .await
+                .unwrap();
+            sessions.push(runtime.snapshot().await.id);
+        }
+        let [a, b, c] = [&sessions[0], &sessions[1], &sessions[2]];
+
+        // An ID is unique on the connection while it is outstanding, even
+        // across sessions, and an unanswered request cannot be completed.
+        assert!(store.reserve_url_elicitation(a, "oauth").await.is_ok());
+        let reused = store.reserve_url_elicitation(b, "oauth").await.unwrap_err();
+        assert_eq!(reused.code, agent_client_protocol::ErrorCode::InvalidParams);
+        assert!(!store.complete_url_elicitation(a, "oauth").await);
+
+        // Declining frees the ID.
+        store.settle_url_elicitation(a, "oauth", false).await;
+        assert!(store.reserve_url_elicitation(b, "oauth").await.is_ok());
+        store.settle_url_elicitation(b, "oauth", true).await;
+
+        // Only the session that created it completes it, and only once.
+        assert!(!store.complete_url_elicitation(a, "oauth").await);
+        assert!(store.complete_url_elicitation(b, "oauth").await);
+        assert!(!store.complete_url_elicitation(b, "oauth").await);
+        assert!(store.reserve_url_elicitation(a, "oauth").await.is_ok());
+
+        // Closing a session drops its accepted elicitations unreported.
+        store.settle_url_elicitation(a, "oauth", true).await;
+        store.close(a).await.unwrap();
+        assert!(!store.complete_url_elicitation(a, "oauth").await);
+        assert!(store.reserve_url_elicitation(b, "oauth").await.is_ok());
+
+        // A turn still running after its session was deleted cannot reserve an
+        // ID that nothing would free.
+        store.delete(c).await.unwrap();
+        let deleted = store
+            .reserve_url_elicitation(c, "oauth-deleted")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            deleted.code,
+            agent_client_protocol::ErrorCode::RequestCancelled
+        );
+        assert!(
+            store
+                .reserve_url_elicitation(b, "oauth-deleted")
+                .await
+                .is_ok()
+        );
+
+        // Every accepted `--listen` connection gets a fresh store. Its
+        // in-memory session and URL-elicitation registries start empty even
+        // though the previous connection left reservations outstanding.
+        let fresh = store.fresh();
+        assert!(fresh.sessions.lock().await.is_empty());
+        assert!(fresh.url_elicitations.lock().await.is_empty());
+        fresh.get(b).await.unwrap();
+        assert!(fresh.reserve_url_elicitation(b, "oauth").await.is_ok());
+        assert!(
+            fresh
+                .reserve_url_elicitation(b, "oauth-deleted")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn client_titles_are_stored_whether_or_not_the_session_is_loaded() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            api_key: None,
+            base_url: "http://localhost".to_string(),
+            default_model: "deepseek-flash".to_string(),
+            models: vec!["deepseek-flash".to_string()],
+            data_dir: temp.path().join("data"),
+            permission_mode: PermissionMode::Ask,
+            system_prompt: None,
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::High,
+            context_chars: 1000,
+            tool_output_bytes: 1000,
+            http_timeout: std::time::Duration::from_secs(1),
+            mcp_connect_timeout: std::time::Duration::from_secs(1),
+            disable_web: true,
+            trace: false,
+        };
+        let store = SessionStore::open(&config).await.unwrap();
+        let runtime = store
+            .create(temp.path().to_path_buf(), Vec::new(), None, None)
+            .await
+            .unwrap();
+        let id = runtime.snapshot().await.id;
+        let stored = || -> Value {
+            serde_json::from_slice(&std::fs::read(store.record_path(&id)).unwrap()).unwrap()
+        };
+        let mut expected = stored();
+        assert_eq!(expected["title_set_by_client"], false);
+
+        assert!(matches!(
+            store.set_client_title(&id, "In memory").await.unwrap(),
+            SessionPresence::Active(_)
+        ));
+        let record = runtime.snapshot().await;
+        assert_eq!(record.title.as_deref(), Some("In memory"));
+        assert!(record.title_set_by_client);
+        expected["title"] = json!("In memory");
+        expected["title_set_by_client"] = json!(true);
+        assert_eq!(stored(), expected, "only the title changed");
+
+        // A second store over the same directory stands in for a restart.
+        let restarted = SessionStore::open(&config).await.unwrap();
+        assert!(matches!(
+            restarted.set_client_title(&id, "On disk").await.unwrap(),
+            SessionPresence::Inactive
+        ));
+        assert!(restarted.sessions.lock().await.is_empty(), "not loaded");
+        expected["title"] = json!("On disk");
+        assert_eq!(stored(), expected, "only the title changed");
+        let loaded = restarted.get(&id).await.unwrap().snapshot().await;
+        assert_eq!(loaded.title.as_deref(), Some("On disk"));
+        assert!(loaded.title_set_by_client);
+
+        store.delete(&id).await.unwrap();
+        for id in [id.as_str(), "dsh-unknown", "", "../../outside"] {
+            assert!(
+                matches!(
+                    store.set_client_title(id, "Nowhere").await.unwrap(),
+                    SessionPresence::Unknown
+                ),
+                "{id:?}"
+            );
+        }
+        assert!(!store.record_path(&id).exists(), "deleted stays deleted");
     }
 
     #[tokio::test]
@@ -543,6 +946,7 @@ mod tests {
             context_chars: 1000,
             tool_output_bytes: 1000,
             http_timeout: std::time::Duration::from_secs(1),
+            mcp_connect_timeout: std::time::Duration::from_secs(1),
             disable_web: true,
             trace: false,
         };
@@ -605,6 +1009,7 @@ mod tests {
             context_chars: 1000,
             tool_output_bytes: 1000,
             http_timeout: std::time::Duration::from_secs(1),
+            mcp_connect_timeout: std::time::Duration::from_secs(1),
             disable_web: true,
             trace: false,
         };
@@ -699,6 +1104,7 @@ mod tests {
             context_chars: 1000,
             tool_output_bytes: 1000,
             http_timeout: std::time::Duration::from_secs(1),
+            mcp_connect_timeout: std::time::Duration::from_secs(1),
             disable_web: true,
             trace: false,
         };
@@ -733,6 +1139,7 @@ mod tests {
             context_chars: 1000,
             tool_output_bytes: 1000,
             http_timeout: std::time::Duration::from_secs(1),
+            mcp_connect_timeout: std::time::Duration::from_secs(1),
             disable_web: true,
             trace: false,
         };
@@ -772,6 +1179,7 @@ mod tests {
             context_chars: 1000,
             tool_output_bytes: 1000,
             http_timeout: std::time::Duration::from_secs(1),
+            mcp_connect_timeout: std::time::Duration::from_secs(1),
             disable_web: true,
             trace: false,
         };

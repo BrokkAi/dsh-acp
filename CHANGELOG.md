@@ -8,16 +8,6 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ### Added
 
-- ACP clients can now replace the built-in harness prompt instead of only
-  appending to it: both protocol versions advertise
-  `systemPrompt.mode.override` and accept `mode: "override"` on session
-  create, load (v1), resume, and fork. Only the harness's own guidance is
-  replaced. The `--system-prompt` text, `AGENTS.md` instructions, and plan-mode
-  instructions still follow the client's text, and tools, MCP servers,
-  permissions, and workspace boundaries are unchanged. The mode is stored with
-  the session, so a load, resume, or fork that omits `systemPrompt` keeps it.
-  Append mode behaves as before, and sessions stored by earlier versions keep
-  appending.
 - `--listen <ADDR>` (`DSH_ACP_LISTEN`) serves ACP over streamable HTTP and
   WebSocket at `/acp` instead of stdio, using the SDK's server for the
   Streamable HTTP & WebSocket Transport RFD, which is not yet stable. Stdio
@@ -28,6 +18,105 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   are refused. One ACP connection is served at a time; each starts with
   nothing in memory, like a new stdio process, and can load or resume saved
   sessions.
+
+## 0.5.0 - 2026-10-27
+
+### Added
+
+- MCP-over-ACP (draft RFD): the ACP client can serve MCP tools over the ACP
+  connection itself. Both protocol versions advertise the `acp` MCP transport
+  (`mcpCapabilities.acp: true` in v1, `session.mcp.acp: {}` in v2) and accept
+  `{"type": "acp", "name", "serverId"}` declarations wherever MCP servers are
+  declared. Each MCP operation is an `mcp/message` request to the client,
+  using MCP 2026-07-28 with per-request metadata and no `initialize`
+  handshake. The server is not contacted during session setup; its tools are
+  listed at the start of each model round and named, filtered in plan mode,
+  and permission-checked like other MCP tools. An ACP or MCP error fails only
+  the tool call or that server's tool listing, and cancelling the turn
+  withdraws an outstanding request with `$/cancel_request`. Declaring one
+  `serverId` twice in a request fails with `-32602`.
+- MCP tools are now refreshed server by server. A server whose `tools/list`
+  fails keeps its last listed tools instead of hiding every server's tools
+  for that round, and the refresh notice names the servers that failed.
+- ACP clients can now replace the built-in harness prompt instead of only
+  appending to it: both protocol versions advertise
+  `systemPrompt.mode.override` and accept `mode: "override"` on session
+  create, load (v1), resume, and fork. Only the harness's own guidance is
+  replaced. The `--system-prompt` text, `AGENTS.md` instructions, and plan-mode
+  instructions still follow the client's text, and tools, MCP servers,
+  permissions, and workspace boundaries are unchanged. The mode is stored with
+  the session, so a load, resume, or fork that omits `systemPrompt` keeps it.
+  Append mode behaves as before, and sessions stored by earlier versions keep
+  appending.
+- ACP v1 now honors `$/cancel_request` for an in-flight `session/prompt`.
+  Previously the notification was ignored and the turn ran to completion. The
+  turn now stops the way it does for `session/cancel`: the model stream and
+  the running tool stop, unfinished tool calls are reported and saved as
+  failed, and a request still waiting on the client, such as a permission
+  request, is cancelled too. The prompt is answered once: with error `-32800`
+  (Request cancelled) when `$/cancel_request` alone stopped the turn, or with
+  its normal result if the turn had already finished. A prompt that
+  `session/cancel` reaches still ends with `stopReason: "cancelled"`, even if
+  a `$/cancel_request` for it arrives as well. ACP v2 is unchanged:
+  `session/prompt` is answered when the message is inserted, so stopping the
+  work it started still takes `session/cancel`.
+- `--mcp-connect-timeout-secs` (`DSH_ACP_MCP_CONNECT_TIMEOUT_SECS`, default
+  60) sets how long each MCP server may take to start, complete the MCP
+  handshake, and list its tools when a session is created, loaded, resumed, or
+  forked. Servers connect one after another, so a request that declares
+  several servers can take up to that many times the limit. Tool calls and the
+  tool list refresh during a turn are not bounded by it.
+- `session/status` from the Draft Session Status RFD, in both protocol
+  versions. It reports whether a session is `active` (in memory) or `inactive`
+  (stored, for example after `session/close` or a restart) without loading,
+  resuming, or changing it, and answers an unknown or deleted session with
+  `-32002` and the requested `sessionId`. A v2 `active` result also carries the
+  session's `running`, `requires_action`, or `idle` state. It is advertised as
+  `sessionCapabilities.status` in v1 and `session.status` in v2. The SDK has no
+  types for the method yet, so its shape follows the RFD and may change with
+  it.
+- `auth/status` from the Draft Agent Authentication State Query RFD, in both
+  protocol versions. It tells a client whether a DeepSeek credential is
+  configured (`DEEPSEEK_API_KEY`, `--api-key`, or a provider `Authorization`
+  header) without logging in or changing anything, and reports `false` after a
+  logout or a disabled provider until the client authenticates again. It never
+  returns the credential. It is advertised as `agentCapabilities.auth.status`
+  in v1 and `capabilities.auth.status` in v2. The SDK has no types for the
+  method yet, so its shape follows the RFD and may change with it.
+- URL elicitations can now be closed out. Accepting a URL only means the user
+  agreed to open it, and the harness has no callback that sees the external
+  step finish, so `elicitation/complete` was never sent and the Client could not
+  tell the flow was over. The `ask_user` result now gives the model the
+  elicitation ID, and Clients that advertise URL elicitation are offered a
+  `complete_url_elicitation` tool. Once the model has verified the step
+  finished, for example by retrying the operation that needed it, the tool sends
+  `elicitation/complete` with the original ID on the same connection. Unknown,
+  declined, already completed, and other sessions' IDs fail the call and send
+  nothing. Pending IDs live in memory only and are dropped, without a
+  completion, when the session is closed or deleted.
+- `session/set_title` from the Draft Client-Set Session Titles RFD, in both
+  protocol versions. A client can rename a session whether or not it is
+  loaded; a stored session is updated on disk without being loaded, and for a
+  session in memory the client is also sent a `session_info_update`. The
+  title is trimmed, runs of whitespace and control characters become one
+  space, it is capped at 256 characters, and the result returns the title as
+  stored. Once a client sets a title, titles generated from prompts no longer
+  replace it, also after a restart. A title that is empty after normalization
+  is rejected with `-32602`, and an unknown or deleted session with `-32002`.
+  It is advertised as `sessionCapabilities.setTitle` in v1 and
+  `session.setTitle` in v2. The SDK has no types for the method yet, so its
+  shape follows the RFD and may change with it.
+
+### Changed
+
+- HTTP MCP server setup is now bounded by `--mcp-connect-timeout-secs`, 60
+  seconds in total by default. It was bounded only by a fixed 180-second
+  timeout on each request (`initialize`, `notifications/initialized`, and each
+  `tools/list` page), so an HTTP MCP server that takes more than 60 seconds to
+  connect now fails session setup unless the limit is raised.
+- The result of an accepted URL elicitation no longer includes `content` the
+  Client attached to its response. What the user enters out of band must stay
+  out of the model's context.
 
 ### Fixed
 
@@ -47,6 +136,75 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   directories, and a v1 load had already saved them to the session file. The
   next prompt used instructions from a request the client was told had failed.
   Both versions now install them only after the MCP servers connect.
+- A stdio MCP server that started but never answered the MCP handshake or its
+  first `tools/list` hung `session/new`, `session/load`, `session/resume`, or
+  `session/fork`, and with it every later message on the connection. Such a
+  server now fails the request once `--mcp-connect-timeout-secs` passes, with
+  an error naming the server, and the stdio server processes started for the
+  request are killed.
+- `session/cancel` now stops a turn that is waiting on an MCP server. The turn
+  held the session's state lock during an MCP `tools/call` and during the
+  `tools/list` refresh at the start of each round, and `session/cancel` needs
+  that lock, so the cancel waited until the MCP server answered: up to the
+  180-second HTTP timeout, or indefinitely for a stdio server that never
+  replies. The connection handles messages in order, so every later message
+  waited too, and requests that use the session's state, such as
+  `session/set_mode`, waited even without a cancel. The turn now takes the lock
+  only to look up the session's MCP servers, so the cancel stops the MCP
+  request at once. An interrupted MCP tool call is reported as failed, an ACP
+  v1 prompt ends with `stopReason: "cancelled"`, and ACP v2 settles to idle
+  with `cancelled`.
+- An empty or whitespace-only `DEEPSEEK_API_KEY` or `--api-key` was sent to
+  DeepSeek as a blank bearer token, so the prompt failed with DeepSeek's HTTP
+  401 even though authentication already treated such a key as missing. It now
+  counts as no key: the prompt fails locally with the `-32000` error that says
+  to set `DEEPSEEK_API_KEY`, and no request is sent. An `Authorization` header
+  set with `providers/set` is still used in its place.
+- `ask_user` sent a model-chosen URL `elicitation_id` again even while an
+  earlier request with that ID was still outstanding, which ACP forbids. It now
+  fails the tool call and tells the model to omit the ID so one is generated.
+  An ID whose request was cancelled before the Client answered stays reserved
+  until the session closes, because the Client may already have accepted it.
+- An `ask_user` request that could not be sent, or that the Client answered
+  with an error, did not tell the model why. In ACP v1 the model saw only the
+  JSON-RPC error name, such as "Invalid params". In ACP v2 the whole turn ended
+  with stop reason `error`, and the model saw only "Tool call failed before
+  completion." Both versions now fail just that tool call with the reason, for
+  example that the URL must use HTTPS, and the turn continues. In ACP v2, a
+  request refused before it is sent no longer reports `requires_action`.
+- A Client that cancelled an `ask_user` elicitation itself, answering `-32800`,
+  ended the whole turn as `cancelled` although nobody cancelled the turn. Only
+  the turn's own cancellation (`session/cancel`, or a v1 `$/cancel_request` for
+  the prompt) now ends it; a Client-side cancel fails only that tool call, and
+  the model is told the client cancelled the request.
+- In ACP v2, an `update_plan` call without an `entries` array, or with an entry
+  that has no `content`, ended the whole turn with stop reason `error`, and the
+  model saw only "Tool call failed before completion." It now fails just that
+  tool call with the reason, the turn continues, and the model can send a
+  corrected plan.
+- A call to an `mcp__` tool in a session with no MCP servers ended the whole
+  turn: an ACP v1 `session/prompt` failed with `-32603`, and an ACP v2 turn
+  ended with stop reason `error`. In both versions it now fails like a call to
+  any other unknown MCP tool, and the turn continues.
+- Each request or notification rejected for invalid params, such as
+  `session/new` with a non-string `cwd` or `_session/steering` without a
+  `sessionId`, wrote about 1 MB to stderr. The SDK's `Handler errored` warning
+  describes every registered handler, escaped again for each one. A client
+  that piped stderr without reading it stalled after the first rejection: the
+  server blocked writing the log and stopped answering. The default log filter
+  now drops the SDK's warnings that describe its handler chain, so a rejection
+  logs one line of a few hundred bytes, the SDK's warning for the error
+  response it sends. `_session/steering` now answers invalid params itself,
+  like the other hand-rolled methods. A `RUST_LOG` setting still replaces the
+  default filter.
+- A Client that answered a permission request with an error ended the whole
+  turn: as `cancelled` for `-32800` (Request cancelled) although nobody
+  cancelled the turn, and otherwise with a prompt error in ACP v1 or stop
+  reason `error` in ACP v2. The model was never told why the tool did not run.
+  Both versions now treat the error as a refusal: the tool does not run, its
+  call fails with the reason, for example that the client cancelled the
+  permission request, and the turn continues. Only the turn's own cancellation
+  (`session/cancel`, or a v1 `$/cancel_request` for the prompt) ends it.
 
 ## 0.4.0 - 2026-10-25
 
@@ -233,7 +391,8 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 - Integration coverage for v1/v2 handshakes, images, tools, failed-tool replay,
   terminal output, commands, cancellation, and steering.
 
-[Unreleased]: https://github.com/BrokkAi/dsh-acp/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/BrokkAi/dsh-acp/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/BrokkAi/dsh-acp/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/BrokkAi/dsh-acp/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/BrokkAi/dsh-acp/compare/v0.2.3...v0.3.0
 [0.2.0]: https://github.com/BrokkAi/dsh-acp/compare/v0.1.0...v0.2.0

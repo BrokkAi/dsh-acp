@@ -7,7 +7,7 @@ use std::{
 };
 
 use agent_client_protocol::{
-    Agent, Client, ConnectTo, Error, UntypedMessage, V2ConnectionTo,
+    Agent, Client, ConnectTo, Error, JsonRpcMessage, UntypedMessage, V2ConnectionTo,
     schema::v2::{
         self, AgentCapabilities, AgentMessage, AgentThought, AuthMethod, AuthMethodAgent,
         AvailableCommand, CompactionStatus, CompactionUpdate, ContentBlock, ContentChunk, Diff,
@@ -30,7 +30,8 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    agent::Harness,
+    agent::{Harness, steering_params, with_extra_capabilities},
+    auth_status,
     config::ReasoningEffort,
     deepseek::{Completion, StreamEvent},
     model::{
@@ -38,7 +39,8 @@ use crate::{
         PendingUserMessage, PersistedCompaction, PersistedDiff, Role, SessionRecord,
         SessionRuntime, TokenUsage, ToolOutcomeStatus, ensure_session_unique_tool_call_ids,
     },
-    session::session_title,
+    session::{SessionPresence, session_title},
+    session_set_title, session_status,
     tools::{
         ToolAccess, ToolResult, built_in_definitions, git_patch, persisted_diff,
         persisted_tool_outcome, result_status, structured_content,
@@ -66,17 +68,6 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
     Agent
         .v2()
         .name("dsh-acp-v2")
-        .on_receive_request(
-            {
-                let harness = harness.clone();
-                async move |request: InitializeRequest,
-                            responder: agent_client_protocol::Responder<InitializeResponse>,
-                            _connection: V2ConnectionTo<Client>| {
-                    harness.clone().initialize(request, responder).await
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
         .on_receive_request(
             {
                 let harness = harness.clone();
@@ -248,13 +239,39 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
                 async move |request: UntypedMessage,
                             responder: agent_client_protocol::Responder<Value>,
                             connection: V2ConnectionTo<Client>| {
-                    if request.method != STEERING_METHOD {
-                        return responder.respond_with_error(Error::method_not_found());
+                    match request.method.as_str() {
+                        // Answered as JSON: the SDK capability types cannot advertise
+                        // `auth/status`, `session/status`, or `session/set_title` yet.
+                        "initialize" => {
+                            match InitializeRequest::parse_message(&request.method, &request.params)
+                            {
+                                Ok(initialize) => {
+                                    harness.clone().initialize(initialize, responder).await
+                                }
+                                Err(error) => responder.respond_with_error(error),
+                            }
+                        }
+                        STEERING_METHOD => {
+                            harness
+                                .clone()
+                                .steering(request.params, responder, connection)
+                                .await
+                        }
+                        session_status::METHOD => {
+                            harness
+                                .clone()
+                                .session_status(request.params, responder)
+                                .await
+                        }
+                        session_set_title::METHOD => {
+                            harness
+                                .clone()
+                                .session_set_title(request.params, responder, connection)
+                                .await
+                        }
+                        auth_status::METHOD => responder.respond(harness.base.auth_status().await),
+                        _ => responder.respond_with_error(Error::method_not_found()),
                     }
-                    harness
-                        .clone()
-                        .steering(request.params, responder, connection)
-                        .await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -276,7 +293,7 @@ impl V2Harness {
     async fn initialize(
         self,
         request: InitializeRequest,
-        responder: agent_client_protocol::Responder<InitializeResponse>,
+        responder: agent_client_protocol::Responder<Value>,
     ) -> agent_client_protocol::Result<()> {
         *self.capabilities.write().await = request.capabilities.clone();
         self.initialized.store(true, Ordering::Release);
@@ -296,7 +313,8 @@ impl V2Harness {
             .mcp(
                 v2::McpCapabilities::new()
                     .stdio(v2::McpStdioCapabilities::new())
-                    .http(v2::McpHttpCapabilities::new()),
+                    .http(v2::McpHttpCapabilities::new())
+                    .acp(v2::McpAcpCapabilities::new()),
             )
             .delete(v2::SessionDeleteCapabilities::new())
             .additional_directories(v2::SessionAdditionalDirectoriesCapabilities::new())
@@ -309,23 +327,34 @@ impl V2Harness {
             );
         let capabilities = AgentCapabilities::new()
             .session(session_capabilities)
+            // Empty in the SDK; it carries the `auth/status` marker added below.
+            .auth(v2::AgentAuthCapabilities::new())
             .providers(ProvidersCapabilities::new());
-        responder.respond(
-            InitializeResponse::new(
-                request.protocol_version,
-                Implementation::new("dsh-acp", env!("CARGO_PKG_VERSION")).title("DeepSeek Harness"),
-            )
-            .capabilities(capabilities)
-            .auth_methods(vec![AuthMethod::Agent(
-                AuthMethodAgent::new("deepseek-api-key", "DeepSeek API key").description(
-                    "Uses DEEPSEEK_API_KEY, --api-key, or an Authorization provider header.",
-                ),
-            )])
-            .meta(Some(serde_json::Map::from_iter([(
-                "steering".to_string(),
-                json!({"supported": true, "idleBehaviors": ["promptRequired"]}),
-            )]))),
+        let response = InitializeResponse::new(
+            request.protocol_version,
+            Implementation::new("dsh-acp", env!("CARGO_PKG_VERSION")).title("DeepSeek Harness"),
         )
+        .capabilities(capabilities)
+        .auth_methods(vec![AuthMethod::Agent(
+            AuthMethodAgent::new("deepseek-api-key", "DeepSeek API key").description(
+                "Uses DEEPSEEK_API_KEY, --api-key, or an Authorization provider header.",
+            ),
+        )])
+        .meta(Some(serde_json::Map::from_iter([(
+            "steering".to_string(),
+            json!({"supported": true, "idleBehaviors": ["promptRequired"]}),
+        )])));
+        match with_extra_capabilities(
+            response,
+            &[
+                ("/capabilities/session", "status", json!({})),
+                ("/capabilities/session", "setTitle", json!({})),
+                ("/capabilities/auth", "status", json!({})),
+            ],
+        ) {
+            Ok(response) => responder.respond(response),
+            Err(error) => responder.respond_with_error(error),
+        }
     }
 
     async fn login(
@@ -337,18 +366,14 @@ impl V2Harness {
             return responder
                 .respond_with_error(Error::invalid_params().data("unknown authentication method"));
         }
-        let routing = self.base.provider.read().await.clone();
-        let has_provider_auth = routing
-            .headers
-            .keys()
-            .any(|name| name.eq_ignore_ascii_case("authorization"));
-        let has_api_key = self
+        let has_credential = self
             .base
-            .config
-            .api_key
-            .as_deref()
-            .is_some_and(|key| !key.trim().is_empty());
-        if has_api_key || has_provider_auth {
+            .provider
+            .read()
+            .await
+            .credential(&self.base.config)
+            .is_some();
+        if has_credential {
             self.base.provider.write().await.enabled = true;
             responder.respond(LoginAuthResponse::new())
         } else {
@@ -452,7 +477,10 @@ impl V2Harness {
             Ok(runtime) => runtime,
             Err(error) => return responder.respond_with_error(error),
         };
-        if let Err(error) = self.attach_mcp(&runtime, &request.mcp_servers).await {
+        if let Err(error) = self
+            .attach_mcp(&runtime, &request.mcp_servers, &connection)
+            .await
+        {
             let _ = self.base.store.delete(&runtime.snapshot().await.id).await;
             return responder.respond_with_error(error);
         }
@@ -552,7 +580,10 @@ impl V2Harness {
         // A resume whose MCP servers fail to connect leaves the session as it
         // was. Installing touches only the instructions, so a turn that is
         // still running keeps the messages it adds meanwhile.
-        if let Err(error) = self.attach_mcp(&runtime, &request.mcp_servers).await {
+        if let Err(error) = self
+            .attach_mcp(&runtime, &request.mcp_servers, &connection)
+            .await
+        {
             return responder.respond_with_error(error);
         }
         instructions.install(&mut runtime.state.lock().await.record);
@@ -567,17 +598,13 @@ impl V2Harness {
         }
         {
             let state = runtime.state.lock().await;
-            let current = if state.requires_action.load(Ordering::Acquire) {
-                StateUpdate::RequiresAction(RequiresActionStateUpdate::new())
-            } else if state.active_prompt.load(Ordering::Acquire) {
-                StateUpdate::Running(RunningStateUpdate::new())
-            } else {
-                StateUpdate::Idle(IdleStateUpdate::new())
-            };
             send_update(
                 &connection,
                 &v2_session_id(&record.id),
-                SessionUpdate::StateUpdate(current),
+                SessionUpdate::StateUpdate(foreground_state(
+                    &state.active_prompt,
+                    &state.requires_action,
+                )),
             )?;
         }
         responder.respond(
@@ -646,6 +673,7 @@ impl V2Harness {
             candidate.compactions = source.compactions.clone();
             candidate.config = source.config;
             candidate.title = source.title;
+            candidate.title_set_by_client = source.title_set_by_client;
             candidate.usage = source.usage;
             candidate.context_used = source.context_used;
             let refresh = self.base.store.rebuild_system_prompt(&mut candidate);
@@ -658,7 +686,10 @@ impl V2Harness {
             let _ = self.base.store.delete(&runtime_id).await;
             return responder.respond_with_error(error);
         }
-        if let Err(error) = self.attach_mcp(&runtime, &request.mcp_servers).await {
+        if let Err(error) = self
+            .attach_mcp(&runtime, &request.mcp_servers, &connection)
+            .await
+        {
             let _ = self.base.store.delete(&runtime_id).await;
             return responder.respond_with_error(error);
         }
@@ -728,6 +759,60 @@ impl V2Harness {
             Ok(()) => responder.respond(v2::CloseSessionResponse::new()),
             Err(error) => responder.respond_with_error(error),
         }
+    }
+
+    async fn session_status(
+        self,
+        params: Value,
+        responder: agent_client_protocol::Responder<Value>,
+    ) -> agent_client_protocol::Result<()> {
+        if !self.initialized.load(Ordering::Acquire) {
+            return responder.respond_with_error(Error::invalid_request().data("initialize first"));
+        }
+        let session_id = match session_status::requested_session_id(&params) {
+            Ok(session_id) => session_id,
+            Err(error) => return responder.respond_with_error(error),
+        };
+        match self.base.store.presence(session_id).await {
+            Ok(SessionPresence::Active(runtime)) => {
+                // Without the state lock, which can be held across an MCP
+                // call while every other request on the connection waits.
+                let state = foreground_state(&runtime.active_prompt, &runtime.requires_action);
+                responder.respond(json!({"status": "active", "state": state}))
+            }
+            Ok(SessionPresence::Inactive) => responder.respond(json!({"status": "inactive"})),
+            Ok(SessionPresence::Unknown) => {
+                responder.respond_with_error(session_status::unknown_session(session_id))
+            }
+            Err(error) => responder.respond_with_error(error),
+        }
+    }
+
+    async fn session_set_title(
+        self,
+        params: Value,
+        responder: agent_client_protocol::Responder<Value>,
+        connection: V2ConnectionTo<Client>,
+    ) -> agent_client_protocol::Result<()> {
+        if !self.initialized.load(Ordering::Acquire) {
+            return responder.respond_with_error(Error::invalid_request().data("initialize first"));
+        }
+        let stored = match self.base.store_session_title(&params).await {
+            Ok(stored) => stored,
+            Err(error) => return responder.respond_with_error(error),
+        };
+        if stored.loaded {
+            // The result carries the title, so a client does not depend on
+            // this and a failed send does not fail the request.
+            let _ = send_update(
+                &connection,
+                &v2_session_id(&stored.session_id),
+                SessionUpdate::SessionInfoUpdate(
+                    v2::SessionInfoUpdate::new().title(stored.title.clone()),
+                ),
+            );
+        }
+        responder.respond(json!({"title": stored.title}))
     }
 
     async fn set_config(
@@ -866,7 +951,10 @@ impl V2Harness {
             } else {
                 state.record.pending_steering.pop();
             }
-            state.record.title = previous_title;
+            // A title set with `session/set_title` meanwhile stays.
+            if !state.record.title_set_by_client {
+                state.record.title = previous_title;
+            }
             state.prompt_seq = state.prompt_seq.saturating_sub(1);
             if starts_work {
                 state.active_prompt.store(false, Ordering::Release);
@@ -928,34 +1016,10 @@ impl V2Harness {
         responder: agent_client_protocol::Responder<Value>,
         connection: V2ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
-        let session_id = params
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .filter(|session_id| !session_id.is_empty())
-            .ok_or_else(|| {
-                Error::invalid_params().data("steering requires a non-empty sessionId")
-            })?;
-        let prompt = params
-            .get("prompt")
-            .cloned()
-            .ok_or_else(|| Error::invalid_params().data("steering requires prompt content"))?;
-        let prompt = serde_json::from_value::<Vec<ContentBlock>>(prompt)
-            .map_err(|error| Error::invalid_params().data(error.to_string()))?;
-        if prompt.is_empty() {
-            return responder.respond_with_error(
-                Error::invalid_params().data("steering prompt must not be empty"),
-            );
-        }
-        let idle_behavior = params
-            .pointer("/_meta/steering/idleBehavior")
-            .and_then(Value::as_str);
-        if let Some(idle_behavior) = idle_behavior
-            && idle_behavior != "promptRequired"
-        {
-            return responder.respond_with_error(
-                Error::invalid_params().data("unsupported steering idleBehavior"),
-            );
-        }
+        let (session_id, prompt, idle_behavior) = match steering_params::<ContentBlock>(&params) {
+            Ok(params) => params,
+            Err(error) => return responder.respond_with_error(error),
+        };
         let session_id = v2::SessionId::new(session_id.to_string());
         let runtime = match self.base.store.get(&session_id.to_string()).await {
             Ok(runtime) => runtime,
@@ -1068,7 +1132,10 @@ impl V2Harness {
                 .prompt_blocks
                 .remove(&message_index.to_string());
             state.record.message_ids.remove(&message_index.to_string());
-            state.record.title = previous_title;
+            // A title set with `session/set_title` meanwhile stays.
+            if !state.record.title_set_by_client {
+                state.record.title = previous_title;
+            }
             state.prompt_seq = prompt_seq.saturating_sub(1);
             state.active_prompt.store(false, Ordering::Release);
             state.activity_notify.notify_waiters();
@@ -1143,25 +1210,25 @@ impl V2Harness {
         connection: V2ConnectionTo<Client>,
         cancellation: CancellationToken,
     ) {
-        let record = {
+        {
             let state = runtime.state.lock().await;
             state.requires_action.store(false, Ordering::Release);
-            let record = state.record.clone();
             send_update(
                 &connection,
                 &session_id,
                 SessionUpdate::StateUpdate(StateUpdate::Running(RunningStateUpdate::new())),
             )
             .ok();
-            record
-        };
-        let _ = send_update(
-            &connection,
-            &session_id,
-            SessionUpdate::SessionInfoUpdate(
-                v2::SessionInfoUpdate::new().title(record.title.clone()),
-            ),
-        );
+            // Also under the state lock, so this never announces a title
+            // that `session/set_title` has already replaced.
+            let _ = send_update(
+                &connection,
+                &session_id,
+                SessionUpdate::SessionInfoUpdate(
+                    v2::SessionInfoUpdate::new().title(state.record.title.clone()),
+                ),
+            );
+        }
         let initial_usage = runtime.snapshot().await.usage;
         let mut usage = initial_usage.clone();
         let mut allow_command = true;
@@ -1206,6 +1273,10 @@ impl V2Harness {
                 if matches!(&stop_reason, StopReason::EndTurn) && pending_steering {
                     (true, flushed_steering)
                 } else {
+                    // Before the update: `session/status` reads the flags
+                    // without this lock.
+                    state.active_prompt.store(false, Ordering::Release);
+                    state.requires_action.store(false, Ordering::Release);
                     let _ = send_update(
                         &connection,
                         &session_id,
@@ -1215,8 +1286,6 @@ impl V2Harness {
                                 .usage(Some(v2_turn_usage(&usage, &initial_usage))),
                         )),
                     );
-                    state.active_prompt.store(false, Ordering::Release);
-                    state.requires_action.store(false, Ordering::Release);
                     state.activity_notify.notify_waiters();
                     (false, flushed_steering)
                 }
@@ -1281,6 +1350,10 @@ impl V2Harness {
             .is_some_and(|capabilities| {
                 capabilities.supports_form() || capabilities.supports_url()
             });
+        let supports_url_elicitation = capabilities
+            .elicitation
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.supports_url());
         let mut compaction_reported = false;
         // A turn runs until the model stops asking for tools, the user
         // cancels, or a request fails. There is no round limit: a task that
@@ -1310,10 +1383,22 @@ impl V2Harness {
             if supports_elicitation {
                 tools.push(crate::tools::ask_user_definition());
             }
+            if supports_url_elicitation {
+                tools.push(crate::tools::complete_url_elicitation_definition());
+            }
             let read_only_mcp_names = {
-                let mut state = runtime.state.lock().await;
-                if let Some(mcp) = state.mcp.as_mut() {
+                let mcp = runtime.state.lock().await.mcp.clone();
+                if let Some(mcp) = mcp {
                     if let Err(error) = mcp.refresh(cancellation).await {
+                        // A cancel that lands during the refresh ends the
+                        // work; the refresh did not fail.
+                        if error.code == agent_client_protocol::ErrorCode::RequestCancelled {
+                            return Ok((
+                                StopReason::Cancelled,
+                                usage,
+                                runtime.state.lock().await.prompt_seq,
+                            ));
+                        }
                         tracing::warn!(?error, "failed to refresh MCP tools");
                         let _ = send_update(
                             connection,
@@ -1725,7 +1810,16 @@ impl V2Harness {
             SessionUpdate::ToolCallUpdate(update.clone()),
         )?;
         if call.function.name == "update_plan" {
-            let entries = parse_plan(&arguments)?;
+            // Like other tool failures, an invalid plan tells the model why
+            // and the turn goes on.
+            let entries = match parse_plan(&arguments) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    let result = crate::tools::error_result("Unable to update plan", &error);
+                    send_tool_result(connection, session_id, call, &result, false)?;
+                    return Ok(result);
+                }
+            };
             send_update(
                 connection,
                 session_id,
@@ -1748,38 +1842,74 @@ impl V2Harness {
                     capabilities.supports_form() || capabilities.supports_url()
                 })
         {
+            // Validate and reserve first: a refused request never waits on the
+            // user, so it reports no `requires_action`.
+            let result = match self
+                .elicitation_request(session_id, call, &arguments, capabilities)
+                .await
             {
-                let state = runtime.state.lock().await;
-                state.requires_action.store(true, Ordering::Release);
-                send_update(
-                    connection,
-                    session_id,
-                    SessionUpdate::StateUpdate(StateUpdate::RequiresAction(
-                        RequiresActionStateUpdate::new(),
-                    )),
-                )?;
-            }
-            let result = self
-                .ask_user(
-                    connection,
-                    session_id,
-                    call,
-                    &arguments,
-                    capabilities,
-                    cancellation,
-                )
-                .await;
-            {
-                let state = runtime.state.lock().await;
-                state.requires_action.store(false, Ordering::Release);
-                send_update(
-                    connection,
-                    session_id,
-                    SessionUpdate::StateUpdate(StateUpdate::Running(RunningStateUpdate::new())),
-                )?;
-            }
-            let result = result?;
-            send_tool_result(connection, session_id, call, &result, true)?;
+                Ok((request, url_elicitation_id)) => {
+                    {
+                        let state = runtime.state.lock().await;
+                        state.requires_action.store(true, Ordering::Release);
+                        send_update(
+                            connection,
+                            session_id,
+                            SessionUpdate::StateUpdate(StateUpdate::RequiresAction(
+                                RequiresActionStateUpdate::new(),
+                            )),
+                        )?;
+                    }
+                    let result = self
+                        .ask_user(
+                            connection,
+                            session_id,
+                            request,
+                            url_elicitation_id.as_deref(),
+                            cancellation,
+                        )
+                        .await;
+                    {
+                        let state = runtime.state.lock().await;
+                        state.requires_action.store(false, Ordering::Release);
+                        send_update(
+                            connection,
+                            session_id,
+                            SessionUpdate::StateUpdate(StateUpdate::Running(
+                                RunningStateUpdate::new(),
+                            )),
+                        )?;
+                    }
+                    result
+                }
+                Err(error) => Err(error),
+            };
+            // Like other tool failures, a refused or failed request tells the
+            // model why and the turn goes on. Only the turn's own cancellation
+            // ends it: a Client that cancels the elicitation answers -32800 too.
+            let (result, success) = match result {
+                Ok(result) => (result, true),
+                Err(_) if cancellation.is_cancelled() => return Err(Error::request_cancelled()),
+                Err(error) => (crate::tools::ask_user_failed(&error), false),
+            };
+            send_tool_result(connection, session_id, call, &result, success)?;
+            return Ok(result);
+        }
+        // Only a protocol notification to the Client: it needs no permission,
+        // stays available in plan mode, and is not a foreground state change.
+        if call.function.name == "complete_url_elicitation" {
+            let result = crate::tools::complete_url_elicitation(
+                &self.base.store,
+                &session_id.to_string(),
+                &arguments,
+                |elicitation_id| {
+                    connection
+                        .send_notification(v2::CompleteElicitationNotification::new(elicitation_id))
+                },
+            )
+            .await;
+            let success = result_status(&result) == ToolOutcomeStatus::Completed;
+            send_tool_result(connection, session_id, call, &result, success)?;
             return Ok(result);
         }
         // Refuse before asking permission: approving a call plan mode then
@@ -1831,8 +1961,8 @@ impl V2Harness {
                 .await
                 .requires_action
                 .store(false, Ordering::Release);
-            match decision? {
-                PermissionDecision::AllowOnce => {}
+            let refusal = match decision {
+                PermissionDecision::AllowOnce => None,
                 PermissionDecision::AllowAlways => {
                     runtime
                         .state
@@ -1840,28 +1970,18 @@ impl V2Harness {
                         .await
                         .session_approvals
                         .insert(approval_key);
+                    None
                 }
-                PermissionDecision::Deny => {
-                    {
-                        let state = runtime.state.lock().await;
-                        send_update(
-                            connection,
-                            session_id,
-                            SessionUpdate::StateUpdate(StateUpdate::Running(
-                                RunningStateUpdate::new(),
-                            )),
-                        )?;
-                        drop(state);
-                    }
-                    let result = ToolResult {
-                        text: "The user denied permission.".to_string(),
-                        raw: json!({"denied": true}),
-                    };
-                    send_tool_result(connection, session_id, call, &result, false)?;
-                    return Ok(result);
+                PermissionDecision::Deny => Some(ToolResult {
+                    text: "The user denied permission.".to_string(),
+                    raw: json!({"denied": true}),
+                }),
+                PermissionDecision::Failed(error) => {
+                    Some(crate::tools::permission_request_failed(&error))
                 }
                 PermissionDecision::Cancelled => return Err(Error::request_cancelled()),
-            }
+            };
+            // The turn goes on whether or not the tool runs.
             {
                 let state = runtime.state.lock().await;
                 send_update(
@@ -1870,6 +1990,10 @@ impl V2Harness {
                     SessionUpdate::StateUpdate(StateUpdate::Running(RunningStateUpdate::new())),
                 )?;
                 drop(state);
+            }
+            if let Some(result) = refusal {
+                send_tool_result(connection, session_id, call, &result, false)?;
+                return Ok(result);
             }
         }
         send_update(
@@ -1885,22 +2009,20 @@ impl V2Harness {
             config: self.base.config.clone(),
         };
         let mut result = if call.function.name.starts_with("mcp__") {
-            let mcp_result = {
-                let state = runtime.state.lock().await;
-                let Some(mcp) = state.mcp.as_ref() else {
-                    return Err(Error::internal_error().data("MCP session unavailable"));
-                };
-                mcp.call(&call.function.name, arguments, cancellation).await
+            let mcp = runtime.state.lock().await.mcp.clone();
+            let mcp_result = match mcp {
+                Some(mcp) => mcp.call(&call.function.name, arguments, cancellation).await,
+                // With no MCP server attached, the model named a tool it was
+                // never offered: that fails only this call, as any unknown
+                // MCP tool does.
+                None => Err(Error::invalid_params().data("unknown MCP tool")),
             };
             match mcp_result {
                 Ok(value) => ToolResult {
                     text: crate::mcp::mcp_result_text(&value),
                     raw: value,
                 },
-                Err(error) => ToolResult {
-                    text: format!("MCP tool failed: {}", error.message),
-                    raw: json!({"error": error.message}),
-                },
+                Err(error) => crate::tools::error_result("MCP tool failed", &error),
             }
         } else {
             match crate::tools::execute(
@@ -1914,10 +2036,7 @@ impl V2Harness {
             .await
             {
                 Ok(result) => result,
-                Err(error) => ToolResult {
-                    text: format!("Tool failed: {}", error.message),
-                    raw: json!({"error": error.message}),
-                },
+                Err(error) => crate::tools::error_result("Tool failed", &error),
             }
         };
         if call.function.name == "run_command" {
@@ -1937,24 +2056,24 @@ impl V2Harness {
         Ok(result)
     }
 
-    async fn ask_user(
+    /// Validate an `ask_user` call and build its request, reserving a URL
+    /// elicitation's ID. Returns that ID with the request.
+    async fn elicitation_request(
         &self,
-        connection: &V2ConnectionTo<Client>,
         session_id: &v2::SessionId,
         call: &crate::model::ToolCall,
         arguments: &Value,
         capabilities: &v2::ClientCapabilities,
-        cancellation: &CancellationToken,
-    ) -> Result<ToolResult, Error> {
+    ) -> Result<(v2::CreateElicitationRequest, Option<String>), Error> {
         let message = arguments
             .get("message")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::invalid_params().data("ask_user requires message"))?;
         let scope = v2::ElicitationSessionScope::new(session_id.clone())
             .tool_call_id(Some(v2::ToolCallId::new(call.id.clone())));
-        let url_mode = arguments.get("url").and_then(Value::as_str);
+        let mut url_elicitation_id = None;
         let mode =
-            if let Some(url) = url_mode {
+            if let Some(url) = arguments.get("url").and_then(Value::as_str) {
                 if !capabilities
                     .elicitation
                     .as_ref()
@@ -1978,6 +2097,11 @@ impl V2Harness {
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned)
                     .unwrap_or_else(|| format!("elicit-{}", uuid::Uuid::new_v4().simple()));
+                self.base
+                    .store
+                    .reserve_url_elicitation(&session_id.to_string(), &elicitation_id)
+                    .await?;
+                url_elicitation_id = Some(elicitation_id.clone());
                 v2::ElicitationMode::Url(v2::ElicitationUrlMode::new(scope, elicitation_id, url))
             } else {
                 if !capabilities
@@ -1994,28 +2118,54 @@ impl V2Harness {
                     .string("response", true);
                 v2::ElicitationMode::Form(v2::ElicitationFormMode::new(scope, schema))
             };
-        let request = v2::CreateElicitationRequest::new(mode, message);
-        let response: v2::CreateElicitationResponse = tokio::select! {
+        Ok((
+            v2::CreateElicitationRequest::new(mode, message),
+            url_elicitation_id,
+        ))
+    }
+
+    async fn ask_user(
+        &self,
+        connection: &V2ConnectionTo<Client>,
+        session_id: &v2::SessionId,
+        request: v2::CreateElicitationRequest,
+        url_elicitation_id: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<ToolResult, Error> {
+        let response: Result<v2::CreateElicitationResponse, Error> = tokio::select! {
+            // The Client may already have accepted, so a URL elicitation's ID
+            // stays reserved, though never completable, until the session
+            // closes.
             _ = cancellation.cancelled() => return Err(Error::request_cancelled()),
-            response = connection.send_request(request).block_task() => response?,
+            response = connection.send_request(request).block_task() => response,
         };
-        Ok(match response.action {
-            v2::ElicitationAction::Accept(action) => ToolResult {
-                text: action
-                    .content
-                    .as_ref()
-                    .and_then(|content| content.get("response"))
-                    .map(elicitation_text)
-                    .unwrap_or_else(|| {
-                        if url_mode.is_some() {
-                            "The user consented to open the URL. External completion was not verified."
-                                .to_string()
-                        } else {
-                            "The user accepted without text.".to_string()
-                        }
-                    }),
-                raw: json!({"action": "accept"}),
-            },
+        if let Some(elicitation_id) = url_elicitation_id {
+            let accepted = response
+                .as_ref()
+                .is_ok_and(|response| matches!(response.action, v2::ElicitationAction::Accept(_)));
+            self.base
+                .store
+                .settle_url_elicitation(&session_id.to_string(), elicitation_id, accepted)
+                .await;
+        }
+        Ok(match response?.action {
+            v2::ElicitationAction::Accept(action) => {
+                // Consent, not completion. What the user enters out of band
+                // must stay out of the model's context, so URL content is not
+                // read.
+                if let Some(elicitation_id) = url_elicitation_id {
+                    return Ok(crate::tools::url_elicitation_accepted(elicitation_id));
+                }
+                ToolResult {
+                    text: action
+                        .content
+                        .as_ref()
+                        .and_then(|content| content.get("response"))
+                        .map(elicitation_text)
+                        .unwrap_or_else(|| "The user accepted without text.".to_string()),
+                    raw: json!({"action": "accept"}),
+                }
+            }
             v2::ElicitationAction::Decline => ToolResult {
                 text: "The user declined.".to_string(),
                 raw: json!({"action": "decline"}),
@@ -2088,6 +2238,7 @@ impl V2Harness {
         &self,
         runtime: &SessionRuntime,
         servers: &[v2::McpServer],
+        connection: &V2ConnectionTo<Client>,
     ) -> Result<(), Error> {
         if servers.is_empty() {
             return Ok(());
@@ -2096,7 +2247,28 @@ impl V2Harness {
             .iter()
             .map(convert_mcp_server)
             .collect::<Result<Vec<_>, _>>()?;
-        self.base.attach_mcp(runtime, &converted).await
+        self.base
+            .attach_mcp(
+                runtime,
+                &converted,
+                crate::mcp::AcpConnection::V2(connection.clone()),
+            )
+            .await
+    }
+}
+
+/// The foreground state snapshot that `session/resume` and `session/status`
+/// report.
+///
+/// Every transition sets these flags before it sends its `state_update`, so a
+/// snapshot read after the client has seen an update is at least that new.
+fn foreground_state(active_prompt: &AtomicBool, requires_action: &AtomicBool) -> StateUpdate {
+    if requires_action.load(Ordering::Acquire) {
+        StateUpdate::RequiresAction(RequiresActionStateUpdate::new())
+    } else if active_prompt.load(Ordering::Acquire) {
+        StateUpdate::Running(RunningStateUpdate::new())
+    } else {
+        StateUpdate::Idle(IdleStateUpdate::new())
     }
 }
 
@@ -2336,6 +2508,8 @@ enum PermissionDecision {
     AllowOnce,
     AllowAlways,
     Deny,
+    /// The Client answered with an error while the turn went on.
+    Failed(Error),
     Cancelled,
 }
 
@@ -2345,7 +2519,7 @@ async fn request_permission(
     tool_call: ToolCallUpdate,
     session_approval_label: &str,
     cancellation: &CancellationToken,
-) -> Result<PermissionDecision, Error> {
+) -> PermissionDecision {
     let options = vec![
         PermissionOption::new(
             v2::PermissionOptionId::new("allow_once"),
@@ -2365,11 +2539,18 @@ async fn request_permission(
     ];
     let request = RequestPermissionRequest::new(session_id.clone(), "Run sensitive tool", options)
         .subject(Some(v2::RequestPermissionSubject::from(tool_call)));
-    let response: v2::RequestPermissionResponse = tokio::select! {
-        _ = cancellation.cancelled() => return Err(Error::request_cancelled()),
-        response = connection.send_request(request).block_task() => response?,
+    let response = tokio::select! {
+        _ = cancellation.cancelled() => return PermissionDecision::Cancelled,
+        response = connection.send_request(request).block_task() => response,
     };
-    Ok(match response.outcome {
+    let response: v2::RequestPermissionResponse = match response {
+        Ok(response) => response,
+        // Only the turn's own cancellation ends it: a Client that cancels
+        // the permission request itself answers -32800 too.
+        Err(_) if cancellation.is_cancelled() => return PermissionDecision::Cancelled,
+        Err(error) => return PermissionDecision::Failed(error),
+    };
+    match response.outcome {
         RequestPermissionOutcome::Cancelled => PermissionDecision::Cancelled,
         RequestPermissionOutcome::Selected(v2::SelectedPermissionOutcome { option_id, .. }) => {
             match option_id.to_string().as_str() {
@@ -2379,7 +2560,7 @@ async fn request_permission(
             }
         }
         _ => PermissionDecision::Deny,
-    })
+    }
 }
 
 fn replay_history(
@@ -2844,6 +3025,12 @@ fn convert_mcp_server(
                     .collect(),
             ),
         )),
+        // Requests to it are still sent as v2 `mcp/message`, over the v2
+        // connection `attach_mcp` passes along.
+        v2::McpServer::Acp(config) => Ok(v1::McpServer::Acp(v1::McpServerAcp::new(
+            &config.name,
+            config.server_id.0.clone(),
+        ))),
         _ => Err(Error::invalid_params()
             .data("this v2 MCP transport is not supported by the standalone agent")),
     }

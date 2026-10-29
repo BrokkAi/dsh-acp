@@ -34,6 +34,16 @@ for HTTP, after 30 seconds without an open event stream. An HTTP client
 receives everything through those streams, so one without any for that long is
 gone; the SDK does not detect that by itself.
 
+Without `RUST_LOG`, the log filter is `dsh_acp=info,warn`, or
+`dsh_acp=trace,info` with `--trace`, and it drops the SDK's events that carry
+a `handler` field. Those describe the SDK's whole handler chain, about 1 MB
+for each rejected message, which can fill a stderr pipe the client does not
+drain. The SDK still logs each error response it sends, with its method and
+id. `RUST_LOG` replaces the default filter entirely. Hand-rolled request
+handlers answer invalid params with `respond_with_error`. Returning the error
+gets it answered too, but through the SDK's handler-error path, which logs
+that warning.
+
 The SDK protocol router selects the v1 or v2 implementation from the first
 `initialize` request. Shared application logic lives behind that boundary so
 wire-specific behavior does not leak across versions.
@@ -53,6 +63,11 @@ Each session contains:
 
 JSON writes use a temporary file and atomic rename. Session files live under
 `<data-dir>/sessions/` and are created with owner-only permissions on Unix.
+
+URL elicitations awaiting a completion report are connection state, not session
+data. The store keeps them in memory, keyed by `elicitationId` with the session
+that requested each, and drops a session's entries when it is closed or
+deleted. They are never written to the session file.
 
 ## Prompt execution
 
@@ -81,6 +96,15 @@ active work stops the model stream and tool operations, emits final tool state,
 and settles to idle with the `cancelled` reason. Idle usage covers only that
 foreground turn; per-update usage continues to track the session total.
 
+An ACP v1 prompt turn runs outside the connection's ordered dispatch, so a
+`$/cancel_request` for the prompt reaches it while it runs. The notification
+cancels a child of the token `session/cancel` uses, so the turn stops the same
+way and the session token still shows whether `session/cancel` or a close
+reached the turn. A turn stopped by `$/cancel_request` alone answers the prompt
+with `-32800`; one that `session/cancel` also reached ends with
+`stopReason: "cancelled"`. Every other request is answered from the ordered
+dispatch, before a later `$/cancel_request` can be read.
+
 ## Replay
 
 Full replay rebuilds retained conversation entities in order. Tool calls retain
@@ -99,8 +123,26 @@ lossy text reconstruction.
 - Session transitions and final idle reporting use a per-session turn lock.
 - Steering requests for a session serialize through that same lock.
 - Closing prevents new prompt insertion and waits for active work to settle.
-- MCP calls are serialized per server.
-- Session-store writes are serialized per connection.
+- Calls to a stdio or HTTP MCP server are serialized per server. An
+  MCP-over-ACP request stands alone, so it takes no lock. A turn does not hold
+  the session's state lock while it waits on an MCP server, so
+  `session/cancel` and other requests for the session are not held up by a
+  slow or unresponsive server.
+- Session lifecycle requests run in the SDK's dispatch loop, so no other
+  incoming message is handled until they answer. Connecting their MCP servers
+  is bounded per server by `--mcp-connect-timeout-secs`. Servers connect one
+  after another, so a request with N servers can wait up to N times that
+  limit.
+- MCP-over-ACP servers are not contacted during a lifecycle request. The
+  client's answer to an `mcp/message` arrives through the same dispatch loop,
+  so waiting for it there would never finish. The servers keep the connection
+  of the lifecycle request that declared them, and the session's turns send
+  `mcp/message` requests over it from outside the loop: the per-round tool
+  refresh lists the tools, and dropping a request when the turn is cancelled
+  sends the client `$/cancel_request`.
+- Session-store writes are serialized process-wide. Loading a stored session
+  takes the same lock, so a title `session/set_title` writes to a stored
+  record cannot be lost to a load in progress.
 
 ## Security boundaries
 
