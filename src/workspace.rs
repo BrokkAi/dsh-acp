@@ -231,23 +231,9 @@ pub(crate) fn reject_unsafe_file(file: &File) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn has_multiple_links(metadata: &cap_std::fs::Metadata) -> bool {
-    use cap_std::fs::MetadataExt;
+    use cap_fs_ext::MetadataExt;
     metadata.nlink() > 1
-}
-
-#[cfg(windows)]
-fn has_multiple_links(metadata: &cap_std::fs::Metadata) -> bool {
-    use cap_std::fs::MetadataExt;
-    metadata
-        .number_of_links()
-        .is_none_or(|number_of_links| number_of_links > 1)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn has_multiple_links(_metadata: &cap_std::fs::Metadata) -> bool {
-    false
 }
 
 pub(crate) fn normalize_lexically(path: &Path) -> PathBuf {

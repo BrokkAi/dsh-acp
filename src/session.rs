@@ -286,6 +286,7 @@ impl SessionStore {
     }
 
     pub async fn list(&self, cwd: Option<&Path>) -> Result<Vec<SessionRecord>, Error> {
+        let cwd = cwd.map(crate::workspace::canonical_directory).transpose()?;
         let mut records = Vec::new();
         let mut directory = tokio::fs::read_dir(&self.directory)
             .await
@@ -306,7 +307,7 @@ impl SessionStore {
             let Ok(record) = serde_json::from_slice::<SessionRecord>(&bytes) else {
                 continue;
             };
-            if cwd.is_none_or(|cwd| record.cwd == cwd) {
+            if cwd.as_deref().is_none_or(|cwd| record.cwd == cwd) {
                 records.push(record);
             }
         }
@@ -707,10 +708,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         let additional = temp.path().join("additional");
+        let workspace_link = temp.path().join("workspace-link");
+        let additional_link = temp.path().join("additional-link");
         std::fs::create_dir(&workspace).unwrap();
         std::fs::create_dir(&additional).unwrap();
-        std::os::unix::fs::symlink(&workspace, temp.path().join("workspace-link")).unwrap();
-        std::os::unix::fs::symlink(&additional, temp.path().join("additional-link")).unwrap();
+        std::os::unix::fs::symlink(&workspace, &workspace_link).unwrap();
+        std::os::unix::fs::symlink(&additional, &additional_link).unwrap();
         let config = Config {
             api_key: None,
             base_url: "http://localhost".to_string(),
@@ -731,12 +734,7 @@ mod tests {
         };
         let store = SessionStore::open(&config).await.unwrap();
         let runtime = store
-            .create(
-                temp.path().join("workspace-link"),
-                vec![temp.path().join("additional-link")],
-                None,
-                None,
-            )
+            .create(workspace_link.clone(), vec![additional_link], None, None)
             .await
             .unwrap();
         let record = runtime.snapshot().await;
@@ -746,6 +744,7 @@ mod tests {
             [additional.canonicalize().unwrap()]
         );
         assert!(runtime.state.lock().await.workspace.is_some());
+        assert_eq!(store.list(Some(&workspace_link)).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
