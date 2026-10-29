@@ -376,6 +376,18 @@ async fn stdio_supports_initialize_and_session_lifecycle() {
     let session_id = new_session["sessionId"].as_str().unwrap().to_string();
     assert_eq!(new_session["modes"]["currentModeId"], "agent");
     assert!(new_session["configOptions"].as_array().unwrap().len() >= 3);
+    assert!(
+        new_session["configOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|option| {
+                (option["id"] == "web_fetch" || option["configId"] == "web_fetch")
+                    && option["name"] == "web_fetch access"
+            }),
+        "{}",
+        new_session["configOptions"]
+    );
     let idle_steer = peer
         .request(
             "_session/steering",
@@ -569,6 +581,18 @@ async fn stdio_negotiates_acp_v2_and_uses_async_prompt_lifecycle() {
         .await;
     let session_id = session["sessionId"].as_str().unwrap().to_string();
     assert!(session["configOptions"].as_array().unwrap().len() >= 4);
+    assert!(
+        session["configOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|option| {
+                (option["id"] == "web_fetch" || option["configId"] == "web_fetch")
+                    && option["name"] == "web_fetch access"
+            }),
+        "{}",
+        session["configOptions"]
+    );
     assert!(
         session["availableCommands"]
             .as_array()
@@ -1496,6 +1520,37 @@ async fn auth_status_reports_the_configured_key_until_sign_out() {
 }
 
 #[tokio::test]
+async fn api_key_file_supplies_credentials_without_argv_exposure() {
+    for protocol in &AUTH_PROTOCOLS {
+        let temp = tempfile::tempdir().unwrap();
+        let key_file = temp.path().join("api-key");
+        std::fs::write(&key_file, "file-secret\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let key_file = key_file.to_string_lossy().to_string();
+        let mut peer = spawn_peer_with_api_key(
+            temp.path(),
+            Some("http://127.0.0.1:9"),
+            None,
+            &["--api-key-file", &key_file],
+        )
+        .await;
+        initialize_advertising_auth_status(&mut peer, protocol).await;
+        let (authenticated, message) = auth_status(&mut peer, &["file-secret"]).await;
+        assert!(authenticated, "v{}: {message}", protocol.version);
+        assert!(
+            message.contains("--api-key-file"),
+            "v{}: {message}",
+            protocol.version
+        );
+        exit_peer(peer).await;
+    }
+}
+
+#[tokio::test]
 async fn auth_status_reports_missing_credentials() {
     let secrets = ["header-secret"];
     for protocol in &AUTH_PROTOCOLS {
@@ -2255,6 +2310,63 @@ async fn command_permission_title_quotes_arguments_as_a_shell_would() {
             .contains("terminal-output")
     );
     assert!(peer.terminal_requests.is_empty());
+
+    drop(peer.stdin);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
+    assert_eq!(server.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn provider_key_is_removed_from_local_command_environment() {
+    let temp = tempfile::tempdir().unwrap();
+    let Some((base_url, server)) = mock_sequence_server(vec![
+        tool_call_stream(
+            "call-env",
+            "run_command",
+            json!({
+                "command": "sh",
+                "args": ["-c", "printf 'env:%s' \"${DEEPSEEK_API_KEY-unset}\""]
+            }),
+        ),
+        mock_text_stream(),
+    ])
+    .await
+    else {
+        eprintln!("skipping command environment test: loopback networking is unavailable");
+        return;
+    };
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request("initialize", json!({"protocolVersion": 1}))
+        .await;
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": temp.path().to_string_lossy(), "mcpServers": []}),
+        )
+        .await;
+    let response = peer
+        .request(
+            "session/prompt",
+            json!({
+                "sessionId": session["sessionId"],
+                "prompt": [{"type": "text", "text": "inspect the command environment"}]
+            }),
+        )
+        .await;
+    assert_eq!(response["stopReason"], "end_turn");
+    let update = final_tool_update(&peer, "call-env");
+    assert_eq!(update["status"], "completed");
+    assert!(
+        update.to_string().contains("env:unset"),
+        "local command saw the provider key: {update}"
+    );
+    assert!(
+        !peer
+            .updates
+            .iter()
+            .any(|update| update.to_string().contains("test-key")),
+        "a tool update leaked the provider key"
+    );
 
     drop(peer.stdin);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait()).await;
@@ -3676,7 +3788,7 @@ async fn a_blank_api_key_fails_locally_without_calling_the_model() {
         assert_eq!(error["code"], -32000, "{case}: {error}");
         assert_eq!(
             error["data"],
-            "Set DEEPSEEK_API_KEY, pass --api-key, or configure an Authorization provider header",
+            "Set DEEPSEEK_API_KEY, use --api-key-file, or configure an Authorization provider header",
             "{case}: {error}"
         );
         drop(peer.stdin);

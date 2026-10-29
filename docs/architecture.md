@@ -53,7 +53,7 @@ wire-specific behavior does not leak across versions.
 Each session contains:
 
 - immutable identity, working directory, and additional roots;
-- model, mode, permission, thinking effort, and network configuration;
+- model, mode, permission, thinking effort, and `web_fetch` configuration;
 - effective system instructions loaded from configuration, `AGENTS.md`, and
   the ACP client;
 - conversation messages and original ACP prompt blocks;
@@ -160,6 +160,10 @@ a new request.
 Provider and MCP headers are supplied by configuration and are not persisted as
 session data. Instruction files are canonicalized against their source root,
 limited to regular files, and capped at 1 MiB.
+The session network switch controls only `web_fetch`; commands and MCP servers
+are governed by their own permission and transport policies. Remote MCP HTTP
+uses HTTPS unless plaintext is explicitly enabled, and MCP redirects are not
+followed.
 
 External input is bounded while reading: provider streams to 64 MiB, JSON to
 16 MiB, MCP messages to 8 MiB, and MCP tool metadata to 1 MiB. MCP pagination

@@ -86,7 +86,7 @@ pub(crate) enum Credential {
     /// An `Authorization` header from the provider configuration. It takes
     /// precedence over the API key.
     ProviderHeader,
-    /// `DEEPSEEK_API_KEY` or `--api-key`.
+    /// `DEEPSEEK_API_KEY` or `--api-key-file`.
     ApiKey,
 }
 
@@ -544,7 +544,7 @@ impl Harness {
             .agent_capabilities(capabilities)
             .auth_methods(vec![AuthMethod::Agent(
                 AuthMethodAgent::new("deepseek-api-key", "DeepSeek API key").description(
-                    "Uses DEEPSEEK_API_KEY, --api-key, or an Authorization provider header.",
+                    "Uses DEEPSEEK_API_KEY, --api-key-file, or an Authorization provider header.",
                 ),
             )])
             .agent_info(
@@ -1419,6 +1419,7 @@ impl Harness {
             servers,
             Some(&acp),
             self.config.mcp_connect_timeout,
+            self.config.allow_insecure_mcp_http,
             &CancellationToken::new(),
         )
         .await?;
@@ -2268,7 +2269,7 @@ impl Harness {
             "/status" => {
                 let record = runtime.snapshot().await;
                 format!(
-                    "model: {}\nmode: {}\npermission: {}\neffort: {}\nnetwork: {}\nusage: {} tokens",
+                    "model: {}\nmode: {}\npermission: {}\neffort: {}\nweb_fetch: {}\nusage: {} tokens",
                     record.config.model,
                     record.config.mode,
                     record.config.permission_mode.as_str(),
@@ -2371,8 +2372,8 @@ impl Harness {
             .description("How hard DeepSeek thinks before answering. None disables thinking.")
             .category(SessionConfigOptionCategory::ThoughtLevel),
             SessionConfigOption::select(
-                "network",
-                "Network access",
+                "web_fetch",
+                "web_fetch access",
                 if record.config.network {
                     "enabled"
                 } else {
@@ -2380,7 +2381,9 @@ impl Harness {
                 },
                 network_options,
             )
-            .description("Allow the web_fetch tool to access HTTP(S) URLs."),
+            .description(
+                "Allow only the built-in web_fetch tool to access HTTP(S) URLs. Commands and MCP servers keep their own network policy.",
+            ),
         ]
     }
 
@@ -2439,7 +2442,7 @@ fn apply_config_value(
                 .map_err(|()| Error::invalid_params().data("invalid reasoning effort"))?;
             Ok(())
         }
-        ("network", SessionConfigOptionValue::ValueId { value }) => {
+        ("web_fetch" | "network", SessionConfigOptionValue::ValueId { value }) => {
             match value.to_string().as_str() {
                 "enabled" => record.config.network = true,
                 "disabled" => record.config.network = false,

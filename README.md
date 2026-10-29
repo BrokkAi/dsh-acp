@@ -78,6 +78,17 @@ export DEEPSEEK_API_KEY="..."
 dsh-acp
 ```
 
+For a credential file instead, keep it readable only by your user:
+
+```bash
+chmod 600 /secure/path/deepseek-key
+dsh-acp --api-key-file /secure/path/deepseek-key
+```
+
+`--api-key <KEY>` remains available for compatibility, but process arguments
+can be visible to other local users and are often retained in shell history.
+Prefer `DEEPSEEK_API_KEY`, `--api-key-file`, or ACP provider authentication.
+
 Example client configuration:
 
 ```json
@@ -114,6 +125,7 @@ The binary is `target/release/dsh-acp`.
 ## Configuration
 
 ```text
+--api-key-file <PATH>            Read the API key from a protected file
 --base-url <URL>                 OpenAI-compatible API root
 --model <MODEL>                  Default model (default: deepseek-flash)
 --models <A,B>                   Models in the ACP model selector
@@ -124,6 +136,7 @@ The binary is `target/release/dsh-acp`.
 --context-chars <N>              Approximate context budget
 --tool-output-bytes <N>          Per-tool output cap
 --mcp-connect-timeout-secs <N>   MCP server setup limit (default: 60)
+--allow-insecure-mcp-http        Permit plaintext HTTP MCP outside loopback
 --disable-web                    Disable web_fetch
 --trace                          Detailed diagnostics on stderr
 --listen <ADDR>                  Serve HTTP and WebSocket at ADDR instead of stdio
@@ -319,6 +332,8 @@ fails and must be requested separately so the user can approve it. The tool
 rejects loopback, private, shared/CGNAT, link-local, multicast, documentation,
 benchmark, and other reserved ranges, connects directly, and does not use
 ambient proxy settings.
+The session setting is named `web_fetch access` and affects only that tool;
+commands and MCP servers have separate network policy.
 
 ## Input limits
 
@@ -354,6 +369,11 @@ temporary-directory locations, locale, and Windows process basics). They do
 not inherit provider or other ambient credentials. Put every additional
 environment value a server needs, including secrets from a secret manager, in
 that server's explicit `env` configuration.
+
+Remote MCP HTTP URLs must use HTTPS. Plain HTTP is accepted for loopback MCP
+servers, or elsewhere only with `--allow-insecure-mcp-http` /
+`DSH_ACP_ALLOW_INSECURE_MCP_HTTP=1`. MCP HTTP redirects are disabled so custom
+authentication headers are never forwarded to another URL.
 
 An MCP-over-ACP server is declared with `"type": "acp"`, a `name`, and the
 client's `serverId`. Each MCP request is an `mcp/message` request to the
@@ -477,6 +497,8 @@ security boundaries, and concurrency model.
   connects only to the public addresses that passed policy.
 - MCP, provider, and workspace inputs are bounded while they are read, so an
   oversized response or file cannot be fully buffered.
+- Remote MCP HTTP requires HTTPS unless plaintext is explicitly enabled, and
+  MCP redirects are not followed with authentication headers.
 - Credentials are read from launch configuration or provider requests and are
   not written to session transcripts.
 - `--listen` is opt-in, loopback-only unless `--listen-allow-remote` is given,

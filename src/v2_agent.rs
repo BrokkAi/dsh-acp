@@ -337,7 +337,7 @@ impl V2Harness {
         .capabilities(capabilities)
         .auth_methods(vec![AuthMethod::Agent(
             AuthMethodAgent::new("deepseek-api-key", "DeepSeek API key").description(
-                "Uses DEEPSEEK_API_KEY, --api-key, or an Authorization provider header.",
+                "Uses DEEPSEEK_API_KEY, --api-key-file, or an Authorization provider header.",
             ),
         )])
         .meta(Some(serde_json::Map::from_iter([(
@@ -378,7 +378,7 @@ impl V2Harness {
             responder.respond(LoginAuthResponse::new())
         } else {
             responder.respond_with_error(Error::auth_required().data(
-                "Configure DEEPSEEK_API_KEY, --api-key, or a provider Authorization header first",
+                "Configure DEEPSEEK_API_KEY, --api-key-file, or a provider Authorization header first",
             ))
         }
     }
@@ -1671,7 +1671,7 @@ impl V2Harness {
             "/status" => {
                 let record = runtime.snapshot().await;
                 format!(
-                    "model: {}\nmode: {}\npermission: {}\neffort: {}\nnetwork: {}\nusage: {} tokens",
+                    "model: {}\nmode: {}\npermission: {}\neffort: {}\nweb_fetch: {}\nusage: {} tokens",
                     record.config.model,
                     record.config.mode,
                     record.config.permission_mode.as_str(),
@@ -2250,7 +2250,14 @@ impl V2Harness {
             )
             .description("How hard DeepSeek thinks before answering. None disables thinking.")
             .category(v2::SessionConfigOptionCategory::ThoughtLevel),
-            v2::SessionConfigOption::boolean("network", "Network access", record.config.network),
+            v2::SessionConfigOption::boolean(
+                "web_fetch",
+                "web_fetch access",
+                record.config.network,
+            )
+            .description(
+                "Controls only the built-in web_fetch tool; commands and MCP servers have separate network policy.",
+            ),
         ]
     }
 
@@ -2984,7 +2991,7 @@ fn apply_config(
                 .map_err(|()| Error::invalid_params().data("invalid reasoning effort"))?;
             Ok(())
         }
-        ("network", v2::SessionConfigOptionValue::Boolean { value }) => {
+        ("web_fetch" | "network", v2::SessionConfigOptionValue::Boolean { value }) => {
             record.config.network = *value;
             Ok(())
         }

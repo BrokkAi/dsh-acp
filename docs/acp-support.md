@@ -200,13 +200,13 @@ result is `authenticated` plus a `message` for the user:
 ```json
 {
   "authenticated": true,
-  "message": "Using the DeepSeek API key from DEEPSEEK_API_KEY or --api-key."
+  "message": "Using the DeepSeek API key from DEEPSEEK_API_KEY or --api-key-file."
 }
 ```
 
 | State | `authenticated` |
 | --- | --- |
-| A non-blank `DEEPSEEK_API_KEY` or `--api-key`, or a provider `Authorization` header | `true` |
+| A non-blank `DEEPSEEK_API_KEY`, `--api-key-file`, or provider `Authorization` header | `true` |
 | Neither of those | `false` |
 | A credential, but after `logout` (v1), `auth/logout` (v2), or `providers/disable` | `false` until a successful `authenticate`, `auth/login`, or `providers/set` |
 
@@ -224,7 +224,10 @@ nothing and never returns the key or header values.
 ## Session configuration options
 
 Both protocol versions expose select options for `model`, `mode`,
-`permission_mode`, and `reasoning_effort`, plus a boolean `network` toggle.
+`permission_mode`, and `reasoning_effort`, plus a boolean `web_fetch` toggle.
+The legacy `network` option ID is still accepted when setting the value.
+`web_fetch` controls only that built-in tool; it does not block commands or MCP
+traffic.
 `model`, `mode`, and `reasoning_effort` carry the ACP `model`, `mode`, and
 `thought_level` categories; `permission_mode` is uncategorized. The thinking
 effort carries `none`, `low`, `high`, or `max`, is stored with the session, and
@@ -307,6 +310,13 @@ Workspace reads, edits, and searches enforce the byte and entry limits listed
 in the README. MCP responses and DeepSeek streams are likewise bounded while
 being read; exceeding a limit fails the request without first buffering the
 whole input.
+
+Remote HTTP MCP URLs require HTTPS. Plain loopback HTTP remains available for
+local servers; non-loopback plaintext requires the explicit
+`--allow-insecure-mcp-http` /
+`DSH_ACP_ALLOW_INSECURE_MCP_HTTP=1` deployment opt-in. HTTP MCP redirects are
+not followed, so configured authentication headers are sent only to the
+requested URL.
 
 A permission request that the Client answers with an error grants nothing. In
 both versions the tool does not run, its call fails with the reason, and the

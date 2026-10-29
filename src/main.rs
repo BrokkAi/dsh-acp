@@ -12,9 +12,15 @@ use dsh_acp::{
     version
 )]
 struct Cli {
-    /// DeepSeek API key. Defaults to DEEPSEEK_API_KEY.
-    #[arg(long, env = "DEEPSEEK_API_KEY", hide_env_values = true)]
+    /// Legacy DeepSeek API key argument. Process arguments may be visible to
+    /// other users; prefer DEEPSEEK_API_KEY or --api-key-file.
+    #[arg(long, hide_env_values = true)]
     api_key: Option<String>,
+
+    /// Read the DeepSeek API key from a protected file instead of putting it
+    /// in command arguments.
+    #[arg(long, env = "DEEPSEEK_API_KEY_FILE", value_name = "PATH")]
+    api_key_file: Option<std::path::PathBuf>,
 
     /// OpenAI-compatible DeepSeek API base URL.
     #[arg(
@@ -85,6 +91,10 @@ struct Cli {
     #[arg(long, env = "DSH_ACP_MCP_CONNECT_TIMEOUT_SECS", default_value_t = 60)]
     mcp_connect_timeout_secs: u64,
 
+    /// Permit plaintext HTTP MCP URLs outside loopback.
+    #[arg(long, env = "DSH_ACP_ALLOW_INSECURE_MCP_HTTP", default_value_t = false)]
+    allow_insecure_mcp_http: bool,
+
     /// Disable web_fetch even when tools are available.
     #[arg(long, env = "DSH_ACP_DISABLE_WEB", default_value_t = false)]
     disable_web: bool,
@@ -142,8 +152,18 @@ impl TryFrom<Cli> for Config {
             agent_client_protocol::Error::invalid_params()
                 .data("reasoning effort must be none, low, high, or max")
         })?;
+        let api_key = match (cli.api_key, cli.api_key_file) {
+            (Some(_), Some(_)) => {
+                return Err(agent_client_protocol::Error::invalid_params().data(
+                    "configure the API key with either --api-key or --api-key-file, not both",
+                ));
+            }
+            (Some(key), None) => Some(key),
+            (None, Some(path)) => Some(read_api_key_file(&path)?),
+            (None, None) => std::env::var("DEEPSEEK_API_KEY").ok(),
+        };
         Ok(Self {
-            api_key: cli.api_key,
+            api_key,
             base_url: cli.base_url,
             default_model: cli.model,
             models,
@@ -156,21 +176,68 @@ impl TryFrom<Cli> for Config {
             tool_output_bytes: cli.tool_output_bytes,
             http_timeout: std::time::Duration::from_secs(cli.http_timeout_secs),
             mcp_connect_timeout: std::time::Duration::from_secs(cli.mcp_connect_timeout_secs),
+            allow_insecure_mcp_http: cli.allow_insecure_mcp_http,
             disable_web: cli.disable_web,
             trace: cli.trace,
         })
     }
 }
 
+fn read_api_key_file(path: &std::path::Path) -> Result<String, agent_client_protocol::Error> {
+    use std::io::Read;
+
+    const MAX_API_KEY_FILE_BYTES: u64 = 64 * 1024;
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        agent_client_protocol::Error::invalid_params().data(format!(
+            "failed to inspect API key file {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(agent_client_protocol::Error::invalid_params()
+            .data("API key file must be a regular file"));
+    }
+    if metadata.len() > MAX_API_KEY_FILE_BYTES {
+        return Err(agent_client_protocol::Error::invalid_params().data(format!(
+            "API key file exceeds the {MAX_API_KEY_FILE_BYTES}-byte limit"
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(agent_client_protocol::Error::invalid_params().data(
+                "API key file must not be accessible by group or other users; use chmod 600",
+            ));
+        }
+    }
+    let file = std::fs::File::open(path).map_err(|error| {
+        agent_client_protocol::Error::invalid_params().data(format!(
+            "failed to open API key file {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    file.take(MAX_API_KEY_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    if bytes.len() as u64 > MAX_API_KEY_FILE_BYTES {
+        return Err(agent_client_protocol::Error::invalid_params().data(format!(
+            "API key file exceeds the {MAX_API_KEY_FILE_BYTES}-byte limit"
+        )));
+    }
+    let key = String::from_utf8(bytes).map_err(|_| {
+        agent_client_protocol::Error::invalid_params().data("API key file is not valid UTF-8")
+    })?;
+    Ok(key.trim().to_string())
+}
+
 fn main() -> agent_client_protocol::Result<()> {
     let cli = Cli::parse();
-    // Commands and MCP servers inherit this process's environment, and the
-    // model can read what they print. Take the token out of it while no other
-    // thread exists, which is why the runtime is built by hand.
+    // Commands inherit this process's environment, and the model can read
+    // what they print. Configuration has captured both secrets below, so
+    // remove them while no other thread exists.
     let token = std::env::var_os(TOKEN_ENV);
-    // SAFETY: the runtime is not built yet, so no other thread can be reading
-    // the environment.
-    unsafe { std::env::remove_var(TOKEN_ENV) };
     let listen = match (cli.listen.clone(), cli.listen_allow_remote) {
         (Some(address), allow_remote) => Some(ListenOptions {
             address,
@@ -192,6 +259,10 @@ fn main() -> agent_client_protocol::Result<()> {
     };
     let config = Config::try_from(cli)?;
     config.validate()?;
+    // SAFETY: the runtime is not built yet, so no other thread can be reading
+    // the environment.
+    unsafe { std::env::remove_var(TOKEN_ENV) };
+    unsafe { std::env::remove_var("DEEPSEEK_API_KEY") };
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -202,4 +273,48 @@ fn main() -> agent_client_protocol::Result<()> {
                 None => run(config).await,
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set_owner_only(path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    #[test]
+    fn api_key_files_are_trimmed_and_size_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("key");
+        std::fs::write(&path, "  secret-key\n").unwrap();
+        set_owner_only(&path);
+        assert_eq!(read_api_key_file(&path).unwrap(), "secret-key");
+
+        std::fs::write(&path, vec![b'x'; 64 * 1024 + 1]).unwrap();
+        assert!(read_api_key_file(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn api_key_files_reject_group_or_world_access() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("key");
+        std::fs::write(&path, "secret-key").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = read_api_key_file(&path).unwrap_err();
+        assert!(
+            error
+                .data
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|message| message.contains("chmod 600"))
+        );
+    }
 }
