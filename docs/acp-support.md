@@ -296,7 +296,12 @@ Every other request, in both versions, is answered before a later
 Reads, writes, searches, local commands, and MCP calls execute in the agent.
 The session `cwd` and additional roots define the filesystem boundary. Sensitive
 tools request permission unless the session policy or an explicit remembered
-decision allows them.
+decision allows them. Every `web_fetch` call requires permission; a remembered
+decision covers only the requested origin. Cross-origin redirects are refused
+so a redirect cannot escape that decision. Reads of credential-like filenames
+and directories, including a resolved symlink target, require a separate
+file-scoped permission decision. Searches skip those paths, and a search whose
+root is itself credential-like is refused.
 
 A permission request that the Client answers with an error grants nothing. In
 both versions the tool does not run, its call fails with the reason, and the

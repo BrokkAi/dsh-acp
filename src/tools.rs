@@ -535,11 +535,90 @@ pub async fn complete_url_elicitation(
     }
 }
 
-pub fn permission_required(name: &str) -> bool {
-    matches!(
-        name,
-        "write_file" | "edit_file" | "run_command" | "mcp__write" | "mcp__delete"
-    )
+/// Whether this tool call needs an ACP permission decision. Network egress is
+/// always gated, and a read gets its own decision when its lexical or resolved
+/// path looks like credential material.
+pub fn permission_required(session: &SessionRecord, name: &str, arguments: &Value) -> bool {
+    match name {
+        "web_fetch" => true,
+        "read_file" => {
+            let Some(path) = arguments.get("path").and_then(Value::as_str) else {
+                return false;
+            };
+            let candidate = candidate_path(session, path);
+            is_sensitive_path(&candidate)
+                || candidate
+                    .canonicalize()
+                    .is_ok_and(|resolved| is_sensitive_path(&resolved))
+        }
+        _ => matches!(
+            name,
+            "write_file" | "edit_file" | "run_command" | "mcp__write" | "mcp__delete"
+        ),
+    }
+}
+
+/// Paths where a workspace file commonly contains credentials or private key
+/// material. This is a prompt-selection heuristic, not a claim that other
+/// files can never contain secrets.
+pub fn is_sensitive_path(path: &Path) -> bool {
+    let components = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .map(|component| component.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if components.iter().any(|component| {
+        matches!(
+            component.as_str(),
+            ".git"
+                | ".ssh"
+                | ".aws"
+                | ".azure"
+                | ".cargo"
+                | ".docker"
+                | ".gnupg"
+                | ".kube"
+                | "gcloud"
+        )
+    }) {
+        return true;
+    }
+    let Some(name) = components.last() else {
+        return false;
+    };
+    let extension = Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    name == ".env"
+        || name.starts_with(".env.")
+        || name == ".envrc"
+        || matches!(
+            name.as_str(),
+            ".git-credentials"
+                | ".htpasswd"
+                | ".netrc"
+                | "_netrc"
+                | ".npmrc"
+                | ".pypirc"
+                | "application_default_credentials.json"
+                | "credentials"
+                | "credentials.json"
+                | "credentials.toml"
+                | "id_dsa"
+                | "id_ecdsa"
+                | "id_ed25519"
+                | "id_rsa"
+                | "secrets"
+                | "secrets.json"
+                | "secrets.toml"
+                | "secrets.yaml"
+                | "secrets.yml"
+        )
+        || matches!(
+            extension,
+            "jks" | "key" | "kdbx" | "p12" | "pem" | "pfx" | "tfstate"
+        )
 }
 
 /// What the model is told while a session is in plan mode. Without it the
@@ -770,6 +849,11 @@ fn search_files(
         Some(path) => resolve_existing_path(session, path)?,
         None => session.cwd.clone(),
     };
+    if is_sensitive_path(&root) {
+        return Err(agent_client_protocol::Error::invalid_request().data(
+            "search_files does not search credential-like paths; read an individual file with an explicit permission decision instead",
+        ));
+    }
     let max_results = arguments
         .get("max_results")
         .and_then(Value::as_u64)
@@ -782,7 +866,9 @@ fn search_files(
         .into_iter()
         .filter_entry(|entry| {
             entry.path().strip_prefix(&root).map_or(true, |relative| {
-                !is_noisy_directory(relative) && !is_hidden_path(relative)
+                !is_noisy_directory(relative)
+                    && !is_hidden_path(relative)
+                    && !is_sensitive_path(relative)
             })
         })
     {
@@ -1474,6 +1560,11 @@ fn resolve_web_redirect(
         return Err(agent_client_protocol::Error::invalid_params()
             .data("web_fetch only follows redirects to HTTP or HTTPS URLs"));
     }
+    if target.origin() != current.origin() {
+        return Err(agent_client_protocol::Error::invalid_params().data(
+            "web_fetch does not follow cross-origin redirects; request the redirect target separately so its origin can be approved",
+        ));
+    }
     Ok(Some(target))
 }
 
@@ -1724,9 +1815,29 @@ pub fn session_approval_key(session: &SessionRecord, tool: &str, arguments: &Val
                 .and_then(Value::as_str)
                 .map(|path| lexical_path(&session.cwd, path)),
         }),
+        "read_file" => json!({
+            "tool": "sensitive_file",
+            "path": arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .map(|path| lexical_path(&session.cwd, path)),
+        }),
+        "web_fetch" => json!({
+            "tool": "web_origin",
+            "origin": web_fetch_origin(arguments),
+        }),
         _ => json!({"tool": tool}),
     }
     .to_string()
+}
+
+fn web_fetch_origin(arguments: &Value) -> String {
+    arguments
+        .get("url")
+        .and_then(Value::as_str)
+        .and_then(|url| reqwest::Url::parse(url).ok())
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|| "invalid".to_string())
 }
 
 /// The label of the "allow for this session" option, naming what it covers.
@@ -1734,6 +1845,8 @@ pub fn session_approval_label(tool: &str) -> &'static str {
     match tool {
         "run_command" => "Yes, and don't ask again for this command in this session",
         "write_file" | "edit_file" => "Yes, and don't ask again for this file in this session",
+        "read_file" => "Yes, and don't ask again for this sensitive path in this session",
+        "web_fetch" => "Yes, and don't ask again for this web origin in this session",
         _ => "Allow for this session",
     }
 }
@@ -1875,25 +1988,21 @@ mod tests {
     #[test]
     fn web_fetch_validates_and_pins_redirect_dns_answers() {
         let initial = reqwest::Url::parse("https://example.com/start").unwrap();
-        let redirected = resolve_web_redirect(
-            &initial,
-            302,
-            Some("https://target.test/private?token=secret"),
-        )
-        .unwrap()
-        .expect("the redirect should resolve");
+        let redirected = resolve_web_redirect(&initial, 302, Some("/private?token=secret"))
+            .unwrap()
+            .expect("the redirect should resolve");
         let public_address = "8.8.8.8:443".parse().unwrap();
         let pinned =
-            public_fetch_target_from_addresses(&redirected, "target.test", vec![public_address])
+            public_fetch_target_from_addresses(&redirected, "example.com", vec![public_address])
                 .unwrap();
         assert_eq!(
             pinned.resolution,
-            Some(("target.test".to_string(), vec![public_address]))
+            Some(("example.com".to_string(), vec![public_address]))
         );
 
         let changed_answer = public_fetch_target_from_addresses(
             &redirected,
-            "target.test",
+            "example.com",
             vec!["127.0.0.1:443".parse().unwrap()],
         )
         .expect_err("a later private DNS answer must be blocked");
@@ -1923,6 +2032,113 @@ mod tests {
             None
         );
         assert_eq!(resolve_web_redirect(&current, 302, None).unwrap(), None);
+        let cross_origin = resolve_web_redirect(&current, 302, Some("https://example.org/next"))
+            .expect_err("cross-origin redirects need a separate decision");
+        assert!(
+            cross_origin
+                .data
+                .as_ref()
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("cross-origin"))
+        );
+    }
+
+    #[test]
+    fn web_and_sensitive_read_permissions_are_scoped_independently() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        std::fs::write(cwd.join(".env"), "DEEPSEEK_API_KEY=secret\n").unwrap();
+        std::fs::write(cwd.join("README.md"), "public documentation\n").unwrap();
+        let session = session_in(&cwd);
+
+        assert!(!permission_required(
+            &session,
+            "read_file",
+            &json!({"path": "README.md"})
+        ));
+        assert!(permission_required(
+            &session,
+            "read_file",
+            &json!({"path": ".env"})
+        ));
+        assert!(permission_required(
+            &session,
+            "read_file",
+            &json!({"path": "deploy/credentials.json"})
+        ));
+        assert!(permission_required(
+            &session,
+            "web_fetch",
+            &json!({"url": "https://example.com/docs"})
+        ));
+        let first = session_approval_key(
+            &session,
+            "web_fetch",
+            &json!({"url": "https://example.com/one"}),
+        );
+        let same_origin = session_approval_key(
+            &session,
+            "web_fetch",
+            &json!({"url": "https://example.com/two"}),
+        );
+        let other_origin = session_approval_key(
+            &session,
+            "web_fetch",
+            &json!({"url": "https://example.org/one"}),
+        );
+        assert_eq!(first, same_origin);
+        assert_ne!(first, other_origin);
+        assert_ne!(
+            session_approval_key(&session, "read_file", &json!({"path": ".env"})),
+            session_approval_key(
+                &session,
+                "read_file",
+                &json!({"path": "deploy/credentials.json"})
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_through_an_innocent_symlink_still_needs_sensitive_permission() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        std::fs::write(cwd.join(".env"), "DEEPSEEK_API_KEY=secret\n").unwrap();
+        std::os::unix::fs::symlink(".env", cwd.join("notes.txt")).unwrap();
+        let session = session_in(&cwd);
+        assert!(permission_required(
+            &session,
+            "read_file",
+            &json!({"path": "notes.txt"})
+        ));
+    }
+
+    #[tokio::test]
+    async fn search_skips_secret_like_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        std::fs::write(cwd.join("public.txt"), "TOKEN public\n").unwrap();
+        std::fs::write(cwd.join("secrets.json"), "TOKEN private\n").unwrap();
+        let session = session_in(&cwd);
+        let result = search_files(
+            &session,
+            &json!({"query": "TOKEN"}),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(result.text.contains("public.txt"), "{}", result.text);
+        assert!(!result.text.contains("secrets.json"), "{}", result.text);
+        assert!(!result.text.contains("private"), "{}", result.text);
+        let direct = search_files(
+            &session,
+            &json!({"query": "TOKEN", "path": "secrets.json"}),
+            &CancellationToken::new(),
+        )
+        .expect_err("an explicitly sensitive search root must be refused");
+        assert_eq!(
+            direct.code,
+            agent_client_protocol::ErrorCode::InvalidRequest
+        );
     }
 
     #[test]

@@ -2034,8 +2034,9 @@ impl Harness {
             return Ok(result);
         }
 
-        let needs_permission = crate::tools::permission_required(&call.function.name)
-            || call.function.name.starts_with("mcp__");
+        let needs_permission =
+            crate::tools::permission_required(&record, &call.function.name, &arguments)
+                || call.function.name.starts_with("mcp__");
         if needs_permission && !cancellation.is_cancelled() {
             let record = runtime.snapshot().await;
             let approval_key =
@@ -2326,7 +2327,9 @@ impl Harness {
                 record.config.permission_mode.as_str(),
                 permission_options,
             )
-            .description("Permission policy for writes and command execution."),
+            .description(
+                "Permission policy for writes, commands, sensitive reads, and web access.",
+            ),
             SessionConfigOption::select(
                 "reasoning_effort",
                 "Thinking effort",
