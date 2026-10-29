@@ -6,6 +6,8 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ## Unreleased
 
+## 0.6.0 - 2026-10-29
+
 ### Security
 
 - Stdio MCP servers now receive only a platform-safe environment plus the
