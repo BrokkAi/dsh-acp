@@ -111,6 +111,7 @@ pub struct Config {
     pub tool_output_bytes: usize,
     pub http_timeout: Duration,
     pub mcp_connect_timeout: Duration,
+    pub allow_insecure_mcp_http: bool,
     pub disable_web: bool,
     pub trace: bool,
 }
@@ -147,7 +148,7 @@ impl Config {
             .filter(|key| !key.trim().is_empty())
             .ok_or_else(|| {
                 Error::auth_required()
-                    .data("Set DEEPSEEK_API_KEY or pass --api-key before prompting")
+                    .data("Set DEEPSEEK_API_KEY, use --api-key-file, or configure an Authorization provider header before prompting")
             })
     }
 

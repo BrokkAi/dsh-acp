@@ -6,6 +6,21 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ## Unreleased
 
+### Security
+
+- Stdio MCP servers now receive only a platform-safe environment plus the
+  variables explicitly configured for each server.
+- `web_fetch` validates and pins every public address, refuses unsafe redirect
+  chains, and uses origin-scoped permission decisions.
+- Credential-like reads and all web access require independent ACP permission
+  decisions; repository instruction files are marked as untrusted context.
+- Workspace file operations use canonical directory capabilities and reject
+  files with unsafe hard-link relationships.
+- MCP, provider, and workspace inputs have explicit byte, count, pagination,
+  and tool-call limits.
+- API keys can be read from protected files, non-loopback MCP HTTP requires
+  HTTPS unless explicitly enabled, and MCP redirects are disabled.
+
 ### Added
 
 - `--listen <ADDR>` (`DSH_ACP_LISTEN`) serves ACP over streamable HTTP and

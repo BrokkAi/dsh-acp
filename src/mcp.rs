@@ -108,6 +108,7 @@ impl McpSession {
         servers: &[McpServer],
         acp: Option<&AcpConnection>,
         setup_timeout: Duration,
+        allow_insecure_http: bool,
         cancellation: &CancellationToken,
     ) -> Result<Self, Error> {
         reject_duplicate_acp_servers(servers)?;
@@ -117,7 +118,13 @@ impl McpSession {
         };
         for server in servers {
             if let Err(error) = session
-                .add_server(server, acp, setup_timeout, cancellation)
+                .add_server(
+                    server,
+                    acp,
+                    setup_timeout,
+                    allow_insecure_http,
+                    cancellation,
+                )
                 .await
             {
                 for client in &session.clients {
@@ -134,6 +141,7 @@ impl McpSession {
         server: &McpServer,
         acp: Option<&AcpConnection>,
         setup_timeout: Duration,
+        allow_insecure_http: bool,
         cancellation: &CancellationToken,
     ) -> Result<(), Error> {
         let requested_name = match server {
@@ -144,7 +152,7 @@ impl McpSession {
             _ => "mcp",
         };
         let name = unique_server_name(requested_name, self.clients.as_slice());
-        let client = Arc::new(McpClient::start(server, name, acp)?);
+        let client = Arc::new(McpClient::start(server, name, acp, allow_insecure_http)?);
         self.clients.push(client.clone());
         if matches!(client.transport, McpTransport::Acp(_)) {
             return Ok(());
@@ -415,7 +423,12 @@ enum McpTransport {
 impl McpClient {
     /// Spawns a stdio server or prepares an HTTP or MCP-over-ACP client,
     /// without talking to the server yet.
-    fn start(server: &McpServer, name: String, acp: Option<&AcpConnection>) -> Result<Self, Error> {
+    fn start(
+        server: &McpServer,
+        name: String,
+        acp: Option<&AcpConnection>,
+        allow_insecure_http: bool,
+    ) -> Result<Self, Error> {
         let transport = match server {
             McpServer::Stdio(config) => McpTransport::Stdio(Mutex::new(StdioTransport::spawn(
                 &config.command,
@@ -425,9 +438,11 @@ impl McpClient {
             McpServer::Http(config) => McpTransport::Http(Mutex::new(HttpTransport::new(
                 &config.url,
                 &config.headers,
+                allow_insecure_http,
             )?)),
             McpServer::Sse(config) => {
-                let mut transport = HttpTransport::new(&config.url, &config.headers)?;
+                let mut transport =
+                    HttpTransport::new(&config.url, &config.headers, allow_insecure_http)?;
                 transport.prefer_streamable_http = true;
                 McpTransport::Http(Mutex::new(transport))
             }
@@ -1086,14 +1101,24 @@ struct HttpTransport {
 }
 
 impl HttpTransport {
-    fn new(url: &str, headers: &[HttpHeader]) -> Result<Self, Error> {
+    fn new(url: &str, headers: &[HttpHeader], allow_insecure_http: bool) -> Result<Self, Error> {
         let url = reqwest::Url::parse(url)
             .map_err(|error| Error::invalid_params().data(error.to_string()))?;
         if !matches!(url.scheme(), "http" | "https") {
             return Err(Error::invalid_params().data("MCP URL must use http or https"));
         }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(Error::invalid_params()
+                .data("MCP URL must not contain credentials; configure authentication headers"));
+        }
+        if url.scheme() == "http" && !is_loopback_url(&url) && !allow_insecure_http {
+            return Err(Error::invalid_params().data(
+                "plaintext HTTP MCP URLs are only allowed on loopback; use HTTPS or set DSH_ACP_ALLOW_INSECURE_MCP_HTTP=1",
+            ));
+        }
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(180))
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("dsh-acp/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(Error::into_internal_error)?;
@@ -1253,6 +1278,21 @@ impl HttpTransport {
             serde_json::from_slice(&bytes).map_err(Error::into_internal_error)
         }
     }
+}
+
+fn is_loopback_url(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
 }
 
 /// A failed HTTP exchange with an MCP server, with its causes, which
@@ -1435,6 +1475,53 @@ mod tests {
     }
 
     #[test]
+    fn remote_mcp_http_requires_explicit_plaintext_opt_in() {
+        let remote = "http://mcp.example.test/rpc";
+        assert!(HttpTransport::new(remote, &[], false).is_err());
+        assert!(HttpTransport::new(remote, &[], true).is_ok());
+        assert!(HttpTransport::new("http://127.0.0.1:9000/rpc", &[], false).is_ok());
+        assert!(HttpTransport::new("http://[::1]:9000/rpc", &[], false).is_ok());
+        assert!(HttpTransport::new("https://mcp.example.test/rpc", &[], false).is_ok());
+        assert!(
+            HttpTransport::new("https://user:secret@mcp.example.test/rpc", &[], false).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_mcp_requests_do_not_follow_redirects() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}", target.local_addr().unwrap());
+        let redirect = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_url = format!("http://{}", redirect.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = redirect.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {target_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let headers = [HttpHeader::new("Authorization", "Bearer secret")];
+        let mut transport = HttpTransport::new(&redirect_url, &headers, false).unwrap();
+        let error = transport
+            .post(
+                json!({"jsonrpc": "2.0", "method": "notifications/test"}),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("a redirect response must not be followed");
+        assert_eq!(error.data.as_ref().unwrap()["status"], 302);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), target.accept())
+                .await
+                .is_err(),
+            "the redirect target received the authenticated request"
+        );
+        server.await.unwrap();
+    }
+
+    #[test]
     fn error_bodies_are_cut_on_a_char_boundary() {
         assert_eq!(truncate_body("short"), "short");
         let body = "é".repeat(ERROR_BODY_BYTES);
@@ -1605,6 +1692,7 @@ mod tests {
             &servers,
             None,
             Duration::from_secs(1),
+            false,
             &CancellationToken::new(),
         )
         .await
@@ -1644,6 +1732,7 @@ mod tests {
                 &[server],
                 None,
                 Duration::from_millis(300),
+                false,
                 &CancellationToken::new(),
             ),
         )
@@ -1675,6 +1764,7 @@ mod tests {
             &[shell_server("ok", script, &[])],
             None,
             Duration::from_secs(10),
+            false,
             &CancellationToken::new(),
         )
         .await
@@ -1726,6 +1816,7 @@ mod tests {
             &[shell_server("cursor", script, &[])],
             None,
             Duration::from_secs(10),
+            false,
             &CancellationToken::new(),
         )
         .await
@@ -1765,6 +1856,7 @@ mod tests {
                 &servers,
                 None,
                 Duration::from_millis(500),
+                false,
                 &CancellationToken::new(),
             ),
         )

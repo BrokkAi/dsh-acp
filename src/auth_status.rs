@@ -26,8 +26,8 @@ impl Harness {
         let (authenticated, message) = match (routing.credential(&self.config), routing.enabled) {
             (None, _) => (
                 false,
-                "No DeepSeek credentials are configured. Set DEEPSEEK_API_KEY, pass --api-key, \
-                 or configure an Authorization provider header.",
+                "No DeepSeek credentials are configured. Set DEEPSEEK_API_KEY, use \
+                 --api-key-file, or configure an Authorization provider header.",
             ),
             (Some(_), false) => (
                 false,
@@ -40,7 +40,7 @@ impl Harness {
             ),
             (Some(Credential::ApiKey), true) => (
                 true,
-                "Using the DeepSeek API key from DEEPSEEK_API_KEY or --api-key.",
+                "Using the DeepSeek API key from DEEPSEEK_API_KEY or --api-key-file.",
             ),
         };
         json!({"authenticated": authenticated, "message": message})

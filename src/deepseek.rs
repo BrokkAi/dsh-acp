@@ -98,7 +98,7 @@ impl DeepSeekClient {
         let api_key = config.api_key().ok().map(str::to_owned);
         if api_key.is_none() && !header_map.contains_key(reqwest::header::AUTHORIZATION) {
             return Err(Error::auth_required().data(
-                "Set DEEPSEEK_API_KEY, pass --api-key, or configure an Authorization provider header",
+                "Set DEEPSEEK_API_KEY, use --api-key-file, or configure an Authorization provider header",
             ));
         }
         let http = reqwest::Client::builder()
@@ -240,7 +240,7 @@ impl DeepSeekClient {
                     || status == reqwest::StatusCode::FORBIDDEN
                 {
                     let message = format!(
-                        "{message}. Check DEEPSEEK_API_KEY (or --api-key, or the provider's Authorization header)."
+                        "{message}. Check DEEPSEEK_API_KEY (or --api-key-file, or the provider's Authorization header)."
                     );
                     AttemptFailure::permanent(
                         Error::auth_required()
@@ -809,6 +809,7 @@ mod tests {
             tool_output_bytes: 1000,
             http_timeout: std::time::Duration::from_secs(1),
             mcp_connect_timeout: std::time::Duration::from_secs(1),
+            allow_insecure_mcp_http: false,
             disable_web: true,
             trace: false,
         }
@@ -924,7 +925,7 @@ mod tests {
             assert_eq!(
                 error.data,
                 Some(json!(
-                    "Set DEEPSEEK_API_KEY, pass --api-key, or configure an Authorization provider header"
+                    "Set DEEPSEEK_API_KEY, use --api-key-file, or configure an Authorization provider header"
                 ))
             );
 
