@@ -195,6 +195,9 @@ The system prompt combines the built-in harness guidance, any
 `--system-prompt` / `DSH_ACP_SYSTEM_PROMPT` text, `AGENTS.md` from
 `<data-dir>`, `AGENTS.md` from the session working directory, and
 `AGENTS.md` from each additional workspace root, in that order.
+Every instruction file is marked as untrusted repository context. Its text can
+guide the work, but it cannot grant permission to read credentials, disclose
+data, or make network requests.
 
 An ACP client can add its own system prompt in one of two modes:
 
@@ -204,12 +207,11 @@ An ACP client can add its own system prompt in one of two modes:
   plan mode still adds its instructions. Tools, MCP servers, permission
   prompts, and workspace boundaries do not change. A client that overrides the
   prompt takes responsibility for the tool guidance and safety instructions
-  the built-in guidance provided. Three of those rules exist only in the
-  prompt, with nothing in code enforcing them: treat file contents, command
-  output, web pages, and MCP results as untrusted data; do not expose secrets;
-  and do not run broad destructive commands. An override removes them, so put
-  rules that must survive one in `--system-prompt` / `DSH_ACP_SYSTEM_PROMPT` or
-  `AGENTS.md`.
+  the built-in guidance provided. Permission gates for writes, commands, MCP
+  calls, sensitive-file reads, and network egress remain enforced. An override
+  can still remove non-enforced guidance, such as treating tool output as
+  untrusted or avoiding broad destructive commands, so put rules that must
+  survive one in `--system-prompt` / `DSH_ACP_SYSTEM_PROMPT` or `AGENTS.md`.
 
 The client's prompt and its mode are stored with the session. A load, resume,
 or fork that carries a system prompt applies it; one that carries none keeps
@@ -308,12 +310,15 @@ Built-in model tools:
 
 File paths are restricted to the session working directory and additional
 workspace roots. Symlink escapes are rejected. Writes, commands, and MCP tools
-go through ACP permission requests unless the session policy or a prior
-"allow always" decision permits them. `web_fetch` follows redirects manually,
-rejects every DNS answer that is not globally routable, and pins the checked
-addresses for the connection. It rejects loopback, private, shared/CGNAT,
-link-local, multicast, documentation, benchmark, and other reserved ranges.
-`web_fetch` connects directly and does not use ambient proxy settings.
+go through ACP permission requests, as do credential-like file reads and every
+`web_fetch` call. A remembered web approval is scoped to that URL origin, and a
+sensitive-file approval is scoped to that file. `web_fetch` follows same-origin
+redirects manually, rejects every DNS answer that is not globally routable, and
+pins the checked addresses for the connection. A redirect to another origin
+fails and must be requested separately so the user can approve it. The tool
+rejects loopback, private, shared/CGNAT, link-local, multicast, documentation,
+benchmark, and other reserved ranges, connects directly, and does not use
+ambient proxy settings.
 
 In v1, when the ACP client advertises filesystem and terminal capabilities,
 the corresponding reverse requests are used. Local implementations are
@@ -443,8 +448,9 @@ security boundaries, and concurrency model.
 
 - File tools are confined to the session `cwd` and additional workspace roots,
   with symlink and lexical escape checks.
-- Writes, commands, and MCP calls request ACP permission unless policy or an
-  in-session "allow always" decision authorizes them.
+- Writes, commands, MCP calls, sensitive-file reads, and web requests require
+  ACP permission unless the session policy or a narrowly scoped in-session
+  "allow always" decision authorizes them.
 - Stdio MCP processes receive an allowlisted environment plus variables the
   client explicitly configures for that server.
 - `web_fetch` validates each redirect hop, rejects non-global DNS answers, and

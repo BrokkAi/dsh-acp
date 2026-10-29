@@ -151,6 +151,9 @@ check the nearest existing ancestor before creating files. `web_fetch` follows
 redirects itself, rejects every address in a DNS answer unless it is globally
 routable, and pins the validated addresses as the request resolver. It bypasses
 ambient proxy configuration so the checked address is the connected address.
+Web requests and sensitive-file reads require independent ACP permission
+decisions; web approvals are origin-scoped, and cross-origin redirects require
+a new request.
 Provider and MCP headers are supplied by configuration and are not persisted as
 session data. Instruction files are canonicalized against their source root,
 limited to regular files, and capped at 1 MiB.

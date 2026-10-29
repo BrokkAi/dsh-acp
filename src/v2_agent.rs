@@ -1922,8 +1922,9 @@ impl V2Harness {
             send_tool_result(connection, session_id, call, &result, false)?;
             return Ok(result);
         }
-        let needs_permission = crate::tools::permission_required(&call.function.name)
-            || call.function.name.starts_with("mcp__");
+        let needs_permission =
+            crate::tools::permission_required(&record, &call.function.name, &arguments)
+                || call.function.name.starts_with("mcp__");
         let approval_key =
             crate::tools::session_approval_key(&record, &call.function.name, &arguments);
         let approved = runtime.state.lock().await.session_approvals.clone();
