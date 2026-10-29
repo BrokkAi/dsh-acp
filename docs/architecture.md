@@ -147,11 +147,13 @@ lossy text reconstruction.
 ## Security boundaries
 
 Workspace roots are canonicalized and checked before tool access. Writable paths
-check the nearest existing ancestor before creating files. Web access rejects
-private and local destinations, including via redirects. Provider and MCP
-headers are supplied by configuration and are not persisted as session data.
-Instruction files are canonicalized against their source root, limited to
-regular files, and capped at 1 MiB.
+check the nearest existing ancestor before creating files. `web_fetch` follows
+redirects itself, rejects every address in a DNS answer unless it is globally
+routable, and pins the validated addresses as the request resolver. It bypasses
+ambient proxy configuration so the checked address is the connected address.
+Provider and MCP headers are supplied by configuration and are not persisted as
+session data. Instruction files are canonicalized against their source root,
+limited to regular files, and capped at 1 MiB.
 
 `--listen` binds loopback unless `--listen-allow-remote` is given. Every request
 needs the bearer token, compared in constant time. The token comes from
