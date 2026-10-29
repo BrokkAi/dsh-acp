@@ -1,7 +1,7 @@
 //! `session/set_title`, from the draft
 //! [Client-Set Session Titles RFD](https://agentclientprotocol.com/rfds/session-set-title).
 //!
-//! agent-client-protocol 3.4 has no types for this method, so its request and
+//! agent-client-protocol 3.5 has no types for this method, so its request and
 //! result are hand-rolled here until the SDK has them. Both protocol versions
 //! store the title the same way; each sends its own `session_info_update`.
 //! Each version's `initialize` adds the `setTitle` session capability with

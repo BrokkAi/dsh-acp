@@ -20,4 +20,6 @@ suggested mitigation. Remove credentials and unrelated personal data from logs.
 
 Security-sensitive areas include workspace path confinement, command execution,
 MCP server launch configuration, provider headers, permission policy, terminal
-output handling, and persisted session files.
+output handling, persisted session files, and the `--listen` HTTP and WebSocket
+server: its bearer token, `Host` and `Origin` checks, loopback-only default,
+and one-connection-at-a-time rule.

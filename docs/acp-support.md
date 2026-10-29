@@ -15,8 +15,10 @@ The server is a dual-stack ACP endpoint:
   below it.
 - An unsupported version is rejected with `-32022`, whose data lists the
   requested and supported versions. A missing or malformed version is rejected
-  with `-32602`. The server writes the error and then exits, because a failed
-  `initialize` does not initialize the connection.
+  with `-32602`. Over stdio, the server writes the error and then exits,
+  because a failed `initialize` does not initialize the connection. Over HTTP
+  or WebSocket, only that connection ends; over HTTP the error is the body of
+  the `initialize` response, which carries no `Acp-Connection-Id`.
 
 The version is selected once during `initialize`; subsequent traffic uses that
 version's lifecycle and payload shapes.
@@ -62,16 +64,46 @@ version's lifecycle and payload shapes.
 | Notices | Implemented for MCP refresh failures | v2 baseline; negotiated in v1 |
 | Subagents | Not implemented | Draft |
 | MCP-over-ACP | Implemented (draft RFD) | Advertised transport |
-| ACP Streamable HTTP transport | Not implemented | Draft |
+| ACP streamable HTTP and WebSocket transport | Implemented, opt-in | Chosen at launch with `--listen`; RFD not stable |
 
 Audio is intentionally not advertised because the DeepSeek input API used by
 this harness does not accept audio content.
+
+## Transports
+
+stdio is the default. `--listen <ADDR>` serves ACP at `/acp` over streamable
+HTTP (POST, GET event streams, DELETE) and WebSocket instead, per the
+[Streamable HTTP & WebSocket Transport RFD](https://agentclientprotocol.com/rfds/streamable-http-websocket-transport).
+The RFD is in the Active stage of the RFD process, which signals current work,
+not stability; the wire format may still change. The transport is the SDK's
+`agent-client-protocol-http` 3.5 server, unchanged, so where that server
+differs from the RFD, dsh-acp does too. For example, it accepts JSON-RPC
+batches instead of answering `501`, and opens an event stream for any
+`Acp-Session-Id` instead of answering `404` for one the connection does not
+know. Streamable HTTP is served over HTTP/1.1 and over cleartext HTTP/2 with
+prior knowledge; WebSocket upgrades use HTTP/1.1. There is no TLS and no
+`Acp-Protocol-Version` handling.
+
+dsh-acp adds checks in front of the SDK. They are not part of the RFD, which
+leaves authentication to the host:
+
+- Every request needs `Authorization: Bearer <token>` (`401` otherwise).
+- `Host` must be a loopback name, the bound address, or, with
+  `--listen-allow-remote`, the configured host name (`403` otherwise).
+- Requests with an `Origin` header are refused (`403`).
+- One ACP connection is served at a time (`409` for another).
+
+Both protocol versions work over both transports, and a connection behaves as
+a stdio connection does: it starts with nothing in memory and can load or
+resume sessions that earlier connections saved. See the
+[README](../README.md#http-and-websocket) for usage and the security
+trade-offs of `--listen-allow-remote`.
 
 ## Session status
 
 `session/status` follows the
 [Session Status RFD](https://agentclientprotocol.com/rfds/session-status),
-which is still a Draft. `agent-client-protocol` 3.4 has no types for it, so
+which is still a Draft. `agent-client-protocol` 3.5 has no types for it, so
 the request, response, and capability marker are written by hand and may change
 with the RFD. Both versions advertise it with an empty marker:
 `agentCapabilities.sessionCapabilities.status` in v1 and
@@ -107,7 +139,7 @@ reported as `inactive` and fails when resumed.
 
 `session/set_title` follows the
 [Client-Set Session Titles RFD](https://agentclientprotocol.com/rfds/session-set-title),
-which is still a Draft. `agent-client-protocol` 3.4 has no types for it, so
+which is still a Draft. `agent-client-protocol` 3.5 has no types for it, so
 the request, response, and capability marker are written by hand and may change
 with the RFD. Both versions advertise it with an empty marker:
 `agentCapabilities.sessionCapabilities.setTitle` in v1 and
@@ -154,7 +186,7 @@ process holds, but `dsh-acp` cannot tell that one does.
 
 `auth/status` follows the
 [Agent Authentication State Query RFD](https://agentclientprotocol.com/rfds/get-auth-state),
-which is still a Draft. `agent-client-protocol` 3.4 has no types for it, so
+which is still a Draft. `agent-client-protocol` 3.5 has no types for it, so
 the response and capability marker are written by hand and may change with the
 RFD. Both versions advertise it with a `status` field in the agent's auth
 capabilities. v1 sends `agentCapabilities.auth.status: true`, the boolean in

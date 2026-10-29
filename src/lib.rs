@@ -2,6 +2,7 @@ pub mod agent;
 pub mod auth_status;
 pub mod config;
 pub mod deepseek;
+pub mod listen;
 pub mod mcp;
 pub mod model;
 pub mod session;

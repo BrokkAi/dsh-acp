@@ -33,9 +33,10 @@ pub struct SessionStore {
     sessions: Arc<Mutex<HashMap<String, SessionRuntime>>>,
     deleted: Arc<Mutex<std::collections::HashSet<String>>>,
     /// URL elicitations outstanding on this connection, by `elicitationId`.
-    /// The process serves one stdio connection, so this is that connection's
-    /// state. It is never persisted: a completion may only be reported to the
-    /// Client that received the original request.
+    /// Each stdio process or accepted `--listen` connection has its own store,
+    /// so these IDs never cross connections. They are never persisted: a
+    /// completion may only be reported to the Client that received the
+    /// original request.
     url_elicitations: Arc<Mutex<HashMap<String, UrlElicitation>>>,
     write_lock: Arc<Mutex<()>>,
     configured_prompt: Option<Arc<str>>,
@@ -77,6 +78,26 @@ impl SessionStore {
             default_permission: config.permission_mode,
             default_reasoning_effort: config.reasoning_effort,
         })
+    }
+
+    /// A store over the same session files with nothing in memory, the way a
+    /// new process opens it. Each ACP connection served over `--listen` gets
+    /// one, so sessions, turns, MCP servers, and "allow always" approvals in
+    /// memory always belong to the connection that loaded them, as they do
+    /// for a stdio process.
+    pub fn fresh(&self) -> Self {
+        Self {
+            directory: self.directory.clone(),
+            data_dir: self.data_dir.clone(),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            deleted: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            url_elicitations: Arc::new(Mutex::new(HashMap::new())),
+            write_lock: Arc::new(Mutex::new(())),
+            configured_prompt: self.configured_prompt.clone(),
+            default_model: self.default_model.clone(),
+            default_permission: self.default_permission,
+            default_reasoning_effort: self.default_reasoning_effort,
+        }
     }
 
     pub async fn create(
@@ -810,6 +831,21 @@ mod tests {
         );
         assert!(
             store
+                .reserve_url_elicitation(b, "oauth-deleted")
+                .await
+                .is_ok()
+        );
+
+        // Every accepted `--listen` connection gets a fresh store. Its
+        // in-memory session and URL-elicitation registries start empty even
+        // though the previous connection left reservations outstanding.
+        let fresh = store.fresh();
+        assert!(fresh.sessions.lock().await.is_empty());
+        assert!(fresh.url_elicitations.lock().await.is_empty());
+        fresh.get(b).await.unwrap();
+        assert!(fresh.reserve_url_elicitation(b, "oauth").await.is_ok());
+        assert!(
+            fresh
                 .reserve_url_elicitation(b, "oauth-deleted")
                 .await
                 .is_ok()

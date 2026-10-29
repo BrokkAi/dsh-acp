@@ -1,7 +1,7 @@
 //! `auth/status`, from the draft
 //! [Agent Authentication State Query RFD](https://agentclientprotocol.com/rfds/get-auth-state).
 //!
-//! agent-client-protocol 3.4 has no types for this method, so its response is
+//! agent-client-protocol 3.5 has no types for this method, so its response is
 //! hand-rolled here until the SDK has them. Both protocol versions report the
 //! same state. Each version's `initialize` adds the `auth.status` capability
 //! with `agent::with_extra_capabilities`.

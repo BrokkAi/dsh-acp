@@ -1,7 +1,7 @@
 //! `session/status`, from the draft
 //! [Session Status RFD](https://agentclientprotocol.com/rfds/session-status).
 //!
-//! agent-client-protocol 3.4 has no types for this method, so its request and
+//! agent-client-protocol 3.5 has no types for this method, so its request and
 //! error are hand-rolled here until the SDK has them. Each protocol version
 //! builds its own response, because only v2 reports foreground state. Each
 //! version's `initialize` adds the `status` session capability with
