@@ -1277,28 +1277,26 @@ async fn web_fetch(
         return Err(agent_client_protocol::Error::invalid_params()
             .data("only http and https URLs are supported"));
     }
-    validate_public_fetch_url(&parsed, cancellation).await?;
     let max_bytes = arguments
         .get("max_bytes")
         .and_then(Value::as_u64)
         .unwrap_or(262_144)
         .clamp(1024, 1_048_576) as usize;
-    let response = tokio::select! {
-        _ = cancellation.cancelled() => return Err(agent_client_protocol::Error::request_cancelled()),
-        response = reqwest::Client::builder()
-            .timeout(access.config.http_timeout)
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.previous().len() >= 10 || is_private_host(attempt.url()) {
-                    attempt.stop()
-                } else {
-                    attempt.follow()
-                }
-            }))
-            .user_agent(concat!("dsh-acp/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(agent_client_protocol::Error::into_internal_error)?
-            .get(parsed.clone())
-            .send() => response.map_err(agent_client_protocol::Error::into_internal_error)?,
+    let mut fetch_url = parsed.clone();
+    let mut redirects = 0;
+    let response = loop {
+        let target = resolve_public_fetch_target(&fetch_url, cancellation).await?;
+        let response = send_public_fetch_request(access, &target, cancellation).await?;
+        let Some(next_url) = web_redirect_target(&fetch_url, &response)? else {
+            break response;
+        };
+        if redirects >= MAX_WEB_REDIRECTS {
+            return Err(agent_client_protocol::Error::invalid_params().data(format!(
+                "web_fetch followed more than {MAX_WEB_REDIRECTS} redirects"
+            )));
+        }
+        redirects += 1;
+        fetch_url = next_url;
     };
     let status = response.status();
     let content_type = response
@@ -1344,7 +1342,9 @@ async fn web_fetch(
     Ok(ToolResult {
         text: text.clone(),
         raw: json!({
-            "url": parsed.as_str(),
+            "url": fetch_url.as_str(),
+            "requested_url": parsed.as_str(),
+            "redirects": redirects,
             "status": status.as_u16(),
             "content_type": content_type,
             "location": redirect_location,
@@ -1353,33 +1353,128 @@ async fn web_fetch(
     })
 }
 
-async fn validate_public_fetch_url(
+/// The most redirects followed before `web_fetch` returns an error.
+const MAX_WEB_REDIRECTS: usize = 10;
+
+#[derive(Debug)]
+struct PublicFetchTarget {
+    url: reqwest::Url,
+    /// The validated DNS answer pinned for this request. IP-literal URLs need
+    /// no resolver override.
+    resolution: Option<(String, Vec<std::net::SocketAddr>)>,
+}
+
+async fn resolve_public_fetch_target(
     url: &reqwest::Url,
     cancellation: &CancellationToken,
-) -> Result<(), agent_client_protocol::Error> {
+) -> Result<PublicFetchTarget, agent_client_protocol::Error> {
     if is_private_host(url) {
         return Err(agent_client_protocol::Error::invalid_params()
-            .data("web_fetch does not allow localhost or private network addresses"));
+            .data("web_fetch does not allow localhost or non-public network addresses"));
     }
     let Some(host) = url.host_str() else {
         return Err(agent_client_protocol::Error::invalid_params().data("URL has no host"));
     };
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return Ok(());
+    if parse_url_ip(host).is_some() {
+        return Ok(PublicFetchTarget {
+            url: url.clone(),
+            resolution: None,
+        });
     }
     let port = url.port_or_known_default().unwrap_or(80);
     let addresses = tokio::select! {
         _ = cancellation.cancelled() => return Err(agent_client_protocol::Error::request_cancelled()),
         result = tokio::net::lookup_host((host, port)) => result.map_err(agent_client_protocol::Error::into_internal_error)?,
     };
-    if addresses
-        .into_iter()
-        .any(|address| is_private_ip(address.ip()))
-    {
+    public_fetch_target_from_addresses(url, host, addresses.collect())
+}
+
+/// Builds a fetch target only when every address in one DNS answer is public.
+/// Pinning all of those addresses prevents a later lookup from changing the
+/// destination between validation and connection.
+fn public_fetch_target_from_addresses(
+    url: &reqwest::Url,
+    host: &str,
+    addresses: Vec<std::net::SocketAddr>,
+) -> Result<PublicFetchTarget, agent_client_protocol::Error> {
+    if addresses.is_empty() {
         return Err(agent_client_protocol::Error::invalid_params()
-            .data("web_fetch host resolves to a private network address"));
+            .data("web_fetch host has no network addresses"));
     }
-    Ok(())
+    if addresses.iter().any(|address| !is_public_ip(address.ip())) {
+        return Err(agent_client_protocol::Error::invalid_params()
+            .data("web_fetch host resolves to a non-public network address"));
+    }
+    Ok(PublicFetchTarget {
+        url: url.clone(),
+        resolution: Some((host.to_string(), addresses)),
+    })
+}
+
+async fn send_public_fetch_request(
+    access: &ToolAccess,
+    target: &PublicFetchTarget,
+    cancellation: &CancellationToken,
+) -> Result<reqwest::Response, agent_client_protocol::Error> {
+    let mut client = reqwest::Client::builder()
+        .timeout(access.config.http_timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        // A proxy would make the connection address differ from the one that
+        // passed policy. `web_fetch` therefore always connects directly.
+        .no_proxy()
+        .user_agent(concat!("dsh-acp/", env!("CARGO_PKG_VERSION")));
+    if let Some((host, addresses)) = &target.resolution {
+        client = client.resolve_to_addrs(host, addresses);
+    }
+    let client = client
+        .build()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    tokio::select! {
+        _ = cancellation.cancelled() => Err(agent_client_protocol::Error::request_cancelled()),
+        response = client.get(target.url.clone()).send() => {
+            response.map_err(agent_client_protocol::Error::into_internal_error)
+        }
+    }
+}
+
+fn web_redirect_target(
+    current: &reqwest::Url,
+    response: &reqwest::Response,
+) -> Result<Option<reqwest::Url>, agent_client_protocol::Error> {
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .map(|location| {
+            location.to_str().map_err(|error| {
+                agent_client_protocol::Error::invalid_params().data(format!(
+                    "web_fetch redirect location is not valid text: {error}"
+                ))
+            })
+        })
+        .transpose()?;
+    resolve_web_redirect(current, response.status().as_u16(), location)
+}
+
+fn resolve_web_redirect(
+    current: &reqwest::Url,
+    status: u16,
+    location: Option<&str>,
+) -> Result<Option<reqwest::Url>, agent_client_protocol::Error> {
+    if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+        return Ok(None);
+    }
+    let Some(location) = location else {
+        return Ok(None);
+    };
+    let target = current.join(location).map_err(|error| {
+        agent_client_protocol::Error::invalid_params()
+            .data(format!("web_fetch redirect target is invalid: {error}"))
+    })?;
+    if !matches!(target.scheme(), "http" | "https") {
+        return Err(agent_client_protocol::Error::invalid_params()
+            .data("web_fetch only follows redirects to HTTP or HTTPS URLs"));
+    }
+    Ok(Some(target))
 }
 
 fn is_private_host(url: &reqwest::Url) -> bool {
@@ -1390,26 +1485,70 @@ fn is_private_host(url: &reqwest::Url) -> bool {
     if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") {
         return true;
     }
-    host.parse::<std::net::IpAddr>().is_ok_and(is_private_ip)
+    parse_url_ip(&host).is_some_and(|address| !is_public_ip(address))
 }
 
-fn is_private_ip(address: std::net::IpAddr) -> bool {
+fn parse_url_ip(host: &str) -> Option<std::net::IpAddr> {
+    host.strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse()
+        .ok()
+}
+
+/// Whether an address is globally routable unicast. This deliberately rejects
+/// documentation and benchmark networks too: they have no place in a tool
+/// that must not reach environment-specific internal services.
+fn is_public_ip(address: std::net::IpAddr) -> bool {
     match address {
-        std::net::IpAddr::V4(address) => {
-            address.is_private()
-                || address.is_loopback()
-                || address.is_link_local()
-                || address.is_unspecified()
-                || address.is_multicast()
-        }
+        std::net::IpAddr::V4(address) => is_public_ipv4(address),
         std::net::IpAddr::V6(address) => {
-            address.is_loopback()
-                || address.is_unspecified()
-                || address.is_multicast()
-                || (address.segments()[0] & 0xfe00) == 0xfc00
-                || (address.segments()[0] & 0xffc0) == 0xfe80
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                return is_public_ipv4(mapped);
+            }
+            let segments = address.segments();
+            // NAT64 embeds the IPv4 destination in its low 32 bits.
+            if segments[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
+                let embedded = std::net::Ipv4Addr::new(
+                    (segments[6] >> 8) as u8,
+                    segments[6] as u8,
+                    (segments[7] >> 8) as u8,
+                    segments[7] as u8,
+                );
+                return is_public_ipv4(embedded);
+            }
+            // Only the current global-unicast allocation is accepted. This
+            // excludes unspecified, loopback, mapped/compatible, discard,
+            // unique-local, link-local, multicast, and local NAT64 ranges.
+            if segments[0] & 0xe000 != 0x2000 {
+                return false;
+            }
+            // IETF protocol assignments and documentation, plus deprecated
+            // 6to4 and the newer documentation prefix.
+            !(segments[0] == 0x2001 && segments[1] <= 0x01ff)
+                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+                && segments[0] != 0x2002
+                && !(segments[0] == 0x3fff && segments[1] <= 0x0fff)
         }
     }
+}
+
+fn is_public_ipv4(address: std::net::Ipv4Addr) -> bool {
+    let [a, b, c, _] = address.octets();
+    !(a == 0
+        || a == 10
+        || a == 127
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 192 && b == 88 && c == 99)
+        || (a == 192 && b == 168)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 224)
 }
 
 fn resolve_existing_path(
@@ -1674,16 +1813,116 @@ mod tests {
     }
 
     #[test]
-    fn web_fetch_rejects_private_addresses() {
+    fn web_fetch_rejects_non_public_address_literals() {
+        let address_url = |address: &str| {
+            let ip: std::net::IpAddr = address.parse().unwrap();
+            let host = match ip {
+                std::net::IpAddr::V4(ip) => ip.to_string(),
+                std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+            };
+            reqwest::Url::parse(&format!("http://{host}/")).unwrap()
+        };
+        for address in [
+            "0.0.0.1",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "192.0.0.1",
+            "192.0.2.1",
+            "192.168.0.1",
+            "198.18.0.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "::ffff:127.0.0.1",
+            "64:ff9b::7f00:1",
+            "100::1",
+            "2001:db8::1",
+            "2002:7f00:1::",
+            "3fff::1",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
+        ] {
+            assert!(
+                is_private_host(&address_url(address)),
+                "{address} should be blocked"
+            );
+        }
+        for address in ["8.8.8.8", "1.1.1.1", "2001:4860:4860::8888"] {
+            assert!(
+                !is_private_host(&address_url(address)),
+                "{address} should be public"
+            );
+        }
         assert!(is_private_host(
-            &reqwest::Url::parse("http://127.0.0.1:8080").unwrap()
+            &reqwest::Url::parse("http://target.localhost/private").unwrap()
         ));
         assert!(is_private_host(
-            &reqwest::Url::parse("http://localhost/private").unwrap()
+            &reqwest::Url::parse("http://printer.local/private").unwrap()
         ));
         assert!(!is_private_host(
             &reqwest::Url::parse("https://example.com/docs").unwrap()
         ));
+    }
+
+    #[test]
+    fn web_fetch_validates_and_pins_redirect_dns_answers() {
+        let initial = reqwest::Url::parse("https://example.com/start").unwrap();
+        let redirected = resolve_web_redirect(
+            &initial,
+            302,
+            Some("https://target.test/private?token=secret"),
+        )
+        .unwrap()
+        .expect("the redirect should resolve");
+        let public_address = "8.8.8.8:443".parse().unwrap();
+        let pinned =
+            public_fetch_target_from_addresses(&redirected, "target.test", vec![public_address])
+                .unwrap();
+        assert_eq!(
+            pinned.resolution,
+            Some(("target.test".to_string(), vec![public_address]))
+        );
+
+        let changed_answer = public_fetch_target_from_addresses(
+            &redirected,
+            "target.test",
+            vec!["127.0.0.1:443".parse().unwrap()],
+        )
+        .expect_err("a later private DNS answer must be blocked");
+        assert!(
+            changed_answer
+                .data
+                .as_ref()
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("non-public"))
+        );
+    }
+
+    #[test]
+    fn web_fetch_rejects_unsafe_redirect_schemes_and_statuses() {
+        let current = reqwest::Url::parse("https://example.com/start").unwrap();
+        let error = resolve_web_redirect(&current, 302, Some("file:///etc/passwd"))
+            .expect_err("a file redirect must be refused");
+        assert!(
+            error
+                .data
+                .as_ref()
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("HTTP or HTTPS"))
+        );
+        assert_eq!(
+            resolve_web_redirect(&current, 200, Some("https://example.org/next")).unwrap(),
+            None
+        );
+        assert_eq!(resolve_web_redirect(&current, 302, None).unwrap(), None);
     }
 
     #[test]

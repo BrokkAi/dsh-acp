@@ -309,8 +309,11 @@ Built-in model tools:
 File paths are restricted to the session working directory and additional
 workspace roots. Symlink escapes are rejected. Writes, commands, and MCP tools
 go through ACP permission requests unless the session policy or a prior
-"allow always" decision permits them. `web_fetch` rejects localhost, private,
-link-local, and multicast destinations for both direct requests and redirects.
+"allow always" decision permits them. `web_fetch` follows redirects manually,
+rejects every DNS answer that is not globally routable, and pins the checked
+addresses for the connection. It rejects loopback, private, shared/CGNAT,
+link-local, multicast, documentation, benchmark, and other reserved ranges.
+`web_fetch` connects directly and does not use ambient proxy settings.
 
 In v1, when the ACP client advertises filesystem and terminal capabilities,
 the corresponding reverse requests are used. Local implementations are
@@ -444,8 +447,8 @@ security boundaries, and concurrency model.
   in-session "allow always" decision authorizes them.
 - Stdio MCP processes receive an allowlisted environment plus variables the
   client explicitly configures for that server.
-- `web_fetch` rejects loopback, private, link-local, multicast, and unsafe
-  redirect targets.
+- `web_fetch` validates each redirect hop, rejects non-global DNS answers, and
+  connects only to the public addresses that passed policy.
 - Credentials are read from launch configuration or provider requests and are
   not written to session transcripts.
 - `--listen` is opt-in, loopback-only unless `--listen-allow-remote` is given,
