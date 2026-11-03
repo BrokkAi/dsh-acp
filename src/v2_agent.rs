@@ -7,9 +7,10 @@ use std::{
 };
 
 use agent_client_protocol::{
-    Agent, Client, ConnectTo, Error, JsonRpcMessage, UntypedMessage, V2ConnectionTo,
-    schema::v2::{
-        self, AgentCapabilities, AgentMessage, AgentThought, AuthMethod, AuthMethodAgent,
+    Agent, Client, ConnectTo, Error, JsonRpcMessage, UntypedMessage,
+    v2::ConnectionTo as V2ConnectionTo,
+    v2::schema::{
+        self as v2, AgentCapabilities, AgentMessage, AgentThought, AuthMethod, AuthMethodAgent,
         AvailableCommand, CompactionStatus, CompactionUpdate, ContentBlock, ContentChunk, Diff,
         DiffChange, DiffFileType, DisableProviderRequest, DisableProviderResponse, IdleStateUpdate,
         Implementation, InitializeRequest, InitializeResponse, ListProvidersRequest,
@@ -72,7 +73,7 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
             {
                 let harness = harness.clone();
                 async move |request: LoginAuthRequest,
-                            responder: agent_client_protocol::Responder<LoginAuthResponse>,
+                            responder: agent_client_protocol::v2::Responder<LoginAuthResponse>,
                             _connection: V2ConnectionTo<Client>| {
                     harness.clone().login(request, responder).await
                 }
@@ -83,7 +84,7 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
             {
                 let harness = harness.clone();
                 async move |request: LogoutAuthRequest,
-                            responder: agent_client_protocol::Responder<LogoutAuthResponse>,
+                            responder: agent_client_protocol::v2::Responder<LogoutAuthResponse>,
                             _connection: V2ConnectionTo<Client>| {
                     harness.clone().logout(request, responder).await
                 }
@@ -94,7 +95,9 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
             {
                 let harness = harness.clone();
                 async move |request: ListProvidersRequest,
-                            responder: agent_client_protocol::Responder<ListProvidersResponse>,
+                            responder: agent_client_protocol::v2::Responder<
+                    ListProvidersResponse,
+                >,
                             _connection: V2ConnectionTo<Client>| {
                     harness.clone().list_providers(request, responder).await
                 }
@@ -105,7 +108,7 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
             {
                 let harness = harness.clone();
                 async move |request: SetProviderRequest,
-                            responder: agent_client_protocol::Responder<SetProviderResponse>,
+                            responder: agent_client_protocol::v2::Responder<SetProviderResponse>,
                             _connection: V2ConnectionTo<Client>| {
                     harness.clone().set_provider(request, responder).await
                 }
@@ -116,7 +119,9 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
             {
                 let harness = harness.clone();
                 async move |request: DisableProviderRequest,
-                            responder: agent_client_protocol::Responder<DisableProviderResponse>,
+                            responder: agent_client_protocol::v2::Responder<
+                    DisableProviderResponse,
+                >,
                             _connection: V2ConnectionTo<Client>| {
                     harness.clone().disable_provider(request, responder).await
                 }
@@ -127,7 +132,9 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
             {
                 let harness = harness.clone();
                 async move |request: v2::NewSessionRequest,
-                            responder: agent_client_protocol::Responder<v2::NewSessionResponse>,
+                            responder: agent_client_protocol::v2::Responder<
+                    v2::NewSessionResponse,
+                >,
                             connection: V2ConnectionTo<Client>| {
                     harness
                         .clone()
@@ -141,7 +148,7 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
             {
                 let harness = harness.clone();
                 async move |request: v2::ListSessionsRequest,
-                            responder: agent_client_protocol::Responder<
+                            responder: agent_client_protocol::v2::Responder<
                     v2::ListSessionsResponse,
                 >,
                             _connection: V2ConnectionTo<Client>| {
@@ -154,7 +161,7 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
             {
                 let harness = harness.clone();
                 async move |request: v2::ResumeSessionRequest,
-                            responder: agent_client_protocol::Responder<
+                            responder: agent_client_protocol::v2::Responder<
                     v2::ResumeSessionResponse,
                 >,
                             connection: V2ConnectionTo<Client>| {
@@ -170,7 +177,9 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
             {
                 let harness = harness.clone();
                 async move |request: v2::ForkSessionRequest,
-                            responder: agent_client_protocol::Responder<v2::ForkSessionResponse>,
+                            responder: agent_client_protocol::v2::Responder<
+                    v2::ForkSessionResponse,
+                >,
                             connection: V2ConnectionTo<Client>| {
                     harness
                         .clone()
@@ -184,7 +193,7 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
             {
                 let harness = harness.clone();
                 async move |request: v2::DeleteSessionRequest,
-                            responder: agent_client_protocol::Responder<
+                            responder: agent_client_protocol::v2::Responder<
                     v2::DeleteSessionResponse,
                 >,
                             _connection: V2ConnectionTo<Client>| {
@@ -197,7 +206,7 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
             {
                 let harness = harness.clone();
                 async move |request: v2::CloseSessionRequest,
-                            responder: agent_client_protocol::Responder<
+                            responder: agent_client_protocol::v2::Responder<
                     v2::CloseSessionResponse,
                 >,
                             _connection: V2ConnectionTo<Client>| {
@@ -210,7 +219,7 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
             {
                 let harness = harness.clone();
                 async move |request: v2::SetSessionConfigOptionRequest,
-                            responder: agent_client_protocol::Responder<
+                            responder: agent_client_protocol::v2::Responder<
                     v2::SetSessionConfigOptionResponse,
                 >,
                             connection: V2ConnectionTo<Client>| {
@@ -226,7 +235,7 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
             {
                 let harness = harness.clone();
                 async move |request: PromptRequest,
-                            responder: agent_client_protocol::Responder<PromptResponse>,
+                            responder: agent_client_protocol::v2::Responder<PromptResponse>,
                             connection: V2ConnectionTo<Client>| {
                     harness.clone().prompt(request, responder, connection).await
                 }
@@ -237,7 +246,7 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
             {
                 let harness = harness.clone();
                 async move |request: UntypedMessage,
-                            responder: agent_client_protocol::Responder<Value>,
+                            responder: agent_client_protocol::v2::Responder<Value>,
                             connection: V2ConnectionTo<Client>| {
                     match request.method.as_str() {
                         // Answered as JSON: the SDK capability types cannot advertise
@@ -293,7 +302,7 @@ impl V2Harness {
     async fn initialize(
         self,
         request: InitializeRequest,
-        responder: agent_client_protocol::Responder<Value>,
+        responder: agent_client_protocol::v2::Responder<Value>,
     ) -> agent_client_protocol::Result<()> {
         *self.capabilities.write().await = request.capabilities.clone();
         self.initialized.store(true, Ordering::Release);
@@ -360,7 +369,7 @@ impl V2Harness {
     async fn login(
         self,
         request: LoginAuthRequest,
-        responder: agent_client_protocol::Responder<LoginAuthResponse>,
+        responder: agent_client_protocol::v2::Responder<LoginAuthResponse>,
     ) -> agent_client_protocol::Result<()> {
         if request.method_id.to_string() != "deepseek-api-key" {
             return responder
@@ -386,7 +395,7 @@ impl V2Harness {
     async fn logout(
         self,
         _request: LogoutAuthRequest,
-        responder: agent_client_protocol::Responder<LogoutAuthResponse>,
+        responder: agent_client_protocol::v2::Responder<LogoutAuthResponse>,
     ) -> agent_client_protocol::Result<()> {
         self.base.provider.write().await.enabled = false;
         responder.respond(LogoutAuthResponse::new())
@@ -395,7 +404,7 @@ impl V2Harness {
     async fn list_providers(
         self,
         _request: ListProvidersRequest,
-        responder: agent_client_protocol::Responder<ListProvidersResponse>,
+        responder: agent_client_protocol::v2::Responder<ListProvidersResponse>,
     ) -> agent_client_protocol::Result<()> {
         let routing = self.base.provider.read().await;
         let current = routing
@@ -412,7 +421,7 @@ impl V2Harness {
     async fn set_provider(
         self,
         request: SetProviderRequest,
-        responder: agent_client_protocol::Responder<SetProviderResponse>,
+        responder: agent_client_protocol::v2::Responder<SetProviderResponse>,
     ) -> agent_client_protocol::Result<()> {
         if request.provider_id.to_string() != "deepseek" {
             return responder.respond_with_error(
@@ -439,7 +448,7 @@ impl V2Harness {
     async fn disable_provider(
         self,
         request: DisableProviderRequest,
-        responder: agent_client_protocol::Responder<DisableProviderResponse>,
+        responder: agent_client_protocol::v2::Responder<DisableProviderResponse>,
     ) -> agent_client_protocol::Result<()> {
         if request.provider_id.to_string() != "deepseek" {
             return responder.respond_with_error(
@@ -453,7 +462,7 @@ impl V2Harness {
     async fn new_session(
         self,
         request: v2::NewSessionRequest,
-        responder: agent_client_protocol::Responder<v2::NewSessionResponse>,
+        responder: agent_client_protocol::v2::Responder<v2::NewSessionResponse>,
         connection: V2ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         if !self.initialized.load(Ordering::Acquire) {
@@ -500,7 +509,7 @@ impl V2Harness {
     async fn list_sessions(
         self,
         request: v2::ListSessionsRequest,
-        responder: agent_client_protocol::Responder<v2::ListSessionsResponse>,
+        responder: agent_client_protocol::v2::Responder<v2::ListSessionsResponse>,
     ) -> agent_client_protocol::Result<()> {
         let offset = match request.cursor.as_ref() {
             Some(cursor) => match cursor.as_ref().parse::<usize>() {
@@ -539,7 +548,7 @@ impl V2Harness {
     async fn resume_session(
         self,
         request: v2::ResumeSessionRequest,
-        responder: agent_client_protocol::Responder<v2::ResumeSessionResponse>,
+        responder: agent_client_protocol::v2::Responder<v2::ResumeSessionResponse>,
         connection: V2ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         if matches!(request.replay_from.as_ref(), Some(ReplayFrom::Other(_))) {
@@ -624,7 +633,7 @@ impl V2Harness {
     async fn fork_session(
         self,
         request: v2::ForkSessionRequest,
-        responder: agent_client_protocol::Responder<v2::ForkSessionResponse>,
+        responder: agent_client_protocol::v2::Responder<v2::ForkSessionResponse>,
         connection: V2ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         let source_runtime = match self.base.store.get(&request.session_id.to_string()).await {
@@ -724,7 +733,7 @@ impl V2Harness {
     async fn delete_session(
         self,
         request: v2::DeleteSessionRequest,
-        responder: agent_client_protocol::Responder<v2::DeleteSessionResponse>,
+        responder: agent_client_protocol::v2::Responder<v2::DeleteSessionResponse>,
     ) -> agent_client_protocol::Result<()> {
         match self
             .base
@@ -740,7 +749,7 @@ impl V2Harness {
     async fn close_session(
         self,
         request: v2::CloseSessionRequest,
-        responder: agent_client_protocol::Responder<v2::CloseSessionResponse>,
+        responder: agent_client_protocol::v2::Responder<v2::CloseSessionResponse>,
     ) -> agent_client_protocol::Result<()> {
         let runtime = match self.base.store.get(&request.session_id.to_string()).await {
             Ok(runtime) => runtime,
@@ -775,7 +784,7 @@ impl V2Harness {
     async fn session_status(
         self,
         params: Value,
-        responder: agent_client_protocol::Responder<Value>,
+        responder: agent_client_protocol::v2::Responder<Value>,
     ) -> agent_client_protocol::Result<()> {
         if !self.initialized.load(Ordering::Acquire) {
             return responder.respond_with_error(Error::invalid_request().data("initialize first"));
@@ -802,7 +811,7 @@ impl V2Harness {
     async fn session_set_title(
         self,
         params: Value,
-        responder: agent_client_protocol::Responder<Value>,
+        responder: agent_client_protocol::v2::Responder<Value>,
         connection: V2ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         if !self.initialized.load(Ordering::Acquire) {
@@ -829,7 +838,7 @@ impl V2Harness {
     async fn set_config(
         self,
         request: v2::SetSessionConfigOptionRequest,
-        responder: agent_client_protocol::Responder<v2::SetSessionConfigOptionResponse>,
+        responder: agent_client_protocol::v2::Responder<v2::SetSessionConfigOptionResponse>,
         connection: V2ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         let runtime = match self.base.store.get(&request.session_id.to_string()).await {
@@ -864,7 +873,7 @@ impl V2Harness {
     async fn prompt(
         self,
         request: PromptRequest,
-        responder: agent_client_protocol::Responder<PromptResponse>,
+        responder: agent_client_protocol::v2::Responder<PromptResponse>,
         connection: V2ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         let runtime = match self.base.store.get(&request.session_id.to_string()).await {
@@ -1024,7 +1033,7 @@ impl V2Harness {
     async fn steering(
         self,
         params: Value,
-        responder: agent_client_protocol::Responder<Value>,
+        responder: agent_client_protocol::v2::Responder<Value>,
         connection: V2ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         let (session_id, prompt, idle_behavior) = match steering_params::<ContentBlock>(&params) {
@@ -1259,11 +1268,13 @@ impl V2Harness {
             allow_command = false;
             let (stop_reason, next_usage, request_seq) = match result {
                 Ok(result) => result,
-                Err(error) if error.code == agent_client_protocol::ErrorCode::RequestCancelled => (
-                    StopReason::Cancelled,
-                    runtime.snapshot().await.usage,
-                    last_request_seq,
-                ),
+                Err(error) if error.code == agent_client_protocol::ErrorCode::REQUEST_CANCELLED => {
+                    (
+                        StopReason::Cancelled,
+                        runtime.snapshot().await.usage,
+                        last_request_seq,
+                    )
+                }
                 Err(error) => (
                     StopReason::Error(v2::ErrorStopReason::new().error(Some(v2_error_from(error)))),
                     runtime.snapshot().await.usage,
@@ -1403,7 +1414,7 @@ impl V2Harness {
                     if let Err(error) = mcp.refresh(cancellation).await {
                         // A cancel that lands during the refresh ends the
                         // work; the refresh did not fail.
-                        if error.code == agent_client_protocol::ErrorCode::RequestCancelled {
+                        if error.code == agent_client_protocol::ErrorCode::REQUEST_CANCELLED {
                             return Ok((
                                 StopReason::Cancelled,
                                 usage,
@@ -1575,7 +1586,7 @@ impl V2Harness {
                 {
                     Ok(result) => result,
                     Err(error)
-                        if error.code == agent_client_protocol::ErrorCode::RequestCancelled =>
+                        if error.code == agent_client_protocol::ErrorCode::REQUEST_CANCELLED =>
                     {
                         self.append_unfinished_tools(
                             runtime,
@@ -2374,11 +2385,7 @@ fn send_command_terminal(
     let exit_status = (!failed && (raw.get("exit_code").is_some() || raw.get("signal").is_some()))
         .then(|| {
             TerminalExitStatus::new()
-                .exit_code(
-                    raw.get("exit_code")
-                        .and_then(Value::as_u64)
-                        .and_then(|code| u32::try_from(code).ok()),
-                )
+                .exit_code(raw.get("exit_code").and_then(Value::as_i64))
                 .signal(
                     raw.get("signal")
                         .and_then(Value::as_str)
@@ -2431,7 +2438,7 @@ fn send_persisted_terminal(
     };
     let exit_status = terminal.exited.then(|| {
         TerminalExitStatus::new()
-            .exit_code(terminal.exit_code)
+            .exit_code(terminal.exit_code.map(i64::from))
             .signal(terminal.signal.clone())
     });
     send_update(
@@ -2578,7 +2585,7 @@ async fn request_permission(
         Err(error) => return PermissionDecision::Failed(error),
     };
     match response.outcome {
-        RequestPermissionOutcome::Cancelled => PermissionDecision::Cancelled,
+        RequestPermissionOutcome::Cancelled(_) => PermissionDecision::Cancelled,
         RequestPermissionOutcome::Selected(v2::SelectedPermissionOutcome { option_id, .. }) => {
             match option_id.to_string().as_str() {
                 "allow_once" => PermissionDecision::AllowOnce,
@@ -2809,11 +2816,11 @@ fn message_content_to_v2_blocks(content: &MessageContent) -> Vec<ContentBlock> {
 
 fn available_commands() -> Vec<AvailableCommand> {
     vec![
-        AvailableCommand::new("help", "Show available harness commands"),
-        AvailableCommand::new("plan", "Enter read-only planning mode"),
-        AvailableCommand::new("agent", "Enter agent mode"),
-        AvailableCommand::new("model", "Show or select the model"),
-        AvailableCommand::new("status", "Show session configuration"),
+        AvailableCommand::Command(v2::Command::new("help", "Show available harness commands")),
+        AvailableCommand::Command(v2::Command::new("plan", "Enter read-only planning mode")),
+        AvailableCommand::Command(v2::Command::new("agent", "Enter agent mode")),
+        AvailableCommand::Command(v2::Command::new("model", "Show or select the model")),
+        AvailableCommand::Command(v2::Command::new("status", "Show session configuration")),
     ]
 }
 
@@ -3029,8 +3036,8 @@ fn parse_plan(arguments: &Value) -> Result<Vec<PlanEntry>, Error> {
 
 fn convert_mcp_server(
     server: &v2::McpServer,
-) -> Result<agent_client_protocol::schema::v1::McpServer, Error> {
-    use agent_client_protocol::schema::v1;
+) -> Result<agent_client_protocol::v1::schema::McpServer, Error> {
+    use agent_client_protocol::v1::schema as v1;
     match server {
         v2::McpServer::Stdio(config) => Ok(v1::McpServer::Stdio(
             v1::McpServerStdio::new(&config.name, config.command.0.clone())

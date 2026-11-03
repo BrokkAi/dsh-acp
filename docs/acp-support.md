@@ -13,12 +13,14 @@ The server is a dual-stack ACP endpoint:
 - A client requesting ACP v2 is routed to the v2 implementation.
 - A newer requested version may select the highest supported version at or
   below it.
-- An unsupported version is rejected with `-32022`, whose data lists the
-  requested and supported versions. A missing or malformed version is rejected
-  with `-32602`. Over stdio, the server writes the error and then exits,
-  because a failed `initialize` does not initialize the connection. Over HTTP
-  or WebSocket, only that connection ends; over HTTP the error is the body of
-  the `initialize` response, which carries no `Acp-Connection-Id`.
+- A version below every supported version (such as `0`) is rejected with
+  `-32022`, whose data lists the requested and supported versions, as the v2
+  initialization spec requires of an agent that implements v2.
+- A missing or malformed version is rejected with `-32602`.
+- A rejected `initialize` does not initialize the connection, but leaves it
+  open so the client may retry or close it. Over HTTP the error is the body of
+  the `initialize` response, which carries no `Acp-Connection-Id`, and no
+  connection is created.
 
 The version is selected once during `initialize`; subsequent traffic uses that
 version's lifecycle and payload shapes.

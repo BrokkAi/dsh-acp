@@ -236,7 +236,7 @@ impl SessionStore {
         }
         let mut record = match self.read_record(id).await {
             Ok(record) => record,
-            Err(error) if error.code == ErrorCode::ResourceNotFound => {
+            Err(error) if error.code == ErrorCode::RESOURCE_NOT_FOUND => {
                 return Ok(SessionPresence::Unknown);
             }
             Err(error) => return Err(error),
@@ -529,7 +529,7 @@ impl SessionStore {
             .await
             .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
-                    Error::resource_not_found(Some(format!("session://{id}")))
+                    crate::workspace::resource_not_found(Some(format!("session://{id}")))
                 } else {
                     Error::into_internal_error(error)
                 }
@@ -572,7 +572,7 @@ fn read_instructions(root: &Path) -> Result<Option<String>, Error> {
     })?;
     let file = match workspace.open_existing("AGENTS.md") {
         Ok((_, file)) => file,
-        Err(error) if error.code == ErrorCode::ResourceNotFound => return Ok(None),
+        Err(error) if error.code == ErrorCode::RESOURCE_NOT_FOUND => return Ok(None),
         Err(error) => {
             return Err(Error::invalid_params().data(format!(
                 "failed to open instructions from {}: {}",
@@ -632,7 +632,9 @@ fn validate_session_id(id: &str) -> Result<(), Error> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     {
-        return Err(Error::resource_not_found(Some(format!("session://{id}"))));
+        return Err(crate::workspace::resource_not_found(Some(format!(
+            "session://{id}"
+        ))));
     }
     Ok(())
 }
@@ -839,7 +841,10 @@ mod tests {
         // across sessions, and an unanswered request cannot be completed.
         assert!(store.reserve_url_elicitation(a, "oauth").await.is_ok());
         let reused = store.reserve_url_elicitation(b, "oauth").await.unwrap_err();
-        assert_eq!(reused.code, agent_client_protocol::ErrorCode::InvalidParams);
+        assert_eq!(
+            reused.code,
+            agent_client_protocol::ErrorCode::INVALID_PARAMS
+        );
         assert!(!store.complete_url_elicitation(a, "oauth").await);
 
         // Declining frees the ID.
@@ -868,7 +873,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             deleted.code,
-            agent_client_protocol::ErrorCode::RequestCancelled
+            agent_client_protocol::ErrorCode::REQUEST_CANCELLED
         );
         assert!(
             store

@@ -19,7 +19,7 @@ use std::{
 };
 
 use agent_client_protocol::{
-    Agent, Client, ConnectTo, ConnectionTo, DynConnectTo, Error, Responder, UntypedMessage,
+    Agent, Builder, Client, ConnectTo, ConnectionTo, DynConnectTo, Error, Responder, UntypedMessage,
 };
 use agent_client_protocol_http::{AcpHttpServer, ServerOptions};
 use axum::{
@@ -151,7 +151,7 @@ fn connection(
 /// Answers every request with an error. Only reached when two connections
 /// race past the admission check; the loser gets this.
 fn busy_agent() -> impl ConnectTo<Client> {
-    Agent.builder().name("dsh-acp-busy").on_receive_request(
+    Builder::new(Agent).name("dsh-acp-busy").on_receive_request(
         async |_request: UntypedMessage,
                responder: Responder<Value>,
                _connection: ConnectionTo<Client>| {

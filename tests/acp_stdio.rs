@@ -1336,6 +1336,36 @@ async fn v2_session_status_answers_while_an_mcp_call_is_in_flight() {
 }
 
 #[tokio::test]
+async fn a_repeated_initialize_below_v1_is_rejected_with_the_selected_version() {
+    let temp = tempfile::tempdir().unwrap();
+    for (version, first) in [
+        (1, json!({"protocolVersion": 1, "clientCapabilities": {}})),
+        (
+            2,
+            json!({"protocolVersion": 2, "info": {"name": "tck", "version": "0"}, "capabilities": {}}),
+        ),
+    ] {
+        let mut peer = spawn_peer(temp.path(), None).await;
+        let initialize = peer.request("initialize", first).await;
+        assert_eq!(initialize["protocolVersion"], version);
+        let error = peer
+            .request_error(
+                "initialize",
+                json!({"protocolVersion": 0, "clientCapabilities": {}}),
+            )
+            .await;
+        assert_eq!(error["code"], -32022, "v{version}: {error}");
+        assert_eq!(
+            error["data"],
+            json!({"requested": 0, "supported": [version]}),
+            "v{version}"
+        );
+        drop(peer.stdin);
+        peer.child.wait().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn a_rejected_initialize_is_answered_before_the_server_exits() {
     let temp = tempfile::tempdir().unwrap();
     let cases = [
@@ -1377,9 +1407,12 @@ async fn a_rejected_initialize_is_answered_before_the_server_exits() {
                 "{case}"
             );
         }
+        // A rejected initialize leaves the connection open for a retry; the
+        // server exits cleanly once the client closes stdin.
+        drop(peer.stdin);
         let status = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait())
             .await
-            .unwrap_or_else(|_| panic!("server did not exit after rejecting {case}"))
+            .unwrap_or_else(|_| panic!("server did not exit after stdin closed ({case})"))
             .unwrap();
         assert!(status.success(), "{case}: server exited with {status}");
     }

@@ -45,7 +45,7 @@ impl Harness {
         if title.is_empty() {
             // The RFD's example message.
             return Err(Error::new(
-                ErrorCode::InvalidParams.into(),
+                ErrorCode::INVALID_PARAMS,
                 "Title must not be empty.",
             ));
         }
