@@ -13,9 +13,9 @@ The server is a dual-stack ACP endpoint:
 - A client requesting ACP v2 is routed to the v2 implementation.
 - A newer requested version may select the highest supported version at or
   below it.
-- A version below every supported version (such as `0`) is rejected with
-  `-32022`, whose data lists the requested and supported versions, as the v2
-  initialization spec requires of an agent that implements v2.
+- Any other requested version (such as `0`) is routed to the v1
+  implementation, which answers with v1 under v1's fallback-to-latest rule, as
+  the Rust SDK's protocol router does.
 - A missing or malformed version is rejected with `-32602`.
 - A rejected `initialize` does not initialize the connection, but leaves it
   open so the client may retry or close it. Over HTTP the error is the body of

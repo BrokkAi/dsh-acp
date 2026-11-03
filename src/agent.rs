@@ -176,15 +176,12 @@ impl Harness {
 }
 
 /// The ACP agent for one connection: the protocol router in front of the v1
-/// and v2 implementations, which share `harness`, behind the gate that
-/// rejects versions below v1 as the spec requires.
+/// and v2 implementations, which share `harness`.
 pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> {
-    crate::version_gate::VersionGate(
-        Agent
-            .protocol_router()
-            .with_v1(v1_component(harness.clone()))
-            .with_v2(crate::v2_agent::component(harness)),
-    )
+    Agent
+        .protocol_router()
+        .with_v1(v1_component(harness.clone()))
+        .with_v2(crate::v2_agent::component(harness))
 }
 
 fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
