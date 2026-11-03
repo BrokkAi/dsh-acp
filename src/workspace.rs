@@ -7,6 +7,13 @@ use std::{
 use agent_client_protocol::Error;
 use cap_std::fs::{Dir, File, OpenOptions};
 
+/// The error for a file, directory, or session that does not exist. Built
+/// from the v1 schema error, so both protocol versions keep the wire shape
+/// they had before the SDK's `Error` became version-neutral.
+pub(crate) fn resource_not_found(uri: Option<String>) -> Error {
+    agent_client_protocol::v1::schema::Error::resource_not_found(uri).into()
+}
+
 /// Capability handles for the session's workspace roots. The handles remain
 /// anchored to the directories opened for the session even if a local process
 /// later renames or replaces one of their paths.
@@ -115,7 +122,7 @@ impl WorkspaceRoots {
         let root = self.root(path.root_index);
         let file = root.dir.open(&path.relative).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
-                Error::resource_not_found(Some(path.absolute.display().to_string()))
+                resource_not_found(Some(path.absolute.display().to_string()))
             } else {
                 Error::into_internal_error(error)
             }
@@ -176,7 +183,7 @@ fn canonical_root(path: &Path, label: &str, require_unchanged: bool) -> Result<P
     }
     let canonical = path.canonicalize().map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
-            Error::resource_not_found(Some(path.display().to_string()))
+            resource_not_found(Some(path.display().to_string()))
         } else {
             Error::into_internal_error(error)
         }
@@ -188,7 +195,7 @@ fn canonical_root(path: &Path, label: &str, require_unchanged: bool) -> Result<P
         )));
     }
     if !canonical.is_dir() {
-        return Err(Error::resource_not_found(Some(path.display().to_string())));
+        return Err(resource_not_found(Some(path.display().to_string())));
     }
     Ok(canonical)
 }

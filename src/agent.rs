@@ -4,9 +4,10 @@ use std::sync::{
 };
 
 use agent_client_protocol::{
-    Agent, ByteStreams, Client, ConnectTo, ConnectionTo, Error, JsonRpcMessage, UntypedMessage,
+    Agent, ByteStreams, Client, ConnectTo, Error, JsonRpcMessage, UntypedMessage,
     schema::ProtocolVersion,
-    schema::v1::{
+    v1::ConnectionTo,
+    v1::schema::{
         AgentAuthCapabilities, AgentCapabilities, AuthMethod, AuthMethodAgent, AuthenticateRequest,
         AuthenticateResponse, AvailableCommand, AvailableCommandsUpdate, CancelNotification,
         ClientCapabilities, CloseSessionRequest, CloseSessionResponse, CompactionStatus,
@@ -175,23 +176,28 @@ impl Harness {
 }
 
 /// The ACP agent for one connection: the protocol router in front of the v1
-/// and v2 implementations, which share `harness`.
+/// and v2 implementations, which share `harness`, behind the gate that
+/// rejects versions below v1 as the spec requires.
 pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> {
-    Agent
-        .protocol_router()
-        .with_v1(v1_component(harness.clone()))
-        .with_v2(crate::v2_agent::component(harness))
+    crate::version_gate::VersionGate(
+        Agent
+            .protocol_router()
+            .with_v1(v1_component(harness.clone()))
+            .with_v2(crate::v2_agent::component(harness)),
+    )
 }
 
 fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
     Agent
-        .builder()
+        .v1()
         .name("dsh-acp")
         .on_receive_request(
             {
                 let harness = harness.clone();
                 async move |request: AuthenticateRequest,
-                            responder: agent_client_protocol::Responder<AuthenticateResponse>,
+                            responder: agent_client_protocol::v1::Responder<
+                    AuthenticateResponse,
+                >,
                             _connection: ConnectionTo<Client>| {
                     harness.clone().authenticate(request, responder).await
                 }
@@ -202,7 +208,7 @@ fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
             {
                 let harness = harness.clone();
                 async move |request: LogoutRequest,
-                            responder: agent_client_protocol::Responder<LogoutResponse>,
+                            responder: agent_client_protocol::v1::Responder<LogoutResponse>,
                             _connection: ConnectionTo<Client>| {
                     harness.clone().logout(request, responder).await
                 }
@@ -213,7 +219,9 @@ fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
             {
                 let harness = harness.clone();
                 async move |request: ListProvidersRequest,
-                            responder: agent_client_protocol::Responder<ListProvidersResponse>,
+                            responder: agent_client_protocol::v1::Responder<
+                    ListProvidersResponse,
+                >,
                             _connection: ConnectionTo<Client>| {
                     harness.clone().list_providers(request, responder).await
                 }
@@ -224,7 +232,7 @@ fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
             {
                 let harness = harness.clone();
                 async move |request: SetProviderRequest,
-                            responder: agent_client_protocol::Responder<SetProviderResponse>,
+                            responder: agent_client_protocol::v1::Responder<SetProviderResponse>,
                             _connection: ConnectionTo<Client>| {
                     harness.clone().set_provider(request, responder).await
                 }
@@ -235,7 +243,9 @@ fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
             {
                 let harness = harness.clone();
                 async move |request: DisableProviderRequest,
-                            responder: agent_client_protocol::Responder<DisableProviderResponse>,
+                            responder: agent_client_protocol::v1::Responder<
+                    DisableProviderResponse,
+                >,
                             _connection: ConnectionTo<Client>| {
                     harness.clone().disable_provider(request, responder).await
                 }
@@ -246,7 +256,7 @@ fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
             {
                 let harness = harness.clone();
                 async move |request: NewSessionRequest,
-                            responder: agent_client_protocol::Responder<NewSessionResponse>,
+                            responder: agent_client_protocol::v1::Responder<NewSessionResponse>,
                             connection: ConnectionTo<Client>| {
                     harness
                         .clone()
@@ -260,7 +270,7 @@ fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
             {
                 let harness = harness.clone();
                 async move |request: LoadSessionRequest,
-                            responder: agent_client_protocol::Responder<LoadSessionResponse>,
+                            responder: agent_client_protocol::v1::Responder<LoadSessionResponse>,
                             connection: ConnectionTo<Client>| {
                     harness
                         .clone()
@@ -274,7 +284,9 @@ fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
             {
                 let harness = harness.clone();
                 async move |request: ResumeSessionRequest,
-                            responder: agent_client_protocol::Responder<ResumeSessionResponse>,
+                            responder: agent_client_protocol::v1::Responder<
+                    ResumeSessionResponse,
+                >,
                             connection: ConnectionTo<Client>| {
                     harness
                         .clone()
@@ -288,7 +300,7 @@ fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
             {
                 let harness = harness.clone();
                 async move |request: ForkSessionRequest,
-                            responder: agent_client_protocol::Responder<ForkSessionResponse>,
+                            responder: agent_client_protocol::v1::Responder<ForkSessionResponse>,
                             connection: ConnectionTo<Client>| {
                     harness
                         .clone()
@@ -302,7 +314,9 @@ fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
             {
                 let harness = harness.clone();
                 async move |request: ListSessionsRequest,
-                            responder: agent_client_protocol::Responder<ListSessionsResponse>,
+                            responder: agent_client_protocol::v1::Responder<
+                    ListSessionsResponse,
+                >,
                             _connection: ConnectionTo<Client>| {
                     harness.clone().list_sessions(request, responder).await
                 }
@@ -313,7 +327,9 @@ fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
             {
                 let harness = harness.clone();
                 async move |request: DeleteSessionRequest,
-                            responder: agent_client_protocol::Responder<DeleteSessionResponse>,
+                            responder: agent_client_protocol::v1::Responder<
+                    DeleteSessionResponse,
+                >,
                             _connection: ConnectionTo<Client>| {
                     harness.clone().delete_session(request, responder).await
                 }
@@ -324,7 +340,9 @@ fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
             {
                 let harness = harness.clone();
                 async move |request: CloseSessionRequest,
-                            responder: agent_client_protocol::Responder<CloseSessionResponse>,
+                            responder: agent_client_protocol::v1::Responder<
+                    CloseSessionResponse,
+                >,
                             _connection: ConnectionTo<Client>| {
                     harness.clone().close_session(request, responder).await
                 }
@@ -335,7 +353,9 @@ fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
             {
                 let harness = harness.clone();
                 async move |request: SetSessionModeRequest,
-                            responder: agent_client_protocol::Responder<SetSessionModeResponse>,
+                            responder: agent_client_protocol::v1::Responder<
+                    SetSessionModeResponse,
+                >,
                             connection: ConnectionTo<Client>| {
                     harness
                         .clone()
@@ -349,7 +369,7 @@ fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
             {
                 let harness = harness.clone();
                 async move |request: SetSessionConfigOptionRequest,
-                            responder: agent_client_protocol::Responder<
+                            responder: agent_client_protocol::v1::Responder<
                     SetSessionConfigOptionResponse,
                 >,
                             connection: ConnectionTo<Client>| {
@@ -365,7 +385,7 @@ fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
             {
                 let harness = harness.clone();
                 async move |request: PromptRequest,
-                            responder: agent_client_protocol::Responder<PromptResponse>,
+                            responder: agent_client_protocol::v1::Responder<PromptResponse>,
                             connection: ConnectionTo<Client>| {
                     harness.clone().prompt(request, responder, connection).await
                 }
@@ -376,7 +396,7 @@ fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
             {
                 let harness = harness.clone();
                 async move |request: UntypedMessage,
-                            responder: agent_client_protocol::Responder<Value>,
+                            responder: agent_client_protocol::v1::Responder<Value>,
                             connection: ConnectionTo<Client>| {
                     match request.method.as_str() {
                         // Answered as JSON: the SDK capability types cannot advertise
@@ -482,12 +502,12 @@ pub(crate) fn steering_params<Block: serde::de::DeserializeOwned>(
     Ok((session_id, prompt, idle_behavior))
 }
 
-/// Stdio as a transport the protocol router can finish.
+/// Stdio as a transport the connection can finish.
 ///
-/// When the router rejects `initialize`, it asks the transport to finish so
-/// the error response is written before the process exits. The SDK's `Stdio`
-/// cannot be asked to finish, so the router stops it after one poll, which
-/// races the write: the client often got no response at all.
+/// Finishing the transport writes any pending response before the process
+/// exits. The SDK's `Stdio` cannot be asked to finish, so a connection that
+/// ends right after answering races the write and the client can get no
+/// response at all.
 fn stdio_transport() -> impl ConnectTo<Agent> {
     ByteStreams::new(
         blocking::Unblock::new(std::io::stdout()),
@@ -499,14 +519,9 @@ impl Harness {
     async fn initialize(
         self,
         request: InitializeRequest,
-        responder: agent_client_protocol::Responder<Value>,
+        responder: agent_client_protocol::v1::Responder<Value>,
         _connection: ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
-        if request.protocol_version == ProtocolVersion::V0 {
-            return responder.respond_with_error(
-                Error::invalid_params().data("ACP protocol v0 is unsupported"),
-            );
-        }
         *self.client_capabilities.write().await = request.client_capabilities.clone();
         self.initialized.store(true, Ordering::Release);
 
@@ -578,7 +593,7 @@ impl Harness {
     async fn authenticate(
         self,
         request: AuthenticateRequest,
-        responder: agent_client_protocol::Responder<AuthenticateResponse>,
+        responder: agent_client_protocol::v1::Responder<AuthenticateResponse>,
     ) -> agent_client_protocol::Result<()> {
         if request.method_id.to_string() != "deepseek-api-key" {
             return responder
@@ -603,7 +618,7 @@ impl Harness {
     async fn logout(
         self,
         _request: LogoutRequest,
-        responder: agent_client_protocol::Responder<LogoutResponse>,
+        responder: agent_client_protocol::v1::Responder<LogoutResponse>,
     ) -> agent_client_protocol::Result<()> {
         self.provider.write().await.enabled = false;
         responder.respond(LogoutResponse::new())
@@ -612,7 +627,7 @@ impl Harness {
     async fn list_providers(
         self,
         _request: ListProvidersRequest,
-        responder: agent_client_protocol::Responder<ListProvidersResponse>,
+        responder: agent_client_protocol::v1::Responder<ListProvidersResponse>,
     ) -> agent_client_protocol::Result<()> {
         let routing = self.provider.read().await;
         let current = routing
@@ -629,7 +644,7 @@ impl Harness {
     async fn set_provider(
         self,
         request: SetProviderRequest,
-        responder: agent_client_protocol::Responder<SetProviderResponse>,
+        responder: agent_client_protocol::v1::Responder<SetProviderResponse>,
     ) -> agent_client_protocol::Result<()> {
         if request.provider_id.to_string() != "deepseek" {
             return responder.respond_with_error(
@@ -656,7 +671,7 @@ impl Harness {
     async fn disable_provider(
         self,
         request: DisableProviderRequest,
-        responder: agent_client_protocol::Responder<DisableProviderResponse>,
+        responder: agent_client_protocol::v1::Responder<DisableProviderResponse>,
     ) -> agent_client_protocol::Result<()> {
         if request.provider_id.to_string() != "deepseek" {
             return responder.respond_with_error(
@@ -670,7 +685,7 @@ impl Harness {
     async fn new_session(
         self,
         request: NewSessionRequest,
-        responder: agent_client_protocol::Responder<NewSessionResponse>,
+        responder: agent_client_protocol::v1::Responder<NewSessionResponse>,
         connection: ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         if !self.initialized.load(Ordering::Acquire) {
@@ -716,7 +731,7 @@ impl Harness {
     async fn load_session(
         self,
         request: LoadSessionRequest,
-        responder: agent_client_protocol::Responder<LoadSessionResponse>,
+        responder: agent_client_protocol::v1::Responder<LoadSessionResponse>,
         connection: ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         let system_prompt = match client_system_prompt(request.system_prompt.as_ref()) {
@@ -806,7 +821,7 @@ impl Harness {
     async fn resume_session(
         self,
         request: ResumeSessionRequest,
-        responder: agent_client_protocol::Responder<ResumeSessionResponse>,
+        responder: agent_client_protocol::v1::Responder<ResumeSessionResponse>,
         connection: ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         let system_prompt = match client_system_prompt(request.system_prompt.as_ref()) {
@@ -886,7 +901,7 @@ impl Harness {
     async fn fork_session(
         self,
         request: ForkSessionRequest,
-        responder: agent_client_protocol::Responder<ForkSessionResponse>,
+        responder: agent_client_protocol::v1::Responder<ForkSessionResponse>,
         connection: ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         let source_runtime = match self.store.get(&request.session_id.to_string()).await {
@@ -985,7 +1000,7 @@ impl Harness {
     async fn list_sessions(
         self,
         request: ListSessionsRequest,
-        responder: agent_client_protocol::Responder<ListSessionsResponse>,
+        responder: agent_client_protocol::v1::Responder<ListSessionsResponse>,
     ) -> agent_client_protocol::Result<()> {
         if request.cwd.as_ref().is_some_and(|cwd| !cwd.is_absolute()) {
             return responder.respond_with_error(
@@ -1024,7 +1039,7 @@ impl Harness {
     async fn delete_session(
         self,
         request: DeleteSessionRequest,
-        responder: agent_client_protocol::Responder<DeleteSessionResponse>,
+        responder: agent_client_protocol::v1::Responder<DeleteSessionResponse>,
     ) -> agent_client_protocol::Result<()> {
         match self.store.delete(&request.session_id.to_string()).await {
             Ok(()) => responder.respond(DeleteSessionResponse::new()),
@@ -1035,7 +1050,7 @@ impl Harness {
     async fn close_session(
         self,
         request: CloseSessionRequest,
-        responder: agent_client_protocol::Responder<CloseSessionResponse>,
+        responder: agent_client_protocol::v1::Responder<CloseSessionResponse>,
     ) -> agent_client_protocol::Result<()> {
         let runtime = match self.store.get(&request.session_id.to_string()).await {
             Ok(runtime) => runtime,
@@ -1070,7 +1085,7 @@ impl Harness {
     async fn session_status(
         self,
         params: Value,
-        responder: agent_client_protocol::Responder<Value>,
+        responder: agent_client_protocol::v1::Responder<Value>,
     ) -> agent_client_protocol::Result<()> {
         if !self.initialized.load(Ordering::Acquire) {
             return responder.respond_with_error(Error::invalid_request().data("initialize first"));
@@ -1093,7 +1108,7 @@ impl Harness {
     async fn session_set_title(
         self,
         params: Value,
-        responder: agent_client_protocol::Responder<Value>,
+        responder: agent_client_protocol::v1::Responder<Value>,
         connection: ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         if !self.initialized.load(Ordering::Acquire) {
@@ -1108,7 +1123,7 @@ impl Harness {
             // this and a failed send does not fail the request.
             let _ = connection.send_notification(SessionNotification::new(
                 SessionId::new(stored.session_id),
-                agent_client_protocol::schema::v1::SessionUpdate::SessionInfoUpdate(
+                agent_client_protocol::v1::schema::SessionUpdate::SessionInfoUpdate(
                     SessionInfoUpdate::new().title(stored.title.clone()),
                 ),
             ));
@@ -1119,7 +1134,7 @@ impl Harness {
     async fn set_session_mode(
         self,
         request: SetSessionModeRequest,
-        responder: agent_client_protocol::Responder<SetSessionModeResponse>,
+        responder: agent_client_protocol::v1::Responder<SetSessionModeResponse>,
         connection: ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         let mode = request.mode_id.to_string();
@@ -1143,13 +1158,13 @@ impl Harness {
         responder.respond(SetSessionModeResponse::new())?;
         connection.send_notification(SessionNotification::new(
             request.session_id,
-            agent_client_protocol::schema::v1::SessionUpdate::CurrentModeUpdate(
+            agent_client_protocol::v1::schema::SessionUpdate::CurrentModeUpdate(
                 CurrentModeUpdate::new(mode),
             ),
         ))?;
         connection.send_notification(SessionNotification::new(
             SessionId::new(runtime.snapshot().await.id),
-            agent_client_protocol::schema::v1::SessionUpdate::ConfigOptionUpdate(
+            agent_client_protocol::v1::schema::SessionUpdate::ConfigOptionUpdate(
                 ConfigOptionUpdate::new(self.config_options(&runtime.snapshot().await)),
             ),
         ))
@@ -1158,7 +1173,7 @@ impl Harness {
     async fn set_session_config(
         self,
         request: SetSessionConfigOptionRequest,
-        responder: agent_client_protocol::Responder<SetSessionConfigOptionResponse>,
+        responder: agent_client_protocol::v1::Responder<SetSessionConfigOptionResponse>,
         connection: ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         let runtime = match self.store.get(&request.session_id.to_string()).await {
@@ -1181,7 +1196,7 @@ impl Harness {
         let options = self.config_options(&record);
         connection.send_notification(SessionNotification::new(
             request.session_id.clone(),
-            agent_client_protocol::schema::v1::SessionUpdate::ConfigOptionUpdate(
+            agent_client_protocol::v1::schema::SessionUpdate::ConfigOptionUpdate(
                 ConfigOptionUpdate::new(options.clone()),
             ),
         ))?;
@@ -1191,7 +1206,7 @@ impl Harness {
     async fn prompt(
         self,
         request: PromptRequest,
-        responder: agent_client_protocol::Responder<PromptResponse>,
+        responder: agent_client_protocol::v1::Responder<PromptResponse>,
         connection: ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         let runtime = match self.store.get(&request.session_id.to_string()).await {
@@ -1250,13 +1265,13 @@ impl Harness {
                 }
                 Ok(response) => responder.respond(response),
                 Err(error)
-                    if error.code == agent_client_protocol::ErrorCode::RequestCancelled
+                    if error.code == agent_client_protocol::ErrorCode::REQUEST_CANCELLED
                         && !stopped_by_request =>
                 {
                     responder.respond(PromptResponse::new(StopReason::Cancelled))
                 }
                 Err(error) if cancelled_by_request => {
-                    if error.code != agent_client_protocol::ErrorCode::RequestCancelled {
+                    if error.code != agent_client_protocol::ErrorCode::REQUEST_CANCELLED {
                         tracing::warn!(?error, "cancelled prompt turn failed");
                     }
                     responder.respond_with_error(Error::request_cancelled())
@@ -1274,7 +1289,7 @@ impl Harness {
     async fn steering(
         self,
         params: Value,
-        responder: agent_client_protocol::Responder<Value>,
+        responder: agent_client_protocol::v1::Responder<Value>,
         connection: ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         let (session_id, prompt, idle_behavior) = match steering_params::<ContentBlock>(&params) {
@@ -1382,9 +1397,9 @@ impl Harness {
         for block in prompt {
             connection.send_notification(SessionNotification::new(
                 session_id.clone(),
-                agent_client_protocol::schema::v1::SessionUpdate::UserMessageChunk(
+                agent_client_protocol::v1::schema::SessionUpdate::UserMessageChunk(
                     ContentChunk::new(block).message_id(
-                        agent_client_protocol::schema::v1::MessageId::new(message_id.clone()),
+                        agent_client_protocol::v1::schema::MessageId::new(message_id.clone()),
                     ),
                 ),
             ))?;
@@ -1404,7 +1419,7 @@ impl Harness {
     pub(crate) async fn attach_mcp(
         &self,
         runtime: &SessionRuntime,
-        servers: &[agent_client_protocol::schema::v1::McpServer],
+        servers: &[agent_client_protocol::v1::schema::McpServer],
         acp: AcpConnection,
     ) -> Result<(), Error> {
         if servers.is_empty() {
@@ -1518,7 +1533,7 @@ impl Harness {
             let state = runtime.state.lock().await;
             connection.send_notification(SessionNotification::new(
                 session_id.clone(),
-                agent_client_protocol::schema::v1::SessionUpdate::SessionInfoUpdate(
+                agent_client_protocol::v1::schema::SessionUpdate::SessionInfoUpdate(
                     SessionInfoUpdate::new().title(state.record.title.clone()),
                 ),
             ))?;
@@ -1609,14 +1624,14 @@ impl Harness {
                     if let Err(error) = mcp.refresh(&cancellation).await {
                         // A cancel that lands during the refresh ends the
                         // turn; the refresh did not fail.
-                        if error.code == agent_client_protocol::ErrorCode::RequestCancelled {
+                        if error.code == agent_client_protocol::ErrorCode::REQUEST_CANCELLED {
                             return Ok(PromptResponse::new(StopReason::Cancelled));
                         }
                         tracing::warn!(?error, "failed to refresh MCP tools");
                         if supports_notices {
                             let _ = connection.send_notification(SessionNotification::new(
                                 session_id.clone(),
-                                agent_client_protocol::schema::v1::SessionUpdate::Notice(
+                                agent_client_protocol::v1::schema::SessionUpdate::Notice(
                                     Notice::new(NoticeSeverity::Warning, "MCP tool refresh failed")
                                         .description(Some(error.message)),
                                 ),
@@ -1659,7 +1674,7 @@ impl Harness {
                 self.store.save(&runtime).await?;
                 connection.send_notification(SessionNotification::new(
                     session_id.clone(),
-                    agent_client_protocol::schema::v1::SessionUpdate::CompactionUpdate(
+                    agent_client_protocol::v1::schema::SessionUpdate::CompactionUpdate(
                         CompactionUpdate::new(compaction_id, CompactionStatus::Completed),
                     ),
                 ))?;
@@ -1691,7 +1706,7 @@ impl Harness {
                 .await
             {
                 Ok(completion) => crate::deepseek::sanitize_tool_calls(completion),
-                Err(error) if error.code == agent_client_protocol::ErrorCode::RequestCancelled => {
+                Err(error) if error.code == agent_client_protocol::ErrorCode::REQUEST_CANCELLED => {
                     return Ok(PromptResponse::new(StopReason::Cancelled));
                 }
                 Err(error) => return Err(error),
@@ -1731,7 +1746,7 @@ impl Harness {
                 if supports_notices {
                     let _ = connection.send_notification(SessionNotification::new(
                         session_id.clone(),
-                        agent_client_protocol::schema::v1::SessionUpdate::Notice(
+                        agent_client_protocol::v1::schema::SessionUpdate::Notice(
                             Notice::new(
                                 NoticeSeverity::Warning,
                                 "The response reached the token limit and was cut off",
@@ -1797,7 +1812,7 @@ impl Harness {
                             crate::model::INTERRUPTED_TOOL_CALL,
                         )
                         .await?;
-                        if error.code == agent_client_protocol::ErrorCode::RequestCancelled {
+                        if error.code == agent_client_protocol::ErrorCode::REQUEST_CANCELLED {
                             return Ok(PromptResponse::new(StopReason::Cancelled));
                         }
                         return Err(error);
@@ -1839,7 +1854,7 @@ impl Harness {
                     .expect("v1 tool cancellation requires an ACP v1 connection")
                     .send_notification(SessionNotification::new(
                         session_id.clone(),
-                        agent_client_protocol::schema::v1::SessionUpdate::ToolCallUpdate(
+                        agent_client_protocol::v1::schema::SessionUpdate::ToolCallUpdate(
                             ToolCallUpdate::new(call.id.clone(), fields),
                         ),
                     ))?;
@@ -1910,14 +1925,14 @@ impl Harness {
                     .expect("v1 tool update requires an ACP v1 connection")
                     .send_notification(SessionNotification::new(
                         session_id.clone(),
-                        agent_client_protocol::schema::v1::SessionUpdate::ToolCall(
+                        agent_client_protocol::v1::schema::SessionUpdate::ToolCall(
                             ToolCall::new(call.id.clone(), call.function.name.clone())
                                 .name(call.function.name.clone())
                                 .kind(tool_kind(&call.function.name))
                                 .status(ToolCallStatus::Failed)
                                 .raw_input(Value::String(call.function.arguments.clone()))
                                 .content(vec![ToolCallContent::Content(
-                                    agent_client_protocol::schema::v1::Content::new(
+                                    agent_client_protocol::v1::schema::Content::new(
                                         ContentBlock::Text(TextContent::new(&message)),
                                     ),
                                 )]),
@@ -1952,7 +1967,7 @@ impl Harness {
             .expect("v1 tool update requires an ACP v1 connection")
             .send_notification(SessionNotification::new(
                 session_id.clone(),
-                agent_client_protocol::schema::v1::SessionUpdate::ToolCall(
+                agent_client_protocol::v1::schema::SessionUpdate::ToolCall(
                     ToolCall::new(call.id.clone(), title.clone())
                         .name(call.function.name.clone())
                         .kind(kind)
@@ -1989,7 +2004,7 @@ impl Harness {
                 .expect("v1 tool update requires an ACP v1 connection")
                 .send_notification(SessionNotification::new(
                     session_id.clone(),
-                    agent_client_protocol::schema::v1::SessionUpdate::Plan(plan.clone()),
+                    agent_client_protocol::v1::schema::SessionUpdate::Plan(plan.clone()),
                 ))?;
             let result = ToolResult {
                 text: format!(
@@ -2049,7 +2064,7 @@ impl Harness {
                 &arguments,
                 |elicitation_id| {
                     connection.send_notification(
-                        agent_client_protocol::schema::v1::CompleteElicitationNotification::new(
+                        agent_client_protocol::v1::schema::CompleteElicitationNotification::new(
                             elicitation_id,
                         ),
                     )
@@ -2124,7 +2139,7 @@ impl Harness {
             .expect("v1 tool result requires an ACP v1 connection")
             .send_notification(SessionNotification::new(
                 session_id.clone(),
-                agent_client_protocol::schema::v1::SessionUpdate::ToolCallUpdate(
+                agent_client_protocol::v1::schema::SessionUpdate::ToolCallUpdate(
                     ToolCallUpdate::new(
                         call.id.clone(),
                         ToolCallUpdateFields::new().status(ToolCallStatus::InProgress),
@@ -2147,7 +2162,7 @@ impl Harness {
                     text: truncate_text(&mcp_result_text(&value), self.config.tool_output_bytes),
                     raw: value,
                 },
-                Err(error) if error.code == agent_client_protocol::ErrorCode::RequestCancelled => {
+                Err(error) if error.code == agent_client_protocol::ErrorCode::REQUEST_CANCELLED => {
                     return Err(error);
                 }
                 Err(error) => crate::tools::error_result("MCP tool failed", &error),
@@ -2164,7 +2179,7 @@ impl Harness {
             .await
             {
                 Ok(result) => result,
-                Err(error) if error.code == agent_client_protocol::ErrorCode::RequestCancelled => {
+                Err(error) if error.code == agent_client_protocol::ErrorCode::REQUEST_CANCELLED => {
                     return Err(error);
                 }
                 Err(error) => crate::tools::error_result("Tool failed", &error),
@@ -2214,7 +2229,7 @@ impl Harness {
                 self.store.save(runtime).await?;
                 connection.send_notification(SessionNotification::new(
                     session_id.clone(),
-                    agent_client_protocol::schema::v1::SessionUpdate::CurrentModeUpdate(
+                    agent_client_protocol::v1::schema::SessionUpdate::CurrentModeUpdate(
                         CurrentModeUpdate::new("plan"),
                     ),
                 ))?;
@@ -2225,7 +2240,7 @@ impl Harness {
                 self.store.save(runtime).await?;
                 connection.send_notification(SessionNotification::new(
                     session_id.clone(),
-                    agent_client_protocol::schema::v1::SessionUpdate::CurrentModeUpdate(
+                    agent_client_protocol::v1::schema::SessionUpdate::CurrentModeUpdate(
                         CurrentModeUpdate::new("agent"),
                     ),
                 ))?;
@@ -2293,7 +2308,7 @@ impl Harness {
         send_agent_chunk(connection, session_id, &message_id, reply, false)?;
         connection.send_notification(SessionNotification::new(
             session_id.clone(),
-            agent_client_protocol::schema::v1::SessionUpdate::ConfigOptionUpdate(
+            agent_client_protocol::v1::schema::SessionUpdate::ConfigOptionUpdate(
                 ConfigOptionUpdate::new(self.config_options(&runtime.snapshot().await)),
             ),
         ))?;
@@ -2492,9 +2507,9 @@ fn send_agent_chunk(
     let chunk =
         ContentChunk::new(ContentBlock::Text(TextContent::new(text))).message_id(message_id);
     let update = if thought {
-        agent_client_protocol::schema::v1::SessionUpdate::AgentThoughtChunk(chunk)
+        agent_client_protocol::v1::schema::SessionUpdate::AgentThoughtChunk(chunk)
     } else {
-        agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(chunk)
+        agent_client_protocol::v1::schema::SessionUpdate::AgentMessageChunk(chunk)
     };
     connection.send_notification(SessionNotification::new(session_id.clone(), update))
 }
@@ -2505,7 +2520,7 @@ fn send_usage_update(
 ) -> Result<(), Error> {
     connection.send_notification(SessionNotification::new(
         record.id.clone(),
-        agent_client_protocol::schema::v1::SessionUpdate::UsageUpdate(UsageUpdate::new(
+        agent_client_protocol::v1::schema::SessionUpdate::UsageUpdate(UsageUpdate::new(
             record.context_used,
             DEFAULT_CONTEXT_WINDOW,
         )),
@@ -2518,7 +2533,7 @@ fn send_available_commands(
 ) -> Result<(), Error> {
     connection.send_notification(SessionNotification::new(
         SessionId::new(session_id.to_string()),
-        agent_client_protocol::schema::v1::SessionUpdate::AvailableCommandsUpdate(
+        agent_client_protocol::v1::schema::SessionUpdate::AvailableCommandsUpdate(
             AvailableCommandsUpdate::new(vec![
                 AvailableCommand::new("help", "Show available harness commands"),
                 AvailableCommand::new("plan", "Enter read-only planning mode"),
@@ -2555,7 +2570,7 @@ fn send_tool_finished(
     if terminal.is_none() || !success {
         let text = truncate_text(&result.text, access.config.tool_output_bytes);
         content.push(ToolCallContent::Content(
-            agent_client_protocol::schema::v1::Content::new(ContentBlock::Text(TextContent::new(
+            agent_client_protocol::v1::schema::Content::new(ContentBlock::Text(TextContent::new(
                 text,
             ))),
         ));
@@ -2563,7 +2578,7 @@ fn send_tool_finished(
     for item in structured_content(&result.raw) {
         if let Ok(block) = serde_json::from_value::<ContentBlock>(item) {
             content.push(ToolCallContent::Content(
-                agent_client_protocol::schema::v1::Content::new(block),
+                agent_client_protocol::v1::schema::Content::new(block),
             ));
         }
     }
@@ -2585,7 +2600,7 @@ fn send_tool_finished(
         .expect("v1 tool result requires an ACP v1 connection")
         .send_notification(SessionNotification::new(
             session_id.clone(),
-            agent_client_protocol::schema::v1::SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            agent_client_protocol::v1::schema::SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
                 call.id.clone(),
                 fields,
             )),
@@ -2595,7 +2610,7 @@ fn send_tool_finished(
 /// A file change as ACP v1 tool call content: the whole file before and after.
 fn diff_content(diff: &PersistedDiff) -> ToolCallContent {
     ToolCallContent::Diff(
-        agent_client_protocol::schema::v1::Diff::new(diff.path.clone(), diff.new_text.clone())
+        agent_client_protocol::v1::schema::Diff::new(diff.path.clone(), diff.new_text.clone())
             .old_text(diff.old_text.clone()),
     )
 }
@@ -3011,14 +3026,14 @@ fn message_content_to_v1_blocks(content: &MessageContent) -> Vec<ContentBlock> {
                     let data_url = image_url.url.strip_prefix("data:")?;
                     let (mime_type, data) = data_url.split_once(";base64,")?;
                     Some(ContentBlock::Image(
-                        agent_client_protocol::schema::v1::ImageContent::new(data, mime_type),
+                        agent_client_protocol::v1::schema::ImageContent::new(data, mime_type),
                     ))
                 }
                 ContentPart::File { file_data, .. } => {
                     let data_url = file_data.as_deref()?.strip_prefix("data:")?;
                     let (mime_type, data) = data_url.split_once(";base64,")?;
                     Some(ContentBlock::Image(
-                        agent_client_protocol::schema::v1::ImageContent::new(data, mime_type),
+                        agent_client_protocol::v1::schema::ImageContent::new(data, mime_type),
                     ))
                 }
             })
@@ -3027,7 +3042,7 @@ fn message_content_to_v1_blocks(content: &MessageContent) -> Vec<ContentBlock> {
 }
 
 fn client_system_prompt(
-    prompt: Option<&agent_client_protocol::schema::v1::SystemPrompt>,
+    prompt: Option<&agent_client_protocol::v1::schema::SystemPrompt>,
 ) -> Result<Option<ClientSystemPrompt>, Error> {
     let Some(prompt) = prompt else {
         return Ok(None);
@@ -3085,9 +3100,9 @@ fn replay_history(
                     for block in blocks {
                         connection.send_notification(SessionNotification::new(
                             session_id.clone(),
-                            agent_client_protocol::schema::v1::SessionUpdate::UserMessageChunk(
+                            agent_client_protocol::v1::schema::SessionUpdate::UserMessageChunk(
                                 ContentChunk::new(block).message_id(
-                                    agent_client_protocol::schema::v1::MessageId::new(
+                                    agent_client_protocol::v1::schema::MessageId::new(
                                         message_id.clone(),
                                     ),
                                 ),
@@ -3105,9 +3120,9 @@ fn replay_history(
                     for block in message_content_to_v1_blocks(content) {
                         connection.send_notification(SessionNotification::new(
                             session_id.clone(),
-                            agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(
+                            agent_client_protocol::v1::schema::SessionUpdate::AgentMessageChunk(
                                 ContentChunk::new(block).message_id(
-                                    agent_client_protocol::schema::v1::MessageId::new(
+                                    agent_client_protocol::v1::schema::MessageId::new(
                                         message_id.clone(),
                                     ),
                                 ),
@@ -3120,7 +3135,7 @@ fn replay_history(
                         .unwrap_or_else(|_| Value::String(call.function.arguments.clone()));
                     connection.send_notification(SessionNotification::new(
                         session_id.clone(),
-                        agent_client_protocol::schema::v1::SessionUpdate::ToolCall(
+                        agent_client_protocol::v1::schema::SessionUpdate::ToolCall(
                             ToolCall::new(call.id.clone(), call.function.name.clone())
                                 .name(call.function.name.clone())
                                 .status(ToolCallStatus::Pending)
@@ -3134,7 +3149,7 @@ fn replay_history(
                     {
                         connection.send_notification(SessionNotification::new(
                             session_id.clone(),
-                            agent_client_protocol::schema::v1::SessionUpdate::Plan(plan),
+                            agent_client_protocol::v1::schema::SessionUpdate::Plan(plan),
                         ))?;
                     }
                     pending_calls.push(call.id.clone());
@@ -3150,7 +3165,7 @@ fn replay_history(
                             ToolOutcomeStatus::Cancelled => ToolCallStatus::Failed,
                         });
                     let mut content = vec![ToolCallContent::Content(
-                        agent_client_protocol::schema::v1::Content::new(ContentBlock::Text(
+                        agent_client_protocol::v1::schema::Content::new(ContentBlock::Text(
                             TextContent::new(
                                 message
                                     .content
@@ -3165,7 +3180,7 @@ fn replay_history(
                             if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone())
                             {
                                 content.push(ToolCallContent::Content(
-                                    agent_client_protocol::schema::v1::Content::new(block),
+                                    agent_client_protocol::v1::schema::Content::new(block),
                                 ));
                             }
                         }
@@ -3179,7 +3194,7 @@ fn replay_history(
                         .raw_output(outcome.map(|outcome| outcome.raw_output.clone()));
                     connection.send_notification(SessionNotification::new(
                         session_id.clone(),
-                        agent_client_protocol::schema::v1::SessionUpdate::ToolCallUpdate(
+                        agent_client_protocol::v1::schema::SessionUpdate::ToolCallUpdate(
                             ToolCallUpdate::new(tool_call_id.clone(), fields),
                         ),
                     ))?;
@@ -3192,7 +3207,7 @@ fn replay_history(
     for tool_call_id in pending_calls {
         connection.send_notification(SessionNotification::new(
             session_id.clone(),
-            agent_client_protocol::schema::v1::SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            agent_client_protocol::v1::schema::SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
                 tool_call_id,
                 ToolCallUpdateFields::new().status(ToolCallStatus::Failed),
             )),
@@ -3205,9 +3220,9 @@ fn replay_history(
         for block in blocks {
             connection.send_notification(SessionNotification::new(
                 session_id.clone(),
-                agent_client_protocol::schema::v1::SessionUpdate::UserMessageChunk(
+                agent_client_protocol::v1::schema::SessionUpdate::UserMessageChunk(
                     ContentChunk::new(block).message_id(
-                        agent_client_protocol::schema::v1::MessageId::new(
+                        agent_client_protocol::v1::schema::MessageId::new(
                             pending.message_id.clone(),
                         ),
                     ),
@@ -3217,7 +3232,7 @@ fn replay_history(
     }
     connection.send_notification(SessionNotification::new(
         session_id.clone(),
-        agent_client_protocol::schema::v1::SessionUpdate::SessionInfoUpdate(
+        agent_client_protocol::v1::schema::SessionUpdate::SessionInfoUpdate(
             SessionInfoUpdate::new().title(record.title.clone()),
         ),
     ))?;
@@ -3231,7 +3246,7 @@ fn replay_history(
             };
             connection.send_notification(SessionNotification::new(
                 session_id.clone(),
-                agent_client_protocol::schema::v1::SessionUpdate::CompactionUpdate(
+                agent_client_protocol::v1::schema::SessionUpdate::CompactionUpdate(
                     CompactionUpdate::new(compaction.id.clone(), status),
                 ),
             ))?;
@@ -3250,7 +3265,7 @@ fn send_replay_thought(
         ContentChunk::new(ContentBlock::Text(TextContent::new(text))).message_id(message_id);
     connection.send_notification(SessionNotification::new(
         session_id.clone(),
-        agent_client_protocol::schema::v1::SessionUpdate::AgentThoughtChunk(content),
+        agent_client_protocol::v1::schema::SessionUpdate::AgentThoughtChunk(content),
     ))
 }
 

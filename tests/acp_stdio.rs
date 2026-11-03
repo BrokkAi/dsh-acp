@@ -1377,9 +1377,12 @@ async fn a_rejected_initialize_is_answered_before_the_server_exits() {
                 "{case}"
             );
         }
+        // A rejected initialize leaves the connection open for a retry; the
+        // server exits cleanly once the client closes stdin.
+        drop(peer.stdin);
         let status = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait())
             .await
-            .unwrap_or_else(|_| panic!("server did not exit after rejecting {case}"))
+            .unwrap_or_else(|_| panic!("server did not exit after stdin closed ({case})"))
             .unwrap();
         assert!(status.success(), "{case}: server exited with {status}");
     }

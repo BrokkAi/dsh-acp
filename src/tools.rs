@@ -6,8 +6,9 @@ use std::{
 };
 
 use agent_client_protocol::{
-    Client, ConnectionTo,
-    schema::v1::{
+    Client,
+    v1::ConnectionTo,
+    v1::schema::{
         ClientCapabilities, CreateTerminalRequest, EnvVariable, KillTerminalRequest,
         ReleaseTerminalRequest, SessionNotification, SessionUpdate, Terminal, TerminalId,
         TerminalOutputRequest, ToolCallContent, ToolCallStatus, ToolCallUpdate,
@@ -475,7 +476,7 @@ pub fn error_result(context: &str, error: &agent_client_protocol::Error) -> Tool
 /// request itself answers `-32800`, which names no reason; that fails only
 /// this call, because only the turn's own cancellation ends the turn.
 pub fn ask_user_failed(error: &agent_client_protocol::Error) -> ToolResult {
-    if error.code == agent_client_protocol::ErrorCode::RequestCancelled {
+    if error.code == agent_client_protocol::ErrorCode::REQUEST_CANCELLED {
         let reason = "the client cancelled the request";
         return ToolResult {
             text: format!("Unable to request user input: {reason}"),
@@ -491,7 +492,7 @@ pub fn ask_user_failed(error: &agent_client_protocol::Error) -> ToolResult {
 /// `-32800`, which names no reason; that fails only this call, because only
 /// the turn's own cancellation ends the turn.
 pub fn permission_request_failed(error: &agent_client_protocol::Error) -> ToolResult {
-    let reason = if error.code == agent_client_protocol::ErrorCode::RequestCancelled {
+    let reason = if error.code == agent_client_protocol::ErrorCode::REQUEST_CANCELLED {
         "the client cancelled the permission request".to_string()
     } else {
         error_reason(error)
@@ -1274,7 +1275,9 @@ pub async fn preview_diff(
             let content = required_string(arguments, "content").ok()?;
             let old_text = match workspace.open_existing(requested) {
                 Ok((_, mut file)) => Some(read_open_text(&mut file, MAX_EDIT_FILE_BYTES).ok()?),
-                Err(error) if error.code == agent_client_protocol::ErrorCode::ResourceNotFound => {
+                Err(error)
+                    if error.code == agent_client_protocol::ErrorCode::RESOURCE_NOT_FOUND =>
+                {
                     None
                 }
                 // Not text, a directory, or unreadable: showing it as a new
@@ -1476,7 +1479,7 @@ async fn run_command_via_client(
     .await;
     let exit = match wait {
         Ok(Ok(exit)) => exit,
-        Ok(Err(error)) if error.code == agent_client_protocol::ErrorCode::RequestCancelled => {
+        Ok(Err(error)) if error.code == agent_client_protocol::ErrorCode::REQUEST_CANCELLED => {
             let _ = connection
                 .send_request(KillTerminalRequest::new(
                     session.id.clone(),
@@ -1857,7 +1860,7 @@ fn resolve_existing_path(
 ) -> Result<PathBuf, agent_client_protocol::Error> {
     let path = candidate_path(session, path);
     let canonical = path.canonicalize().map_err(|error| {
-        agent_client_protocol::Error::resource_not_found(Some(path.display().to_string()))
+        crate::workspace::resource_not_found(Some(path.display().to_string()))
             .data(error.to_string())
     })?;
     ensure_in_roots(session, &canonical)?;
@@ -2337,7 +2340,7 @@ mod tests {
         .expect_err("an explicitly sensitive search root must be refused");
         assert_eq!(
             direct.code,
-            agent_client_protocol::ErrorCode::InvalidRequest
+            agent_client_protocol::ErrorCode::INVALID_REQUEST
         );
     }
 

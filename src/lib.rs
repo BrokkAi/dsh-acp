@@ -10,6 +10,7 @@ pub mod session_set_title;
 pub mod session_status;
 pub mod tools;
 pub mod v2_agent;
+mod version_gate;
 pub mod workspace;
 
 pub use agent::run;

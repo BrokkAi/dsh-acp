@@ -728,15 +728,18 @@ async fn one_acp_connection_is_served_at_a_time() {
     assert!(response.headers().get("acp-connection-id").is_none());
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["error"]["code"], -32022, "{body}");
-    // Over WebSocket the error arrives and only that connection ends.
+    // Over WebSocket the error arrives and the connection stays open,
+    // uninitialized, so the client can retry with corrected parameters.
     let mut rejected = Peer::connect(&server.ws_url(), &server.token);
     rejected.send(unsupported);
     let reply = rejected.next_message().await;
     assert_eq!(reply["error"]["code"], -32022, "{reply}");
-    let closed = tokio::time::timeout(TIMEOUT, rejected.channel.rx.next())
-        .await
-        .expect("the rejected connection should close");
-    assert!(closed.is_none(), "{closed:?}");
+    rejected
+        .request(
+            "initialize",
+            json!({"protocolVersion": 1, "clientCapabilities": {}}),
+        )
+        .await;
     rejected.close().await;
 
     let mut peer = Peer::connect(&server.ws_url(), &server.token);

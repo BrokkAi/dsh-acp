@@ -22,5 +22,5 @@ pub(crate) fn requested_session_id(params: &Value) -> Result<&str, Error> {
 
 /// The error for a session the agent does not know.
 pub(crate) fn unknown_session(session_id: &str) -> Error {
-    Error::resource_not_found(None).data(json!({ "sessionId": session_id }))
+    crate::workspace::resource_not_found(None).data(json!({ "sessionId": session_id }))
 }

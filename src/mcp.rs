@@ -7,12 +7,13 @@ use std::{
 };
 
 use agent_client_protocol::{
-    Client, ConnectionTo, Error, V2ConnectionTo,
+    Client, Error,
     mcp_server::MCP_SERVER_UNAVAILABLE,
-    schema::{
-        v1::{self, EnvVariable, HttpHeader, McpServer},
-        v2,
+    v1::{
+        ConnectionTo,
+        schema::{self as v1, EnvVariable, HttpHeader, McpServer},
     },
+    v2::{ConnectionTo as V2ConnectionTo, schema as v2},
 };
 use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
@@ -198,7 +199,7 @@ impl McpSession {
                         .into_iter()
                         .map(|tool| McpToolMetadata::new(client.name(), tool)),
                 ),
-                Err(error) if error.code == agent_client_protocol::ErrorCode::RequestCancelled => {
+                Err(error) if error.code == agent_client_protocol::ErrorCode::REQUEST_CANCELLED => {
                     return Err(error);
                 }
                 Err(error) => {
@@ -297,7 +298,7 @@ fn registration_unavailable(error: &Error) -> bool {
         .as_ref()
         .and_then(|data| data.pointer("/acpError/code"))
         .and_then(Value::as_i64)
-        == Some(i64::from(MCP_SERVER_UNAVAILABLE))
+        == Some(i64::from(MCP_SERVER_UNAVAILABLE.value()))
 }
 
 /// A `serverId` names one registration, so declaring it twice for a session
@@ -1697,7 +1698,7 @@ mod tests {
         )
         .await
         .expect_err("a repeated serverId should be rejected");
-        assert_eq!(error.code, agent_client_protocol::ErrorCode::InvalidParams);
+        assert_eq!(error.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
     }
 
     /// A stdio server that runs `script` with `/bin/sh`, with `args` as `$1`
@@ -1707,7 +1708,7 @@ mod tests {
         let mut argv = vec!["-c".to_string(), script.to_string(), "sh".to_string()];
         argv.extend(args.iter().map(ToString::to_string));
         McpServer::Stdio(
-            agent_client_protocol::schema::v1::McpServerStdio::new(name, "/bin/sh").args(argv),
+            agent_client_protocol::v1::schema::McpServerStdio::new(name, "/bin/sh").args(argv),
         )
     }
 
@@ -1901,7 +1902,7 @@ mod tests {
             }
         });
         let message = connect_error(McpServer::Http(
-            agent_client_protocol::schema::v1::McpServerHttp::new("remote", url),
+            agent_client_protocol::v1::schema::McpServerHttp::new("remote", url),
         ))
         .await;
         assert!(message.contains("MCP server `remote`"), "{message}");

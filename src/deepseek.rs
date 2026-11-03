@@ -921,7 +921,7 @@ mod tests {
             let error = DeepSeekClient::new(&config)
                 .err()
                 .expect("a blank key is not a key");
-            assert_eq!(error.code, agent_client_protocol::ErrorCode::AuthRequired);
+            assert_eq!(error.code, agent_client_protocol::ErrorCode::AUTH_REQUIRED);
             assert_eq!(
                 error.data,
                 Some(json!(
