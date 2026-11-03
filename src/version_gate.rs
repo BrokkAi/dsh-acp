@@ -15,12 +15,15 @@ use agent_client_protocol::{
     v2::schema as v2,
 };
 use futures_util::StreamExt;
+use tokio_util::sync::CancellationToken;
 
 /// The versions the agent's protocol router serves.
 const SUPPORTED: [ProtocolVersion; 2] = [ProtocolVersion::V1, ProtocolVersion::V2];
 
-/// Wraps an agent so `initialize` requests below v1 get `-32022` until the
-/// connection is initialized. Every other frame passes through unchanged.
+/// Wraps an agent so `initialize` requests below v1 get `-32022`. Before
+/// initialization the error lists every supported version; afterwards only
+/// the selected one, since the connection cannot switch versions. Every other
+/// frame passes through unchanged.
 pub(crate) struct VersionGate<C>(pub(crate) C);
 
 /// What the gate has seen of the `initialize` exchange.
@@ -29,9 +32,8 @@ struct Negotiation {
     /// IDs of `initialize` requests forwarded to the agent and not yet
     /// answered.
     pending: Vec<RawJsonRpcId>,
-    /// Set once the agent answers an `initialize` successfully. Repeats after
-    /// that are negotiated by the selected implementation alone.
-    initialized: bool,
+    /// The version the latest successful `initialize` selected.
+    selected: Option<ProtocolVersion>,
 }
 
 impl<C: ConnectTo<Client>> ConnectTo<Client> for VersionGate<C> {
@@ -39,6 +41,9 @@ impl<C: ConnectTo<Client>> ConnectTo<Client> for VersionGate<C> {
         let (gate_agent, agent_end) = Channel::duplex();
         let (gate_client, client_end) = Channel::duplex();
         let negotiation = Arc::new(Mutex::new(Negotiation::default()));
+        // Set when the agent side closes, so the client side closes too
+        // instead of waiting for the client to hang up.
+        let agent_closed = CancellationToken::new();
 
         let Channel {
             rx: mut from_client,
@@ -54,15 +59,21 @@ impl<C: ConnectTo<Client>> ConnectTo<Client> for VersionGate<C> {
         let inbound = {
             let negotiation = negotiation.clone();
             let to_client = to_client.clone();
+            let agent_closed = agent_closed.clone();
             async move {
-                while let Some(frame) = from_client.next().await {
+                loop {
+                    let frame = tokio::select! {
+                        frame = from_client.next() => frame,
+                        () = agent_closed.cancelled() => None,
+                    };
+                    let Some(frame) = frame else { break };
                     let mut state = negotiation.lock().unwrap_or_else(PoisonError::into_inner);
-                    if !state.initialized
-                        && let Some((id, requested)) = initialize_request(&frame)
-                    {
+                    if let Some((id, requested)) = initialize_request(&frame) {
                         if requested < ProtocolVersion::V1 {
+                            let supported = state.selected.map_or(SUPPORTED.to_vec(), |v| vec![v]);
                             drop(state);
-                            let _ = to_client.unbounded_send(unsupported(id, requested));
+                            let _ =
+                                to_client.unbounded_send(unsupported(id, requested, &supported));
                             continue;
                         }
                         state.pending.push(id);
@@ -81,9 +92,13 @@ impl<C: ConnectTo<Client>> ConnectTo<Client> for VersionGate<C> {
                     let mut state = negotiation.lock().unwrap_or_else(PoisonError::into_inner);
                     if let Some(index) = state.pending.iter().position(|id| id == response.id()) {
                         state.pending.swap_remove(index);
-                        if matches!(response, RawJsonRpcResponse::Result { .. }) {
-                            state.initialized = true;
-                            state.pending.clear();
+                        if let RawJsonRpcResponse::Result { result, .. } = response
+                            && let Some(version) = result
+                                .get("protocolVersion")
+                                .cloned()
+                                .and_then(|version| serde_json::from_value(version).ok())
+                        {
+                            state.selected = Some(version);
                         }
                     }
                 }
@@ -91,6 +106,7 @@ impl<C: ConnectTo<Client>> ConnectTo<Client> for VersionGate<C> {
                     break;
                 }
             }
+            agent_closed.cancel();
             Ok::<(), Error>(())
         };
 
@@ -121,8 +137,12 @@ fn initialize_request(frame: &TransportFrame) -> Option<(RawJsonRpcId, ProtocolV
     Some((request.id.clone(), requested))
 }
 
-fn unsupported(id: RawJsonRpcId, requested: ProtocolVersion) -> TransportFrame {
-    let error: Error = v2::Error::unsupported_protocol_version(requested, &SUPPORTED).into();
+fn unsupported(
+    id: RawJsonRpcId,
+    requested: ProtocolVersion,
+    supported: &[ProtocolVersion],
+) -> TransportFrame {
+    let error: Error = v2::Error::unsupported_protocol_version(requested, supported).into();
     TransportFrame::Single(RawJsonRpcMessage::Response(RawJsonRpcResponse::new(
         id,
         Err(Box::new(RawJsonRpcError::from(error))),

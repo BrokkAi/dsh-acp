@@ -2385,12 +2385,7 @@ fn send_command_terminal(
     let exit_status = (!failed && (raw.get("exit_code").is_some() || raw.get("signal").is_some()))
         .then(|| {
             TerminalExitStatus::new()
-                .exit_code(
-                    raw.get("exit_code")
-                        .and_then(Value::as_u64)
-                        .and_then(|code| u32::try_from(code).ok())
-                        .map(i64::from),
-                )
+                .exit_code(raw.get("exit_code").and_then(Value::as_i64))
                 .signal(
                     raw.get("signal")
                         .and_then(Value::as_str)
