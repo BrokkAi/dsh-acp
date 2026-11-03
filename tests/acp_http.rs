@@ -716,10 +716,13 @@ async fn one_acp_connection_is_served_at_a_time() {
     }
     let server = Server::start(temp.path(), None, &[]).await;
     // A rejected initialize answers on its POST and leaves the slot free.
-    let mut unsupported = initialize_request(1);
-    unsupported["params"]["protocolVersion"] = json!(0);
+    let mut invalid = initialize_request(1);
+    invalid["params"]
+        .as_object_mut()
+        .unwrap()
+        .remove("protocolVersion");
     let response = server
-        .post(&unsupported)
+        .post(&invalid)
         .header(header::AUTHORIZATION, server.bearer())
         .send()
         .await
@@ -727,13 +730,13 @@ async fn one_acp_connection_is_served_at_a_time() {
     assert_eq!(response.status(), StatusCode::OK);
     assert!(response.headers().get("acp-connection-id").is_none());
     let body: Value = response.json().await.unwrap();
-    assert_eq!(body["error"]["code"], -32022, "{body}");
+    assert_eq!(body["error"]["code"], -32602, "{body}");
     // Over WebSocket the error arrives and the connection stays open,
     // uninitialized, so the client can retry with corrected parameters.
     let mut rejected = Peer::connect(&server.ws_url(), &server.token);
-    rejected.send(unsupported);
+    rejected.send(invalid);
     let reply = rejected.next_message().await;
-    assert_eq!(reply["error"]["code"], -32022, "{reply}");
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
     rejected
         .request(
             "initialize",
