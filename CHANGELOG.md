@@ -6,6 +6,24 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ## Unreleased
 
+## 0.6.1 - 2026-11-04
+
+### Changed
+
+- `agent-client-protocol` is now 5.0.0 (schema 1.15.1). dsh-acp uses its
+  versioned v1/v2 modules and version-neutral error types, and follows the
+  schema 1.15 v2 changes: `AvailableCommand` is an enum, terminal exit codes
+  are `i64`, and permission outcomes include `CancelledPermissionOutcome`.
+
+### Fixed
+
+- Repeating an `initialize` that selects a protocol version below v1 is now
+  rejected with `-32022` naming only that version, instead of reaching the v1
+  handler.
+- The client side ends when the agent side closes, instead of waiting for the
+  client to hang up.
+- v2 terminal exit codes pass through as `i64`.
+
 ## 0.6.0 - 2026-10-29
 
 ### Security
