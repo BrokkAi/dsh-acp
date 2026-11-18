@@ -6,6 +6,14 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ## Unreleased
 
+### Fixed
+
+- The environment variables of command-line switches, such as
+  `DSH_ACP_ALLOW_INSECURE_MCP_HTTP`, `DSH_ACP_DISABLE_WEB`, and
+  `DSH_ACP_TRACE`, accept `1`, `yes`, and `on` (and `0`, `no`, `off`) as well
+  as `true` and `false`. `=1`, which the documentation and an error message
+  recommend, used to stop the agent at startup.
+
 ### Added
 
 - `session/options` (unstable), in both protocol versions: returns the config

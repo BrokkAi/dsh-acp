@@ -92,11 +92,13 @@ struct Cli {
     mcp_connect_timeout_secs: u64,
 
     /// Permit plaintext HTTP MCP URLs outside loopback.
-    #[arg(long, env = "DSH_ACP_ALLOW_INSECURE_MCP_HTTP", default_value_t = false)]
+    #[arg(long, env = "DSH_ACP_ALLOW_INSECURE_MCP_HTTP", action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new())]
     allow_insecure_mcp_http: bool,
 
     /// Disable web_fetch even when tools are available.
-    #[arg(long, env = "DSH_ACP_DISABLE_WEB", default_value_t = false)]
+    #[arg(long, env = "DSH_ACP_DISABLE_WEB", action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new())]
     disable_web: bool,
 
     /// Never ask DeepSeek for prompt suggestions, even for a client that
@@ -105,12 +107,14 @@ struct Cli {
     #[arg(
         long,
         env = "DSH_ACP_DISABLE_PROMPT_SUGGESTIONS",
-        default_value_t = false
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new()
     )]
     disable_prompt_suggestions: bool,
 
     /// Include protocol traffic diagnostics on stderr (never writes stdout).
-    #[arg(long, env = "DSH_ACP_TRACE", default_value_t = false)]
+    #[arg(long, env = "DSH_ACP_TRACE", action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new())]
     trace: bool,
 
     /// Serve ACP over streamable HTTP and WebSocket at http://ADDR/acp
@@ -131,7 +135,8 @@ struct Cli {
     /// plain HTTP, so the token and everything the agent sends cross the
     /// network unencrypted. Prefer listening on loopback and forwarding the
     /// port over SSH.
-    #[arg(long, env = "DSH_ACP_LISTEN_ALLOW_REMOTE", default_value_t = false)]
+    #[arg(long, env = "DSH_ACP_LISTEN_ALLOW_REMOTE", action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new())]
     listen_allow_remote: bool,
 }
 

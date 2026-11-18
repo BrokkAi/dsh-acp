@@ -55,20 +55,26 @@ pub(crate) fn user_home() -> Option<PathBuf> {
     std::env::home_dir().filter(|home| home.is_absolute())
 }
 
-/// The directories searched for skills.
-pub(crate) struct SkillRoots<'a> {
+/// The directories searched for skills. It owns its paths so a search can
+/// run on a blocking thread.
+pub(crate) struct SkillRoots {
     /// The session's cwd and additional directories, for project skills.
-    pub(crate) workspace: Vec<&'a Path>,
+    pub(crate) workspace: Vec<PathBuf>,
     /// The user's home directory, for the user's own skills.
-    pub(crate) home: Option<&'a Path>,
+    pub(crate) home: Option<PathBuf>,
 }
 
-impl SkillRoots<'_> {
+impl SkillRoots {
     /// Each root whose `.agents/skills` may hold skills, in order of
     /// precedence: project skills override the user's.
     fn roots(&self) -> Vec<&Path> {
         let mut roots = Vec::new();
-        for root in self.workspace.iter().copied().chain(self.home) {
+        for root in self
+            .workspace
+            .iter()
+            .chain(&self.home)
+            .map(PathBuf::as_path)
+        {
             if !roots.contains(&root) {
                 roots.push(root);
             }
@@ -81,6 +87,9 @@ impl SkillRoots<'_> {
     /// earlier skill already has, is left out and logged, so names stay
     /// unique in the command list. A skill that cannot be read or has no
     /// description is left out and logged; it never fails the session.
+    ///
+    /// This reads the filesystem synchronously. Call it from a blocking
+    /// thread.
     pub(crate) fn discover(&self, reserved: &[&str]) -> Vec<Skill> {
         let mut skills = Vec::<Skill>::new();
         for root in self.roots() {
@@ -122,13 +131,6 @@ impl SkillRoots<'_> {
             }
         }
         skills
-    }
-
-    /// The skill named `name`, as [`Self::discover`] lists it.
-    pub(crate) fn find(&self, name: &str, reserved: &[&str]) -> Option<Skill> {
-        self.discover(reserved)
-            .into_iter()
-            .find(|skill| skill.name == name)
     }
 }
 
@@ -256,43 +258,59 @@ fn split_frontmatter(text: &str) -> (Option<&str>, &str) {
     (None, text)
 }
 
-/// A top-level string scalar of a frontmatter block: a plain or quoted value
-/// on the key's line, or a `>` or `|` block, or a plain value continued on
-/// the indented lines below it. Line breaks become spaces. A plain value may
-/// contain a colon, which strict YAML refuses but other clients accept.
+/// A top-level string scalar of a frontmatter block.
+///
+/// This is a best-effort reader for the two fields a skill needs, not a YAML
+/// parser. It reads a quoted value on the key's line, a `>` or `|` block, or
+/// a plain value with the indented lines that continue it, and joins lines
+/// with spaces. Escapes inside quotes are kept as written. A plain value may
+/// contain a colon, which strict YAML refuses but other clients accept, and
+/// ends at a ` #` comment.
 fn frontmatter_scalar(frontmatter: &str, key: &str) -> Option<String> {
     let mut lines = frontmatter.lines();
     let first = lines.by_ref().find_map(|line| {
-        line.strip_prefix(key)
-            .and_then(|rest| rest.strip_prefix(':'))
-            .map(|value| value.trim().to_string())
+        let value = line.strip_prefix(key)?.trim_start().strip_prefix(':')?;
+        (value.is_empty() || value.starts_with([' ', '\t'])).then(|| value.trim())
     })?;
+    if let Some(quote) = first.chars().next().filter(|c| matches!(c, '"' | '\'')) {
+        let inner = &first[1..];
+        let value = inner[..inner.find(quote)?].trim();
+        return (!value.is_empty()).then(|| value.to_string());
+    }
+    let first = strip_comment(first);
+    let block = matches!(first, ">" | "|" | ">-" | "|-" | ">+" | "|+");
     let mut parts = Vec::new();
-    if !matches!(first.as_str(), ">" | "|" | ">-" | "|-" | ">+" | "|+") {
+    if !block {
         parts.push(first);
     }
     for line in lines {
         if !line.starts_with([' ', '\t']) && !line.trim().is_empty() {
             break;
         }
-        parts.push(line.trim().to_string());
+        // A `#` inside a block scalar is text, not a comment.
+        parts.push(if block {
+            line.trim()
+        } else {
+            strip_comment(line.trim())
+        });
     }
     let joined = parts
-        .iter()
+        .into_iter()
         .filter(|part| !part.is_empty())
-        .cloned()
         .collect::<Vec<_>>()
         .join(" ");
-    let unquoted = ['"', '\'']
-        .into_iter()
-        .find_map(|quote| {
-            joined
-                .strip_prefix(quote)
-                .and_then(|inner| inner.strip_suffix(quote))
-        })
-        .unwrap_or(&joined)
-        .trim();
-    (!unquoted.is_empty()).then(|| unquoted.to_string())
+    (!joined.is_empty()).then_some(joined)
+}
+
+/// A plain YAML value without its trailing comment.
+fn strip_comment(value: &str) -> &str {
+    if value.starts_with('#') {
+        return "";
+    }
+    match value.find(" #") {
+        Some(comment) => value[..comment].trim_end(),
+        None => value,
+    }
 }
 
 #[cfg(test)]
@@ -303,6 +321,13 @@ mod tests {
         let directory = root.join(SKILLS_DIR).join(directory);
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join(SKILL_FILE), text).unwrap();
+    }
+
+    fn find(roots: &SkillRoots, name: &str, reserved: &[&str]) -> Option<Skill> {
+        roots
+            .discover(reserved)
+            .into_iter()
+            .find(|skill| skill.name == name)
     }
 
     fn skill_file(name: &str, description: &str, body: &str) -> String {
@@ -339,6 +364,30 @@ mod tests {
         );
         assert_eq!(frontmatter_scalar(block, "name"), None);
         assert_eq!(frontmatter_scalar("names: x\nname:\n", "name"), None);
+
+        // Comments, quotes with text after them, and a space before the colon.
+        let block = "name : review  # the skill\ndescription: \"Review: it\"  # note\n";
+        assert_eq!(frontmatter_scalar(block, "name").unwrap(), "review");
+        assert_eq!(
+            frontmatter_scalar(block, "description").unwrap(),
+            "Review: it"
+        );
+        assert_eq!(
+            frontmatter_scalar("description: 'Use # here' # not here\n", "description").unwrap(),
+            "Use # here"
+        );
+        assert_eq!(
+            frontmatter_scalar("description: |\n  Step # one\n", "description").unwrap(),
+            "Step # one"
+        );
+        assert_eq!(
+            frontmatter_scalar("description: # nothing\n", "description"),
+            None
+        );
+        assert_eq!(
+            frontmatter_scalar("description: \"unclosed\n", "description"),
+            None
+        );
     }
 
     #[test]
@@ -399,8 +448,8 @@ mod tests {
         write_skill(cwd.path(), "bad name", "---\ndescription: Bad\n---\nBody\n");
 
         let roots = SkillRoots {
-            workspace: vec![cwd.path(), extra.path()],
-            home: Some(home.path()),
+            workspace: vec![cwd.path().to_path_buf(), extra.path().to_path_buf()],
+            home: Some(home.path().to_path_buf()),
         };
         let skills = roots.discover(&["help"]);
         let listed = skills
@@ -426,8 +475,11 @@ mod tests {
         );
         assert!(skills[2].path.ends_with(".agents/skills/review/SKILL.md"));
 
-        assert_eq!(roots.find("notes", &["help"]).as_ref(), Some(&skills[5]));
-        assert_eq!(roots.find("renamed", &["help"]).as_ref(), Some(&skills[0]));
+        assert_eq!(find(&roots, "notes", &["help"]).as_ref(), Some(&skills[5]));
+        assert_eq!(
+            find(&roots, "renamed", &["help"]).as_ref(),
+            Some(&skills[0])
+        );
         for unknown in [
             "help",
             "a-dir",
@@ -437,16 +489,16 @@ mod tests {
             "../review",
             "",
         ] {
-            assert_eq!(roots.find(unknown, &["help"]), None, "{unknown}");
+            assert_eq!(find(&roots, unknown, &["help"]), None, "{unknown}");
         }
 
         // Without a home directory, only project skills are found.
         let roots = SkillRoots {
-            workspace: vec![cwd.path()],
+            workspace: vec![cwd.path().to_path_buf()],
             home: None,
         };
-        assert!(roots.find("notes", &[]).is_none());
-        assert!(roots.find("review", &[]).is_some());
+        assert!(find(&roots, "notes", &[]).is_none());
+        assert!(find(&roots, "review", &[]).is_some());
     }
 
     #[cfg(unix)]
@@ -465,11 +517,11 @@ mod tests {
             .unwrap();
 
         let roots = SkillRoots {
-            workspace: vec![cwd.path()],
+            workspace: vec![cwd.path().to_path_buf()],
             home: None,
         };
         assert!(roots.discover(&[]).is_empty());
-        assert_eq!(roots.find("leak", &[]), None);
+        assert_eq!(find(&roots, "leak", &[]), None);
     }
 
     #[test]
@@ -481,10 +533,10 @@ mod tests {
             &skill_file("review", "Review", "\nRead scripts/check.sh.\n"),
         );
         let roots = SkillRoots {
-            workspace: vec![cwd.path()],
+            workspace: vec![cwd.path().to_path_buf()],
             home: None,
         };
-        let text = roots.find("review", &[]).unwrap().prompt_text();
+        let text = find(&roots, "review", &[]).unwrap().prompt_text();
         assert!(text.starts_with("The user invoked the skill \"review\""));
         assert!(text.ends_with("<skill name=\"review\">\nRead scripts/check.sh.\n</skill>"));
         assert!(!text.contains("description:"));
