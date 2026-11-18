@@ -6,13 +6,7 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ## Unreleased
 
-### Fixed
-
-- The environment variables of command-line switches, such as
-  `DSH_ACP_ALLOW_INSECURE_MCP_HTTP`, `DSH_ACP_DISABLE_WEB`, and
-  `DSH_ACP_TRACE`, accept `1`, `yes`, and `on` (and `0`, `no`, `off`) as well
-  as `true` and `false`. `=1`, which the documentation and an error message
-  recommend, used to stop the agent at startup.
+## 0.7.0 - 2026-11-18
 
 ### Added
 
@@ -40,7 +34,10 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 ### Changed
 
 - `agent-client-protocol` is now 5.3.0 (schema 1.18.0), and the other
-  dependencies are at their latest compatible releases.
+  dependencies are at their latest compatible releases. dsh-acp uses its
+  versioned v1/v2 modules and version-neutral error types, and follows the
+  schema 1.15 v2 changes: `AvailableCommand` is an enum, terminal exit codes
+  are `i64`, and permission outcomes include `CancelledPermissionOutcome`.
 - The draft `auth/status`, `session/status`, and `session/set_title` methods
   now use the SDK's types and so follow the current drafts. Clients written
   against the earlier shapes need these changes:
@@ -53,17 +50,13 @@ All notable changes to `dsh-acp` are recorded here. The format follows
   - The `session/set_title` capability is `title` instead of `setTitle`. The
     method and its result are unchanged.
 
-## 0.6.1 - 2026-11-04
-
-### Changed
-
-- `agent-client-protocol` is now 5.0.0 (schema 1.15.1). dsh-acp uses its
-  versioned v1/v2 modules and version-neutral error types, and follows the
-  schema 1.15 v2 changes: `AvailableCommand` is an enum, terminal exit codes
-  are `i64`, and permission outcomes include `CancelledPermissionOutcome`.
-
 ### Fixed
 
+- The environment variables of command-line switches, such as
+  `DSH_ACP_ALLOW_INSECURE_MCP_HTTP`, `DSH_ACP_DISABLE_WEB`, and
+  `DSH_ACP_TRACE`, accept `1`, `yes`, and `on` (and `0`, `no`, `off`) as well
+  as `true` and `false`. `=1`, which the documentation and an error message
+  recommend, used to stop the agent at startup.
 - Repeating an `initialize` that selects a protocol version below v1 is now
   rejected with `-32022` naming only that version, instead of reaching the v1
   handler.
