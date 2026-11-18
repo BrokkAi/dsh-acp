@@ -478,16 +478,16 @@ impl SessionStore {
     }
 
     /// Where skills are searched for a session with these workspace roots.
-    pub(crate) fn skill_roots<'a>(
-        &'a self,
-        cwd: &'a Path,
-        additional_directories: &'a [PathBuf],
-    ) -> crate::skills::SkillRoots<'a> {
+    pub(crate) fn skill_roots(
+        &self,
+        cwd: &Path,
+        additional_directories: &[PathBuf],
+    ) -> crate::skills::SkillRoots {
         crate::skills::SkillRoots {
-            workspace: std::iter::once(cwd)
-                .chain(additional_directories.iter().map(PathBuf::as_path))
+            workspace: std::iter::once(cwd.to_path_buf())
+                .chain(additional_directories.iter().cloned())
                 .collect(),
-            home: self.home.as_deref(),
+            home: self.home.as_deref().map(Path::to_path_buf),
         }
     }
 

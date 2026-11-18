@@ -980,10 +980,8 @@ impl V2Harness {
             .is_some_and(|commands| commands.skill.is_some());
         if takes_skills {
             commands.extend(
-                self.base
-                    .store
-                    .skill_roots(cwd, additional_directories)
-                    .discover(COMMAND_NAMES)
+                self.skills(cwd, additional_directories)
+                    .await
                     .into_iter()
                     .map(|skill| {
                         AvailableCommand::Skill(
@@ -994,6 +992,28 @@ impl V2Harness {
             );
         }
         commands
+    }
+
+    /// The skills of a session with these workspace roots, read from disk on
+    /// a blocking thread.
+    async fn skills(
+        &self,
+        cwd: &Path,
+        additional_directories: &[PathBuf],
+    ) -> Vec<crate::skills::Skill> {
+        let roots = self.base.store.skill_roots(cwd, additional_directories);
+        tokio::task::spawn_blocking(move || {
+            let reserved = HARNESS_COMMANDS
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>();
+            roots.discover(&reserved)
+        })
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(?error, "skill discovery failed");
+            Vec::new()
+        })
     }
 
     /// Splits a prompt into the skill it invokes, if any, and its other
@@ -1023,10 +1043,10 @@ impl V2Harness {
             )
         };
         let skill = self
-            .base
-            .store
-            .skill_roots(&cwd, &additional_directories)
-            .find(&reference.name, COMMAND_NAMES)
+            .skills(&cwd, &additional_directories)
+            .await
+            .into_iter()
+            .find(|skill| skill.name == reference.name)
             .ok_or_else(|| {
                 Error::invalid_params().data(format!("unknown skill {}", reference.name))
             })?;
@@ -1125,14 +1145,7 @@ impl V2Harness {
             }
             Err(error) => return responder.respond_with_error(error),
         };
-        // A generated title says what the user wrote, not the skill's text.
-        let skill_title = skill.as_ref().map(|skill| {
-            if prompt.text.trim().is_empty() {
-                skill.name.clone()
-            } else {
-                crate::session::title_from_text(&prompt.text)
-            }
-        });
+        let skill_title = skill_title(skill.as_ref(), &prompt);
         let prompt = prompt.with_skill(skill.as_ref());
         let model = runtime.snapshot().await.config.model;
         if prompt.has_images
@@ -1285,14 +1298,6 @@ impl V2Harness {
             Ok(params) => params,
             Err(error) => return responder.respond_with_error(error),
         };
-        if prompt
-            .iter()
-            .any(|block| matches!(block, ContentBlock::Skill(_)))
-        {
-            return responder.respond_with_error(
-                Error::invalid_params().data("a steering prompt cannot invoke a skill"),
-            );
-        }
         let session_id = v2::SessionId::new(session_id.to_string());
         let runtime = match self.base.store.get(&session_id.to_string()).await {
             Ok(runtime) => runtime,
@@ -1316,14 +1321,25 @@ impl V2Harness {
                 "reason": "noRunningTurn"
             }));
         }
-        let payload = match content_blocks_to_prompt(&prompt) {
-            Ok(payload) if !payload.text.trim().is_empty() || payload.has_images => payload,
+        // A steering prompt invokes a skill as `session/prompt` does.
+        let (skill, own_blocks) = match self.invoked_skill(&runtime, &prompt).await {
+            Ok(invoked) => invoked,
+            Err(error) => return responder.respond_with_error(error),
+        };
+        let payload = match content_blocks_to_prompt(own_blocks) {
+            Ok(payload)
+                if skill.is_some() || !payload.text.trim().is_empty() || payload.has_images =>
+            {
+                payload
+            }
             Ok(_) => {
                 return responder
                     .respond_with_error(Error::invalid_params().data("steering prompt is empty"));
             }
             Err(error) => return responder.respond_with_error(error),
         };
+        let skill_title = skill_title(skill.as_ref(), &payload);
+        let payload = payload.with_skill(skill.as_ref());
         let model = runtime.snapshot().await.config.model;
         if payload.has_images
             && !payload.text.trim().starts_with('/')
@@ -1393,7 +1409,7 @@ impl V2Harness {
                 .insert(message_index.to_string(), message_id.clone());
             state.record.touch();
             if state.record.title.is_none() {
-                state.record.title = session_title(&state.record);
+                state.record.title = skill_title.or_else(|| session_title(&state.record));
             }
             (message_id, message_index, previous_title, prompt_seq)
         };
@@ -3115,17 +3131,21 @@ fn message_content_to_v2_blocks(content: &MessageContent) -> Vec<ContentBlock> {
     }
 }
 
-/// The harness's slash commands. A skill may not take one of these names.
-const COMMAND_NAMES: &[&str] = &["help", "plan", "agent", "model", "status"];
+/// The harness's slash commands: name and description. A skill may not take
+/// one of these names.
+const HARNESS_COMMANDS: &[(&str, &str)] = &[
+    ("help", "Show available harness commands"),
+    ("plan", "Enter read-only planning mode"),
+    ("agent", "Enter agent mode"),
+    ("model", "Show or select the model"),
+    ("status", "Show session configuration"),
+];
 
 fn harness_commands() -> Vec<AvailableCommand> {
-    vec![
-        AvailableCommand::Command(v2::Command::new("help", "Show available harness commands")),
-        AvailableCommand::Command(v2::Command::new("plan", "Enter read-only planning mode")),
-        AvailableCommand::Command(v2::Command::new("agent", "Enter agent mode")),
-        AvailableCommand::Command(v2::Command::new("model", "Show or select the model")),
-        AvailableCommand::Command(v2::Command::new("status", "Show session configuration")),
-    ]
+    HARNESS_COMMANDS
+        .iter()
+        .map(|(name, description)| AvailableCommand::Command(v2::Command::new(*name, *description)))
+        .collect()
 }
 
 fn v2_session_info(record: SessionRecord) -> v2::SessionInfo {
@@ -3175,6 +3195,18 @@ struct V2PromptPayload {
     text: String,
     content: MessageContent,
     has_images: bool,
+}
+
+/// The generated title for a session whose first prompt invokes `skill`:
+/// what the user wrote, or the skill's name, not the skill's text. Taken
+/// from the payload before the skill is added to it.
+fn skill_title(skill: Option<&crate::skills::Skill>, own: &V2PromptPayload) -> Option<String> {
+    let skill = skill?;
+    Some(if own.text.trim().is_empty() {
+        skill.name.clone()
+    } else {
+        crate::session::title_from_text(&own.text)
+    })
 }
 
 impl V2PromptPayload {

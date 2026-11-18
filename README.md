@@ -145,7 +145,8 @@ The binary is `target/release/dsh-acp`.
 ```
 
 Every option has an environment fallback; run `dsh-acp --help` for the complete
-list. The `--listen` token is the exception: it is read only from
+list. A switch's variable takes `1`, `true`, `yes`, or `on` to turn it on, and
+`0`, `false`, `no`, or `off` to leave it off. The `--listen` token is the exception: it is read only from
 `DSH_ACP_LISTEN_TOKEN`.
 
 ## HTTP and WebSocket
@@ -201,7 +202,9 @@ the network unencrypted. To reach the agent from another machine, keep it on
 loopback and forward the port instead, for example `ssh -L
 8787:127.0.0.1:8787 host`. If you do allow remote connections, bind the
 address or host name your clients use: with a wildcard such as `0.0.0.0`, only
-loopback host names pass the `Host` check.
+loopback host names pass the `Host` check. A connected client can also list
+the skills in `~/.agents/skills/`, with their descriptions and paths; see
+[Agent skills](docs/acp-support.md#agent-skills).
 
 ## Instructions
 

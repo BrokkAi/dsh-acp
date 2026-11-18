@@ -335,8 +335,10 @@ these places:
 
 `SKILL.md` starts with YAML frontmatter between `---` lines, which gives the
 skill's `name` and `description`. The rest of the file is the skill's
-instructions. As the format's guide for clients recommends, the rules are
-applied leniently:
+instructions. The frontmatter is read on a best-effort basis, not by a YAML
+parser: `name` and `description` may be plain, quoted, or `>` / `|` block
+values, and anything else in the block is ignored. As the format's guide for
+clients recommends, the rules are applied leniently:
 
 - A project skill overrides a user skill of the same name. Among project
   skills, the earlier root wins. A skill named like a slash command (`help`,
@@ -362,17 +364,30 @@ first block. The skill is read again and its instructions are given to the
 model ahead of the user's own blocks, with its path. The block alone is a
 valid prompt. A generated session title uses the user's text, or the skill's
 name when there is none. Replay returns the prompt as the client sent it.
+`_session/steering` invokes a skill the same way, as does a `session/prompt`
+sent while a turn is running.
+
+The instructions become part of that user message in the session's history.
+They are stored with the session, up to 256 KiB for each invocation, and sent
+to the model again on later turns, so the skill stays in effect, until the
+context budget drops the message.
 
 | Prompt | Answer |
 | --- | --- |
 | A skill the session does not have, including a slash command's name | `-32602` |
 | A `skill` block after the first block, or more than one | `-32602` |
-| A `skill` block in `_session/steering` | `-32602` |
 
 A skill is workspace content, like `AGENTS.md`. Invoking it gives the model its
-instructions for that prompt and nothing else: tools still ask permission as
-the session's policy says. The model does not pick skills itself; only the
-user's `skill` block applies one.
+instructions and nothing else: tools still ask permission as the session's
+policy says. The model does not pick skills itself; only the user's `skill`
+block applies one.
+
+User skills are outside the session's workspace roots. Their names,
+descriptions, and absolute `SKILL.md` paths, which include the home directory,
+are listed to any client that advertises `session.commands.skill`, and an
+invoked skill's instructions are sent to the model provider. Over `--listen`
+that client is whoever holds the token, and with `--listen-allow-remote` the
+listing crosses the network unencrypted.
 
 ## Client system prompts
 

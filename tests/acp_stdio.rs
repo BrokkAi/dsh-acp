@@ -2574,6 +2574,22 @@ async fn v2_lists_skills_and_applies_the_one_a_prompt_invokes() {
     assert!(skill_commands(&session["availableCommands"]).is_empty());
     exit_peer(plain).await;
 
+    // ACP v1 has no skills: a `skill` block is not a v1 content block.
+    let mut v1 = spawn_peer(temp.path(), None).await;
+    v1.request("initialize", initialize_params(1)).await;
+    let v1_session = peer_new_session(&mut v1, &cwd).await;
+    let error = v1
+        .request_error(
+            "session/prompt",
+            json!({
+                "sessionId": v1_session,
+                "prompt": [{"type": "skill", "name": "review"}]
+            }),
+        )
+        .await;
+    assert_eq!(error["code"], -32602, "{error}");
+    exit_peer(v1).await;
+
     let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
     peer.request(
         "initialize",
@@ -2640,7 +2656,7 @@ async fn v2_lists_skills_and_applies_the_one_a_prompt_invokes() {
             "_session/steering",
             json!({
                 "sessionId": session_id,
-                "prompt": [{"type": "skill", "name": "review"}]
+                "prompt": [{"type": "skill", "name": "no-such-skill"}]
             }),
         )
         .await;
@@ -2664,15 +2680,17 @@ async fn v2_lists_skills_and_applies_the_one_a_prompt_invokes() {
         listed_title(&mut peer, &session_id).await,
         "Check the parser change"
     );
-    // A skill needs no input.
-    peer.request(
-        "session/prompt",
-        json!({
-            "sessionId": session_id,
-            "prompt": [{"type": "skill", "name": "notes"}]
-        }),
-    )
-    .await;
+    // A skill needs no input, and a steering prompt invokes one the same way.
+    let steered = peer
+        .request(
+            "_session/steering",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "skill", "name": "notes"}]
+            }),
+        )
+        .await;
+    assert_eq!(steered["outcome"], "startedNewTurn", "{steered}");
     let idle = next_v2_idle(&mut peer).await;
     assert_eq!(idle["params"]["update"]["stopReason"], "end_turn", "{idle}");
 
@@ -2729,6 +2747,47 @@ async fn v2_lists_skills_and_applies_the_one_a_prompt_invokes() {
     assert!(first.ends_with("Check the parser change"), "{first}");
     let second = last_user(&requests[1]);
     assert!(second.contains("Keep notes in NOTES.md."), "{second}");
+}
+
+/// The switches that have an environment variable and can be turned on for
+/// a stdio server. `DSH_ACP_LISTEN_ALLOW_REMOTE` needs `--listen`.
+const SWITCH_VARIABLES: [&str; 4] = [
+    "DSH_ACP_ALLOW_INSECURE_MCP_HTTP",
+    "DSH_ACP_DISABLE_WEB",
+    "DSH_ACP_DISABLE_PROMPT_SUGGESTIONS",
+    "DSH_ACP_TRACE",
+];
+
+#[tokio::test]
+async fn switch_environment_variables_take_the_documented_values() {
+    let temp = tempfile::tempdir().unwrap();
+    let launch = async |value: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_dsh-acp"));
+        command
+            .arg("--data-dir")
+            .arg(temp.path().join("sessions-data"))
+            .env_remove("DSH_ACP_LISTEN")
+            .env_remove("DSH_ACP_LISTEN_ALLOW_REMOTE")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        for variable in SWITCH_VARIABLES {
+            command.env(variable, value);
+        }
+        command.output().await.unwrap()
+    };
+    // The server starts and exits cleanly when its input ends.
+    for value in ["1", "true", "yes", "on", "0", "false", "no", "off"] {
+        let output = launch(value).await;
+        assert!(
+            output.status.success(),
+            "{value}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let output = launch("maybe").await;
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("was not a boolean"));
 }
 
 async fn spawn_peer(data_dir: &std::path::Path, base_url: Option<&str>) -> Peer {
