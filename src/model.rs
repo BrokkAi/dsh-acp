@@ -263,6 +263,23 @@ pub struct SessionConfig {
     pub reasoning_effort: crate::config::ReasoningEffort,
 }
 
+impl SessionConfig {
+    /// The config a new session starts with.
+    pub fn new(
+        model: String,
+        permission_mode: crate::config::PermissionMode,
+        reasoning_effort: crate::config::ReasoningEffort,
+    ) -> Self {
+        Self {
+            model,
+            mode: "agent".to_string(),
+            permission_mode,
+            network: true,
+            reasoning_effort,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolOutcomeStatus {
@@ -398,13 +415,7 @@ impl SessionRecord {
             title_set_by_client: false,
             created_at: now,
             updated_at: now,
-            config: SessionConfig {
-                model: default_model,
-                mode: "agent".to_string(),
-                permission_mode,
-                network: true,
-                reasoning_effort,
-            },
+            config: SessionConfig::new(default_model, permission_mode, reasoning_effort),
             system_prompt_mode: system_prompt
                 .as_ref()
                 .map(|prompt| prompt.mode)
@@ -609,6 +620,8 @@ pub struct SessionState {
     pub mcp: Option<Arc<crate::mcp::McpSession>>,
     /// Stable directory capabilities for the session's canonical roots.
     pub workspace: Option<Arc<crate::workspace::WorkspaceRoots>>,
+    /// The prompt suggestions this connection's client is offered.
+    pub prompt_suggestions: crate::prompt_suggestions::Offer,
 }
 
 impl SessionRuntime {
@@ -626,6 +639,7 @@ impl SessionRuntime {
                 session_approvals: std::collections::HashSet::new(),
                 mcp: None,
                 workspace: None,
+                prompt_suggestions: crate::prompt_suggestions::Offer::default(),
             })),
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             turn_lock: Arc::new(tokio::sync::Mutex::new(())),

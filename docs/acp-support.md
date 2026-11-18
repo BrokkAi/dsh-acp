@@ -32,7 +32,7 @@ version's lifecycle and payload shapes.
 | Initialize and implementation info | Yes | Yes |
 | Authentication methods and logout | Yes | Yes |
 | New, list, resume, close | Yes | Yes |
-| Load and replay | `session/load` | `session/resume` + `replayFrom` |
+| Load and replay | `session/load` | `session/resume` + `replayFrom`, ended by `replay_complete` |
 | Prompt and cancellation | Yes | Async acceptance + state lifecycle |
 | Tool calls and permissions | Yes | Yes |
 | Rich prompt content | Text, image, resource | Text, image, resource |
@@ -57,6 +57,10 @@ version's lifecycle and payload shapes.
 | `_session/steering` | Implemented | `_meta.steering.supported` |
 | `session/status` | Implemented (Draft RFD) | Advertised capability |
 | `session/set_title` | Implemented (Draft RFD) | Advertised capability |
+| `session/options` and initial config options | Implemented (unstable) | Advertised capability |
+| Prompt suggestions | Implemented (unstable) | Client capability |
+| Agent skills | Implemented in v2 (unstable) | Advertised `prompt.skill`; listed for clients with `commands.skill` |
+| `speed` config category | Not applicable | DeepSeek has no speed setting to expose |
 | Steering idle return | Implemented | `idleBehavior: "promptRequired"` |
 | Agent-owned terminals | Implemented in v2 | Baseline v2 |
 | Terminal output chunks | Implemented in v2 | Baseline v2 |
@@ -78,11 +82,13 @@ HTTP (POST, GET event streams, DELETE) and WebSocket instead, per the
 [Streamable HTTP & WebSocket Transport RFD](https://agentclientprotocol.com/rfds/streamable-http-websocket-transport).
 The RFD is in the Active stage of the RFD process, which signals current work,
 not stability; the wire format may still change. The transport is the SDK's
-`agent-client-protocol-http` 3.5 server, unchanged, so where that server
-differs from the RFD, dsh-acp does too. For example, it accepts JSON-RPC
-batches instead of answering `501`, and opens an event stream for any
-`Acp-Session-Id` instead of answering `404` for one the connection does not
-know. Streamable HTTP is served over HTTP/1.1 and over cleartext HTTP/2 with
+`agent-client-protocol-http` 5.3 server, unchanged, so where that server
+differs from the RFD, dsh-acp does too. For example, it answers a JSON-RPC
+batch with `400` and one Invalid Request error instead of `501`. It also
+opens an event stream for an `Acp-Session-Id` the connection does not know
+yet, so a client can subscribe before the `session/load` or `session/resume`
+that replays the session; only once 16 such streams are open does another get
+`404`. Streamable HTTP is served over HTTP/1.1 and over cleartext HTTP/2 with
 prior knowledge; WebSocket upgrades use HTTP/1.1. There is no TLS and no
 `Acp-Protocol-Version` handling.
 
@@ -105,9 +111,9 @@ trade-offs of `--listen-allow-remote`.
 
 `session/status` follows the
 [Session Status RFD](https://agentclientprotocol.com/rfds/session-status),
-which is still a Draft. `agent-client-protocol` 3.5 has no types for it, so
-the request, response, and capability marker are written by hand and may change
-with the RFD. Both versions advertise it with an empty marker:
+which is still a Draft. The response and capability marker are the unstable
+types of `agent-client-protocol` 5.3 and may change with the RFD. Both
+versions advertise it with an empty marker:
 `agentCapabilities.sessionCapabilities.status` in v1 and
 `capabilities.session.status` in v2.
 
@@ -115,12 +121,15 @@ The request takes a `sessionId` and reports where that session is:
 
 | Result | Meaning |
 | --- | --- |
-| `{"status": "active"}` | The session is in memory in this server process. |
-| `{"status": "inactive"}` | The session is stored but not in memory, for example after `session/close` or a restart. |
+| `{"status": "open"}` | The session is in memory in this server process. |
+| `{"status": "saved"}` | The session is stored but not in memory, for example after `session/close` or a restart. |
 | `-32002` with `data.sessionId` | No such session, including a deleted one. |
 
+Releases through 0.6.1 followed an earlier draft and answered `active` and
+`inactive`.
+
 A missing or non-string `sessionId` is rejected with `-32602`. In v2, an
-`active` result also carries `state`, the same `running`, `requires_action`,
+`open` result also carries `state`, the same `running`, `requires_action`,
 or `idle` snapshot that `session/resume` sends. v1 has no foreground state, so
 its result has no `state`. The probe does not wait for a session's work, so it
 answers promptly even while that session is in a tool or MCP call. Requests
@@ -131,21 +140,22 @@ to finish, and every later request on the connection waits behind it,
 including `session/status`.
 
 The request does not load, resume, or change the session. As the RFD says,
-`active` only means the session is in memory, so a client still sends
+`open` only means the session is in memory, so a client still sends
 `session/load` (v1) or `session/resume` before prompting a session it did not
-create or resume itself. An inactive session is found by checking that its
+create or resume itself. A saved session is found by checking that its
 record file exists, without reading it, so an unreadable record is still
-reported as `inactive` and fails when resumed.
+reported as `saved` and fails when resumed.
 
 ## Session titles
 
 `session/set_title` follows the
 [Client-Set Session Titles RFD](https://agentclientprotocol.com/rfds/session-set-title),
-which is still a Draft. `agent-client-protocol` 3.5 has no types for it, so
-the request, response, and capability marker are written by hand and may change
-with the RFD. Both versions advertise it with an empty marker:
-`agentCapabilities.sessionCapabilities.setTitle` in v1 and
-`capabilities.session.setTitle` in v2.
+which is still a Draft. The response and capability marker are the unstable
+types of `agent-client-protocol` 5.3 and may change with the RFD. Both
+versions advertise it with an empty marker:
+`agentCapabilities.sessionCapabilities.title` in v1 and
+`capabilities.session.title` in v2. Releases through 0.6.1 followed an
+earlier draft and named the marker `setTitle`.
 
 The request takes a `sessionId` and a `title`, and the result is the title as
 stored, which clients should display:
@@ -161,7 +171,7 @@ characters (Unicode scalar values).
 | Case | Answer |
 | --- | --- |
 | A session in memory in this process | The title, after a `session_info_update` that carries it. |
-| A stored session that is not in memory, for example after `session/close` or a restart | The title. The record is updated on disk without loading the session, which stays `inactive`, so no update is sent. |
+| A stored session that is not in memory, for example after `session/close` or a restart | The title. The record is updated on disk without loading the session, which stays `saved`, so no update is sent. |
 | A title that is empty after normalization | `-32602` with the message `Title must not be empty.` |
 | A missing or non-string `sessionId` or `title` | `-32602` |
 | No such session, including a deleted one | `-32002` with `data.sessionId` |
@@ -188,40 +198,53 @@ process holds, but `dsh-acp` cannot tell that one does.
 
 `auth/status` follows the
 [Agent Authentication State Query RFD](https://agentclientprotocol.com/rfds/get-auth-state),
-which is still a Draft. `agent-client-protocol` 3.5 has no types for it, so
-the response and capability marker are written by hand and may change with the
-RFD. Both versions advertise it with a `status` field in the agent's auth
-capabilities. v1 sends `agentCapabilities.auth.status: true`, the boolean in
-the RFD's example. The RFD shows only v1, so v2 sends
-`capabilities.auth.status: {}`, because v2 capability markers are objects
-(the client's `auth.terminal` capability is `true` in v1 and `{}` in v2).
+which is still a Draft. The response and capability marker are the unstable
+types of `agent-client-protocol` 5.3 and may change with the RFD. Both
+versions advertise it with an empty marker:
+`agentCapabilities.auth.status` in v1 and `capabilities.auth.status` in v2.
 
-The request takes no parameters other than an optional `_meta`, and the
-result is `authenticated` plus a `message` for the user:
+The request takes no parameters other than an optional `_meta`. The result is
+a `state` and the configured credential, if there is one, as an account for
+display:
 
 ```json
 {
-  "authenticated": true,
-  "message": "Using the DeepSeek API key from DEEPSEEK_API_KEY or --api-key-file."
+  "state": "authenticated",
+  "accounts": [
+    {
+      "label": "DeepSeek API key",
+      "description": "DEEPSEEK_API_KEY or --api-key-file",
+      "active": true
+    }
+  ]
 }
 ```
 
-| State | `authenticated` |
-| --- | --- |
-| A non-blank `DEEPSEEK_API_KEY`, `--api-key-file`, or provider `Authorization` header | `true` |
-| Neither of those | `false` |
-| A credential, but after `logout` (v1), `auth/logout` (v2), or `providers/disable` | `false` until a successful `authenticate`, `auth/login`, or `providers/set` |
+| Situation | `state` | `accounts` |
+| --- | --- | --- |
+| A non-blank `DEEPSEEK_API_KEY`, `--api-key-file`, or provider `Authorization` header | `authenticated` | That credential, `active: true` |
+| Neither of those | `unauthenticated` | Omitted |
+| A credential, but after `logout` (v1), `auth/logout` (v2), or `providers/disable` | `unauthenticated` until a successful `authenticate`, `auth/login`, or `providers/set` | That credential, `active: false` |
 
 The provider `Authorization` header takes precedence over the API key, and the
-message says which one requests will use. After a logout or a disabled
+account says which one requests will use. After a logout or a disabled
 provider, prompts fail with `auth_required` until the client authenticates
 again, so that state is reported as unauthenticated even though the key is
 still configured.
 
-As the RFD allows, `true` means a credential is configured, not that DeepSeek
-accepts it; the check is local and makes no request. The query can be sent at
-any time after `initialize`, including before authenticating. It changes
-nothing and never returns the key or header values.
+As the RFD allows, `authenticated` means a credential is configured, not that
+DeepSeek accepts it; the check is local and makes no request. The query can be
+sent at any time after `initialize`, including before authenticating. It
+changes nothing and never returns the key or header values.
+
+When `authenticate`, `logout`, `auth/login`, `auth/logout`, `providers/set`,
+or `providers/disable` changes the state, the agent sends an
+`auth/status_update` notification with the same fields, after it answers that
+request. A request that leaves the state as it was sends none.
+
+Releases through 0.6.1 followed an earlier draft: the result was
+`authenticated` (a boolean) plus a `message`, and v1 advertised the capability
+as `true`.
 
 ## Session configuration options
 
@@ -239,10 +262,122 @@ The v1 prompt response and the v2 idle state report only the completed turn's
 token usage, with `_meta["mjolnir.dev/usage-scope"] = "turn"`. Session
 `usage_update` notifications continue to report the cumulative session total.
 
+## Session options
+
+`session/options` is unstable in ACP schema 1.18 and may change. Both versions
+advertise it with an empty marker: `agentCapabilities.sessionCapabilities.options`
+in v1 and `capabilities.session.options` in v2.
+
+The request takes a `cwd`, optional `additionalDirectories`, and an optional
+`sessionId`, and returns the `configOptions` that session would start with. v1
+also returns `modes`; v2 also returns `availableCommands`.
+
+| Request | Answer |
+| --- | --- |
+| No `sessionId` | A new session's options, under the workspace rules of `session/new`. |
+| A `sessionId`, loaded or not | That session's current options, under the `cwd` rules of `session/resume`. |
+| A `sessionId` the agent does not know | `-32002` with `data.sessionId` |
+| A `cwd` other than the session's | `-32602` |
+
+The request creates, loads, and changes nothing: a stored session's record is
+read from disk and stays `saved`, no update is sent, and no MCP server is
+contacted.
+
+The same capability lets `session/new`, `session/resume`, and `session/fork`,
+and in v1 `session/load`, carry `configOptions`: initial values in the shape of
+`session/set_config_option` without the `sessionId`. They are applied in order
+once the session is set up, on top of the stored values for a load or resume
+and the source's values for a fork, and are saved. The response's
+`configOptions` show the result, and no `config_option_update` is sent.
+
+| Entry | Effect |
+| --- | --- |
+| An unknown `configId`, a value type that does not match the option, or a value that is not allowed | Ignored |
+| The same `configId` twice | The request fails with `-32602` and nothing is created or changed |
+| In v2, a value `type` other than `id` or `boolean` | The request fails with `-32602` |
+
+## Prompt suggestions
+
+Prompt suggestions are unstable in ACP schema 1.18 and may change. A client
+opts in with the `session.promptSuggestions` client capability, in either
+protocol version.
+
+After a turn ends with `end_turn` and an answer, the agent asks DeepSeek what
+the user is likely to send next and offers up to three prompts in a
+`prompt_suggestions_update`, each as one `text` block. The update follows the
+v1 prompt response or the v2 idle state. When the next turn starts, an update
+with an empty list withdraws them. Nothing is sent when the model suggests
+nothing, when the request fails, or when another turn starts first.
+
+The request is separate from the turn and small: the session's model without
+thinking or tools, the last user message and the reply to it (the last 4,000
+characters of each), and at most 300 output tokens. Its tokens are added to the
+session's usage total, so they appear in the next `usage_update`, not in the
+usage of the turn that just ended. `--disable-prompt-suggestions` /
+`DSH_ACP_DISABLE_PROMPT_SUGGESTIONS=1` turns the feature off for every client.
+
+Suggestions are not session history. They are not stored and not replayed.
+
+## Agent skills
+
+Agent skills are unstable in ACP schema 1.18, exist only in protocol v2, and
+may change. The agent advertises `capabilities.session.prompt.skill: {}`: a
+prompt may carry one `skill` content block, as its first block.
+
+Skills follow the [Agent Skills](https://agentskills.io) format and its
+cross-client locations. A skill is a directory with a `SKILL.md`, read from
+these places:
+
+| Scope | Location |
+| --- | --- |
+| Project | `<root>/.agents/skills/<directory>/SKILL.md`, for the session `cwd` and then each additional directory |
+| User | `~/.agents/skills/<directory>/SKILL.md` |
+
+`SKILL.md` starts with YAML frontmatter between `---` lines, which gives the
+skill's `name` and `description`. The rest of the file is the skill's
+instructions. As the format's guide for clients recommends, the rules are
+applied leniently:
+
+- A project skill overrides a user skill of the same name. Among project
+  skills, the earlier root wins. A skill named like a slash command (`help`,
+  `plan`, `agent`, `model`, `status`) is left out.
+- A `name` that differs from its directory still names the skill. Without a
+  `name`, or with one that has whitespace or is longer than 64 characters, the
+  directory's name is used.
+- A skill without a `description`, or without instructions, is left out. A
+  description longer than 1024 characters is cut.
+- `SKILL.md` must resolve within its root or the home directory, and be a
+  regular UTF-8 file no larger than 256 KiB.
+- At most 64 skills are listed. A skill that is left out is logged and never
+  fails the session.
+
+A client that advertised `session.commands.skill` gets the skills as `skill`
+entries, with the absolute `path` of each `SKILL.md`, in the
+`availableCommands` of `session/new`, `session/resume`, `session/fork`, and
+`session/options`. Skills are read from disk each time, so a later response
+shows files added since. Other clients get only the slash commands.
+
+A prompt invokes a skill with `{"type": "skill", "name": "<name>"}` as its
+first block. The skill is read again and its instructions are given to the
+model ahead of the user's own blocks, with its path. The block alone is a
+valid prompt. A generated session title uses the user's text, or the skill's
+name when there is none. Replay returns the prompt as the client sent it.
+
+| Prompt | Answer |
+| --- | --- |
+| A skill the session does not have, including a slash command's name | `-32602` |
+| A `skill` block after the first block, or more than one | `-32602` |
+| A `skill` block in `_session/steering` | `-32602` |
+
+A skill is workspace content, like `AGENTS.md`. Invoking it gives the model its
+instructions for that prompt and nothing else: tools still ask permission as
+the session's policy says. The model does not pick skills itself; only the
+user's `skill` block applies one.
+
 ## Client system prompts
 
-Both protocol versions advertise the unstable `systemPrompt` session
-capability with `mode.override`: `agentCapabilities.sessionCapabilities` in v1
+Both protocol versions advertise the `systemPrompt` session capability, stable
+since ACP schema 1.16, with `mode.override`: `agentCapabilities.sessionCapabilities` in v1
 and `capabilities.session` in v2. The client's prompt is accepted on
 `session/new`, `session/resume`, and `session/fork`, and in v1 also on
 `session/load`.
@@ -276,6 +411,12 @@ the turn completes and carries the stop reason directly.
 
 Both versions persist user content, assistant output, tool calls, outcomes,
 plans, compactions, and terminal/diff state for replay.
+
+A v2 `session/resume` with a `replayFrom` cursor sends the session's history,
+then one `replay_complete` update, also when the history is empty, then the
+current `state_update`, and then its response. A resume without `replayFrom`
+sends only the `state_update`. A resume that fails during replay sends no
+`replay_complete`.
 
 ## Request cancellation
 

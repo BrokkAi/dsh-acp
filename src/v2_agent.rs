@@ -1,5 +1,5 @@
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -31,13 +31,13 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    agent::{Harness, steering_params, with_extra_capabilities},
+    agent::{Harness, reject_duplicate_config_ids, steering_params, typed_json},
     auth_status,
     config::ReasoningEffort,
     deepseek::{Completion, StreamEvent},
     model::{
         ChatMessage, ClientPromptMode, ClientSystemPrompt, ContentPart, ImageUrl, MessageContent,
-        PendingUserMessage, PersistedCompaction, PersistedDiff, Role, SessionRecord,
+        PendingUserMessage, PersistedCompaction, PersistedDiff, Role, SessionConfig, SessionRecord,
         SessionRuntime, TokenUsage, ToolOutcomeStatus, ensure_session_unique_tool_call_ids,
     },
     session::{SessionPresence, session_title},
@@ -74,8 +74,8 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
                 let harness = harness.clone();
                 async move |request: LoginAuthRequest,
                             responder: agent_client_protocol::v2::Responder<LoginAuthResponse>,
-                            _connection: V2ConnectionTo<Client>| {
-                    harness.clone().login(request, responder).await
+                            connection: V2ConnectionTo<Client>| {
+                    harness.clone().login(request, responder, connection).await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -85,8 +85,8 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
                 let harness = harness.clone();
                 async move |request: LogoutAuthRequest,
                             responder: agent_client_protocol::v2::Responder<LogoutAuthResponse>,
-                            _connection: V2ConnectionTo<Client>| {
-                    harness.clone().logout(request, responder).await
+                            connection: V2ConnectionTo<Client>| {
+                    harness.clone().logout(request, responder, connection).await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -109,8 +109,11 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
                 let harness = harness.clone();
                 async move |request: SetProviderRequest,
                             responder: agent_client_protocol::v2::Responder<SetProviderResponse>,
-                            _connection: V2ConnectionTo<Client>| {
-                    harness.clone().set_provider(request, responder).await
+                            connection: V2ConnectionTo<Client>| {
+                    harness
+                        .clone()
+                        .set_provider(request, responder, connection)
+                        .await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -122,8 +125,11 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
                             responder: agent_client_protocol::v2::Responder<
                     DisableProviderResponse,
                 >,
-                            _connection: V2ConnectionTo<Client>| {
-                    harness.clone().disable_provider(request, responder).await
+                            connection: V2ConnectionTo<Client>| {
+                    harness
+                        .clone()
+                        .disable_provider(request, responder, connection)
+                        .await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -218,6 +224,19 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
         .on_receive_request(
             {
                 let harness = harness.clone();
+                async move |request: v2::SessionOptionsRequest,
+                            responder: agent_client_protocol::v2::Responder<
+                    v2::SessionOptionsResponse,
+                >,
+                            _connection: V2ConnectionTo<Client>| {
+                    harness.clone().session_options(request, responder).await
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let harness = harness.clone();
                 async move |request: v2::SetSessionConfigOptionRequest,
                             responder: agent_client_protocol::v2::Responder<
                     v2::SetSessionConfigOptionResponse,
@@ -249,8 +268,8 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
                             responder: agent_client_protocol::v2::Responder<Value>,
                             connection: V2ConnectionTo<Client>| {
                     match request.method.as_str() {
-                        // Answered as JSON: the SDK capability types cannot advertise
-                        // `auth/status`, `session/status`, or `session/set_title` yet.
+                        // Handled as JSON so that `initialize` can pick the protocol
+                        // version and malformed draft-method requests get our errors.
                         "initialize" => {
                             match InitializeRequest::parse_message(&request.method, &request.params)
                             {
@@ -278,7 +297,14 @@ pub(crate) fn component(harness: Harness) -> impl ConnectTo<Client> + 'static {
                                 .session_set_title(request.params, responder, connection)
                                 .await
                         }
-                        auth_status::METHOD => responder.respond(harness.base.auth_status().await),
+                        auth_status::METHOD => respond_json(
+                            responder,
+                            auth_status::auth_status_message!(
+                                agent_client_protocol::v2::schema,
+                                AuthStatusResponse,
+                                harness.base.auth_status().await
+                            ),
+                        ),
                         _ => responder.respond_with_error(Error::method_not_found()),
                     }
                 }
@@ -307,7 +333,8 @@ impl V2Harness {
         *self.capabilities.write().await = request.capabilities.clone();
         self.initialized.store(true, Ordering::Release);
         let mut prompt_capabilities = v2::PromptCapabilities::new()
-            .embedded_context(v2::PromptEmbeddedContextCapabilities::new());
+            .embedded_context(v2::PromptEmbeddedContextCapabilities::new())
+            .skill(v2::PromptSkillCapabilities::new());
         if self
             .base
             .config
@@ -328,6 +355,9 @@ impl V2Harness {
             .delete(v2::SessionDeleteCapabilities::new())
             .additional_directories(v2::SessionAdditionalDirectoriesCapabilities::new())
             .fork(v2::SessionForkCapabilities::new())
+            .status(v2::SessionStatusCapabilities::new())
+            .options(v2::SessionOptionsCapabilities::new())
+            .title(v2::SessionTitleCapabilities::new())
             .system_prompt(
                 v2::SessionSystemPromptCapabilities::new().mode(
                     v2::SessionSystemPromptModeCapabilities::new()
@@ -336,8 +366,7 @@ impl V2Harness {
             );
         let capabilities = AgentCapabilities::new()
             .session(session_capabilities)
-            // Empty in the SDK; it carries the `auth/status` marker added below.
-            .auth(v2::AgentAuthCapabilities::new())
+            .auth(v2::AgentAuthCapabilities::new().status(v2::AuthStatusCapabilities::new()))
             .providers(ProvidersCapabilities::new());
         let response = InitializeResponse::new(
             request.protocol_version,
@@ -353,23 +382,14 @@ impl V2Harness {
             "steering".to_string(),
             json!({"supported": true, "idleBehaviors": ["promptRequired"]}),
         )])));
-        match with_extra_capabilities(
-            response,
-            &[
-                ("/capabilities/session", "status", json!({})),
-                ("/capabilities/session", "setTitle", json!({})),
-                ("/capabilities/auth", "status", json!({})),
-            ],
-        ) {
-            Ok(response) => responder.respond(response),
-            Err(error) => responder.respond_with_error(error),
-        }
+        respond_json(responder, response)
     }
 
     async fn login(
         self,
         request: LoginAuthRequest,
         responder: agent_client_protocol::v2::Responder<LoginAuthResponse>,
+        connection: V2ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         if request.method_id.to_string() != "deepseek-api-key" {
             return responder
@@ -383,8 +403,10 @@ impl V2Harness {
             .credential(&self.base.config)
             .is_some();
         if has_credential {
+            let before = self.base.auth_status().await;
             self.base.provider.write().await.enabled = true;
-            responder.respond(LoginAuthResponse::new())
+            responder.respond(LoginAuthResponse::new())?;
+            self.announce_auth_status(&before, &connection).await
         } else {
             responder.respond_with_error(Error::auth_required().data(
                 "Configure DEEPSEEK_API_KEY, --api-key-file, or a provider Authorization header first",
@@ -396,9 +418,30 @@ impl V2Harness {
         self,
         _request: LogoutAuthRequest,
         responder: agent_client_protocol::v2::Responder<LogoutAuthResponse>,
+        connection: V2ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
+        let before = self.base.auth_status().await;
         self.base.provider.write().await.enabled = false;
-        responder.respond(LogoutAuthResponse::new())
+        responder.respond(LogoutAuthResponse::new())?;
+        self.announce_auth_status(&before, &connection).await
+    }
+
+    /// Sends `auth/status_update` when the auth state differs from `before`,
+    /// the state before the request that just changed it.
+    async fn announce_auth_status(
+        &self,
+        before: &auth_status::AuthStatus,
+        connection: &V2ConnectionTo<Client>,
+    ) -> agent_client_protocol::Result<()> {
+        let status = self.base.auth_status().await;
+        if status == *before {
+            return Ok(());
+        }
+        connection.send_notification(auth_status::auth_status_message!(
+            agent_client_protocol::v2::schema,
+            AuthStatusUpdateNotification,
+            status
+        ))
     }
 
     async fn list_providers(
@@ -422,6 +465,7 @@ impl V2Harness {
         self,
         request: SetProviderRequest,
         responder: agent_client_protocol::v2::Responder<SetProviderResponse>,
+        connection: V2ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         if request.provider_id.to_string() != "deepseek" {
             return responder.respond_with_error(
@@ -437,26 +481,31 @@ impl V2Harness {
             return responder
                 .respond_with_error(Error::invalid_params().data("invalid provider base URL"));
         }
+        let before = self.base.auth_status().await;
         *self.base.provider.write().await = crate::agent::ProviderRouting {
             enabled: true,
             base_url: request.base_url,
             headers: request.headers,
         };
-        responder.respond(SetProviderResponse::new())
+        responder.respond(SetProviderResponse::new())?;
+        self.announce_auth_status(&before, &connection).await
     }
 
     async fn disable_provider(
         self,
         request: DisableProviderRequest,
         responder: agent_client_protocol::v2::Responder<DisableProviderResponse>,
+        connection: V2ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         if request.provider_id.to_string() != "deepseek" {
             return responder.respond_with_error(
                 Error::invalid_params().data("only the deepseek provider is supported"),
             );
         }
+        let before = self.base.auth_status().await;
         self.base.provider.write().await.enabled = false;
-        responder.respond(DisableProviderResponse::new())
+        responder.respond(DisableProviderResponse::new())?;
+        self.announce_auth_status(&before, &connection).await
     }
 
     async fn new_session(
@@ -472,6 +521,9 @@ impl V2Harness {
             Ok(prompt) => prompt,
             Err(error) => return responder.respond_with_error(error),
         };
+        if let Err(error) = validate_initial_config(&request.config_options) {
+            return responder.respond_with_error(error);
+        }
         let runtime = match self
             .base
             .store
@@ -493,11 +545,22 @@ impl V2Harness {
             let _ = self.base.store.delete(&runtime.snapshot().await.id).await;
             return responder.respond_with_error(error);
         }
+        if !request.config_options.is_empty() {
+            self.apply_initial_config(&runtime, &request.config_options)
+                .await;
+            if let Err(error) = self.base.store.save(&runtime).await {
+                let _ = self.base.store.delete(&runtime.snapshot().await.id).await;
+                return responder.respond_with_error(error);
+            }
+        }
         let record = runtime.snapshot().await;
         responder.respond(
             v2::NewSessionResponse::new(record.id.clone())
-                .config_options(self.config_options(&record))
-                .available_commands(available_commands()),
+                .config_options(self.config_options(&record.config))
+                .available_commands(
+                    self.session_commands(&record.cwd, &record.additional_directories)
+                        .await,
+                ),
         )?;
         send_update(
             &connection,
@@ -559,6 +622,9 @@ impl V2Harness {
             Ok(prompt) => prompt,
             Err(error) => return responder.respond_with_error(error),
         };
+        if let Err(error) = validate_initial_config(&request.config_options) {
+            return responder.respond_with_error(error);
+        }
         let runtime = match self.base.store.get(&request.session_id.to_string()).await {
             Ok(runtime) => runtime,
             Err(error) => return responder.respond_with_error(error),
@@ -603,14 +669,23 @@ impl V2Harness {
         if let Err(error) = self.base.store.refresh_workspace(&runtime).await {
             return responder.respond_with_error(error);
         }
+        self.apply_initial_config(&runtime, &request.config_options)
+            .await;
         if let Err(error) = self.base.store.save(&runtime).await {
             return responder.respond_with_error(error);
         }
         let record = runtime.snapshot().await;
-        if request.replay_from.is_some()
-            && let Err(error) = replay_history(&connection, &record)
-        {
-            return responder.respond_with_error(error);
+        if request.replay_from.is_some() {
+            if let Err(error) = replay_history(&connection, &record) {
+                return responder.respond_with_error(error);
+            }
+            // Ends the replay, also for an empty history. The state snapshot
+            // below is current state, not history, so it follows the marker.
+            send_update(
+                &connection,
+                &v2_session_id(&record.id),
+                SessionUpdate::ReplayComplete(v2::ReplayComplete::new()),
+            )?;
         }
         {
             let state = runtime.state.lock().await;
@@ -625,8 +700,11 @@ impl V2Harness {
         }
         responder.respond(
             v2::ResumeSessionResponse::new()
-                .config_options(self.config_options(&record))
-                .available_commands(available_commands()),
+                .config_options(self.config_options(&record.config))
+                .available_commands(
+                    self.session_commands(&record.cwd, &record.additional_directories)
+                        .await,
+                ),
         )
     }
 
@@ -636,6 +714,9 @@ impl V2Harness {
         responder: agent_client_protocol::v2::Responder<v2::ForkSessionResponse>,
         connection: V2ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
+        if let Err(error) = validate_initial_config(&request.config_options) {
+            return responder.respond_with_error(error);
+        }
         let source_runtime = match self.base.store.get(&request.session_id.to_string()).await {
             Ok(runtime) => runtime,
             Err(error) => return responder.respond_with_error(error),
@@ -713,6 +794,8 @@ impl V2Harness {
             let _ = self.base.store.delete(&runtime_id).await;
             return responder.respond_with_error(error);
         }
+        self.apply_initial_config(&runtime, &request.config_options)
+            .await;
         if let Err(error) = self.base.store.save(&runtime).await {
             let _ = self.base.store.delete(&runtime_id).await;
             return responder.respond_with_error(error);
@@ -720,8 +803,11 @@ impl V2Harness {
         let record = runtime.snapshot().await;
         responder.respond(
             v2::ForkSessionResponse::new(record.id.clone())
-                .config_options(self.config_options(&record))
-                .available_commands(available_commands()),
+                .config_options(self.config_options(&record.config))
+                .available_commands(
+                    self.session_commands(&record.cwd, &record.additional_directories)
+                        .await,
+                ),
         )?;
         send_update(
             &connection,
@@ -798,9 +884,15 @@ impl V2Harness {
                 // Without the state lock, which can be held across an MCP
                 // call while every other request on the connection waits.
                 let state = foreground_state(&runtime.active_prompt, &runtime.requires_action);
-                responder.respond(json!({"status": "active", "state": state}))
+                respond_json(
+                    responder,
+                    v2::SessionStatusResponse::new(v2::SessionStatus::Open).state(state),
+                )
             }
-            Ok(SessionPresence::Inactive) => responder.respond(json!({"status": "inactive"})),
+            Ok(SessionPresence::Inactive) => respond_json(
+                responder,
+                v2::SessionStatusResponse::new(v2::SessionStatus::Saved),
+            ),
             Ok(SessionPresence::Unknown) => {
                 responder.respond_with_error(session_status::unknown_session(session_id))
             }
@@ -832,7 +924,139 @@ impl V2Harness {
                 ),
             );
         }
-        responder.respond(json!({"title": stored.title}))
+        respond_json(responder, v2::SetSessionTitleResponse::new(stored.title))
+    }
+
+    /// `session/options`: the config options a session would start with.
+    /// It creates, loads, and changes nothing, and connects to no MCP server.
+    async fn session_options(
+        self,
+        request: v2::SessionOptionsRequest,
+        responder: agent_client_protocol::v2::Responder<v2::SessionOptionsResponse>,
+    ) -> agent_client_protocol::Result<()> {
+        if !self.initialized.load(Ordering::Acquire) {
+            return responder.respond_with_error(Error::invalid_request().data("initialize first"));
+        }
+        let session_id = request.session_id.as_ref().map(ToString::to_string);
+        let additional_directories = absolute_paths(request.additional_directories);
+        match self
+            .base
+            .store
+            .config_preview(
+                &request.cwd.0,
+                &additional_directories,
+                session_id.as_deref(),
+            )
+            .await
+        {
+            Ok(config) => responder.respond(
+                v2::SessionOptionsResponse::new()
+                    .config_options(self.config_options(&config))
+                    .available_commands(
+                        self.session_commands(&request.cwd.0, &additional_directories)
+                            .await,
+                    ),
+            ),
+            Err(error) => responder.respond_with_error(error),
+        }
+    }
+
+    /// The command list of a session with these workspace roots: the harness
+    /// commands, and the skills found for it when the client takes `skill`
+    /// entries.
+    async fn session_commands(
+        &self,
+        cwd: &Path,
+        additional_directories: &[PathBuf],
+    ) -> Vec<AvailableCommand> {
+        let mut commands = harness_commands();
+        let takes_skills = self
+            .capabilities
+            .read()
+            .await
+            .session
+            .as_ref()
+            .and_then(|session| session.commands.as_ref())
+            .is_some_and(|commands| commands.skill.is_some());
+        if takes_skills {
+            commands.extend(
+                self.base
+                    .store
+                    .skill_roots(cwd, additional_directories)
+                    .discover(COMMAND_NAMES)
+                    .into_iter()
+                    .map(|skill| {
+                        AvailableCommand::Skill(
+                            v2::Skill::new(skill.name, skill.description)
+                                .path(v2::AbsolutePath::new(skill.path)),
+                        )
+                    }),
+            );
+        }
+        commands
+    }
+
+    /// Splits a prompt into the skill it invokes, if any, and its other
+    /// blocks. A prompt may carry one `skill` block, as its first block, and
+    /// the skill must be one the session's command list could name.
+    async fn invoked_skill<'a>(
+        &self,
+        runtime: &SessionRuntime,
+        blocks: &'a [ContentBlock],
+    ) -> Result<(Option<crate::skills::Skill>, &'a [ContentBlock]), Error> {
+        if blocks
+            .iter()
+            .skip(1)
+            .any(|block| matches!(block, ContentBlock::Skill(_)))
+        {
+            return Err(Error::invalid_params()
+                .data("a prompt may carry one skill block, as its first block"));
+        }
+        let Some(ContentBlock::Skill(reference)) = blocks.first() else {
+            return Ok((None, blocks));
+        };
+        let (cwd, additional_directories) = {
+            let state = runtime.state.lock().await;
+            (
+                state.record.cwd.clone(),
+                state.record.additional_directories.clone(),
+            )
+        };
+        let skill = self
+            .base
+            .store
+            .skill_roots(&cwd, &additional_directories)
+            .find(&reference.name, COMMAND_NAMES)
+            .ok_or_else(|| {
+                Error::invalid_params().data(format!("unknown skill {}", reference.name))
+            })?;
+        Ok((Some(skill), &blocks[1..]))
+    }
+
+    /// Applies a setup request's initial config options in order, without
+    /// notifications. An unknown option, a mismatched value type, or a value
+    /// that is not allowed is ignored, as the protocol requires.
+    async fn apply_initial_config(
+        &self,
+        runtime: &SessionRuntime,
+        options: &[v2::InitialSessionConfigOption],
+    ) {
+        if options.is_empty() {
+            return;
+        }
+        let mut state = runtime.state.lock().await;
+        let before = state.record.config.clone();
+        for option in options {
+            let _ = apply_config(
+                &mut state.record,
+                option.config_id.to_string().as_str(),
+                &option.value,
+                &self.base.config.models,
+            );
+        }
+        if state.record.config != before {
+            state.record.touch();
+        }
     }
 
     async fn set_config(
@@ -861,7 +1085,7 @@ impl V2Harness {
             return responder.respond_with_error(error);
         }
         let record = runtime.snapshot().await;
-        let options = self.config_options(&record);
+        let options = self.config_options(&record.config);
         send_update(
             &connection,
             &v2_session_id(&record.id),
@@ -884,14 +1108,32 @@ impl V2Harness {
         if runtime.closed.load(Ordering::Acquire) {
             return responder.respond_with_error(Error::request_cancelled());
         }
-        let prompt = match content_blocks_to_prompt(&request.prompt) {
-            Ok(prompt) if !prompt.text.trim().is_empty() || prompt.has_images => prompt,
+        let (skill, blocks) = match self.invoked_skill(&runtime, &request.prompt).await {
+            Ok(invoked) => invoked,
+            Err(error) => return responder.respond_with_error(error),
+        };
+        // A skill needs no input, so its block alone is a prompt.
+        let prompt = match content_blocks_to_prompt(blocks) {
+            Ok(prompt)
+                if skill.is_some() || !prompt.text.trim().is_empty() || prompt.has_images =>
+            {
+                prompt
+            }
             Ok(_) => {
                 return responder
                     .respond_with_error(Error::invalid_params().data("prompt is empty"));
             }
             Err(error) => return responder.respond_with_error(error),
         };
+        // A generated title says what the user wrote, not the skill's text.
+        let skill_title = skill.as_ref().map(|skill| {
+            if prompt.text.trim().is_empty() {
+                skill.name.clone()
+            } else {
+                crate::session::title_from_text(&prompt.text)
+            }
+        });
+        let prompt = prompt.with_skill(skill.as_ref());
         let model = runtime.snapshot().await.config.model;
         if prompt.has_images
             && !prompt.text.trim().starts_with('/')
@@ -947,7 +1189,10 @@ impl V2Harness {
             }
             state.record.touch();
             if state.record.title.is_none() {
-                state.record.title = session_title(&state.record);
+                state.record.title = match skill_title {
+                    Some(title) if message_index.is_some() => Some(title),
+                    _ => session_title(&state.record),
+                };
             }
             (
                 message_id,
@@ -1040,6 +1285,14 @@ impl V2Harness {
             Ok(params) => params,
             Err(error) => return responder.respond_with_error(error),
         };
+        if prompt
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Skill(_)))
+        {
+            return responder.respond_with_error(
+                Error::invalid_params().data("a steering prompt cannot invoke a skill"),
+            );
+        }
         let session_id = v2::SessionId::new(session_id.to_string());
         let runtime = match self.base.store.get(&session_id.to_string()).await {
             Ok(runtime) => runtime,
@@ -1231,7 +1484,7 @@ impl V2Harness {
         cancellation: CancellationToken,
     ) {
         {
-            let state = runtime.state.lock().await;
+            let mut state = runtime.state.lock().await;
             state.requires_action.store(false, Ordering::Release);
             send_update(
                 &connection,
@@ -1239,6 +1492,10 @@ impl V2Harness {
                 SessionUpdate::StateUpdate(StateUpdate::Running(RunningStateUpdate::new())),
             )
             .ok();
+            // The suggestions offered after the last turn are now stale.
+            if state.prompt_suggestions.start_turn() {
+                let _ = send_prompt_suggestions(&connection, &session_id, Vec::new());
+            }
             // Also under the state lock, so this never announces a title
             // that `session/set_title` has already replaced.
             let _ = send_update(
@@ -1252,6 +1509,7 @@ impl V2Harness {
         let initial_usage = runtime.snapshot().await.usage;
         let mut usage = initial_usage.clone();
         let mut allow_command = true;
+        let mut ended_turn = false;
         loop {
             let result = self
                 .run_model_loop(
@@ -1295,6 +1553,7 @@ impl V2Harness {
                 if matches!(&stop_reason, StopReason::EndTurn) && pending_steering {
                     (true, flushed_steering)
                 } else {
+                    ended_turn = matches!(&stop_reason, StopReason::EndTurn);
                     // Before the update: `session/status` reads the flags
                     // without this lock.
                     state.active_prompt.store(false, Ordering::Release);
@@ -1318,6 +1577,16 @@ impl V2Harness {
             if !continue_for_steering {
                 break;
             }
+        }
+        let offers_suggestions = capabilities
+            .session
+            .as_ref()
+            .is_some_and(|session| session.prompt_suggestions.is_some());
+        if ended_turn && offers_suggestions {
+            crate::prompt_suggestions::suggest(&self.base, &runtime, |suggestions| {
+                send_prompt_suggestions(&connection, &session_id, suggestions).is_ok()
+            })
+            .await;
         }
     }
 
@@ -1355,7 +1624,7 @@ impl V2Harness {
                     connection,
                     session_id,
                     SessionUpdate::ConfigOptionUpdate(v2::ConfigOptionUpdate::new(
-                        self.config_options(&after),
+                        self.config_options(&after.config),
                     )),
                 )?;
             }
@@ -2212,7 +2481,7 @@ impl V2Harness {
         })
     }
 
-    fn config_options(&self, record: &SessionRecord) -> Vec<v2::SessionConfigOption> {
+    fn config_options(&self, config: &SessionConfig) -> Vec<v2::SessionConfigOption> {
         let model_options = self
             .base
             .config
@@ -2224,14 +2493,14 @@ impl V2Harness {
             v2::SessionConfigOption::select(
                 "model",
                 "Model",
-                record.config.model.clone(),
+                config.model.clone(),
                 model_options,
             )
             .category(v2::SessionConfigOptionCategory::Model),
             v2::SessionConfigOption::select(
                 "mode",
                 "Mode",
-                record.config.mode.clone(),
+                config.mode.clone(),
                 vec![
                     v2::SessionConfigSelectOption::new("agent", "Agent"),
                     v2::SessionConfigSelectOption::new("plan", "Plan"),
@@ -2241,7 +2510,7 @@ impl V2Harness {
             v2::SessionConfigOption::select(
                 "permission_mode",
                 "Tool permissions",
-                record.config.permission_mode.as_str(),
+                config.permission_mode.as_str(),
                 vec![
                     v2::SessionConfigSelectOption::new("ask", "Ask"),
                     v2::SessionConfigSelectOption::new("allow", "Allow"),
@@ -2251,7 +2520,7 @@ impl V2Harness {
             v2::SessionConfigOption::select(
                 "reasoning_effort",
                 "Thinking effort",
-                record.config.reasoning_effort.as_str(),
+                config.reasoning_effort.as_str(),
                 ReasoningEffort::VALUES
                     .into_iter()
                     .map(|effort| {
@@ -2264,7 +2533,7 @@ impl V2Harness {
             v2::SessionConfigOption::boolean(
                 "web_fetch",
                 "web_fetch access",
-                record.config.network,
+                config.network,
             )
             .description(
                 "Controls only the built-in web_fetch tool; commands and MCP servers have separate network policy.",
@@ -2316,6 +2585,27 @@ fn send_update(
     update: SessionUpdate,
 ) -> Result<(), Error> {
     connection.send_notification(UpdateSessionNotification::new(session_id.clone(), update))
+}
+
+/// Replaces the client's list of prompt suggestions. An empty list withdraws
+/// them.
+fn send_prompt_suggestions(
+    connection: &V2ConnectionTo<Client>,
+    session_id: &v2::SessionId,
+    suggestions: Vec<String>,
+) -> Result<(), Error> {
+    send_update(
+        connection,
+        session_id,
+        SessionUpdate::PromptSuggestionsUpdate(v2::PromptSuggestionsUpdate::new(
+            suggestions
+                .into_iter()
+                .map(|text| {
+                    v2::PromptSuggestion::new(vec![ContentBlock::Text(TextContent::new(text))])
+                })
+                .collect(),
+        )),
+    )
 }
 
 fn send_chunk(
@@ -2597,6 +2887,17 @@ async fn request_permission(
     }
 }
 
+/// Answers a request handled as JSON with a typed SDK response.
+fn respond_json(
+    responder: agent_client_protocol::v2::Responder<Value>,
+    response: impl serde::Serialize,
+) -> agent_client_protocol::Result<()> {
+    match typed_json(response) {
+        Ok(response) => responder.respond(response),
+        Err(error) => responder.respond_with_error(error),
+    }
+}
+
 fn replay_history(
     connection: &V2ConnectionTo<Client>,
     record: &SessionRecord,
@@ -2814,7 +3115,10 @@ fn message_content_to_v2_blocks(content: &MessageContent) -> Vec<ContentBlock> {
     }
 }
 
-fn available_commands() -> Vec<AvailableCommand> {
+/// The harness's slash commands. A skill may not take one of these names.
+const COMMAND_NAMES: &[&str] = &["help", "plan", "agent", "model", "status"];
+
+fn harness_commands() -> Vec<AvailableCommand> {
     vec![
         AvailableCommand::Command(v2::Command::new("help", "Show available harness commands")),
         AvailableCommand::Command(v2::Command::new("plan", "Enter read-only planning mode")),
@@ -2871,6 +3175,29 @@ struct V2PromptPayload {
     text: String,
     content: MessageContent,
     has_images: bool,
+}
+
+impl V2PromptPayload {
+    /// Puts an invoked skill's instructions ahead of the user's own content.
+    fn with_skill(mut self, skill: Option<&crate::skills::Skill>) -> Self {
+        let Some(skill) = skill else {
+            return self;
+        };
+        let skill_text = skill.prompt_text();
+        self.text = if self.text.trim().is_empty() {
+            skill_text.clone()
+        } else {
+            format!("{skill_text}\n\n{}", self.text)
+        };
+        self.content = match self.content {
+            MessageContent::Text(_) => MessageContent::Text(self.text.clone()),
+            MessageContent::Parts(mut parts) => {
+                parts.insert(0, ContentPart::Text { text: skill_text });
+                MessageContent::Parts(parts)
+            }
+        };
+        self
+    }
 }
 
 fn content_blocks_to_prompt(blocks: &[ContentBlock]) -> Result<V2PromptPayload, Error> {
@@ -2963,6 +3290,22 @@ fn content_blocks_to_prompt(blocks: &[ContentBlock]) -> Result<V2PromptPayload, 
         content,
         has_images,
     })
+}
+
+/// Checks a setup request's initial config options before anything is
+/// created or changed: an option named twice or a value type this agent does
+/// not support fails the request.
+fn validate_initial_config(options: &[v2::InitialSessionConfigOption]) -> Result<(), Error> {
+    reject_duplicate_config_ids(options.iter().map(|option| option.config_id.to_string()))?;
+    for option in options {
+        if let v2::SessionConfigOptionValue::Other(other) = &option.value {
+            return Err(Error::invalid_params().data(format!(
+                "unsupported config option value type {}",
+                other.type_
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn apply_config(

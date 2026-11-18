@@ -6,6 +6,45 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ## Unreleased
 
+### Added
+
+- `session/options` (unstable), in both protocol versions: returns the config
+  options a new or existing session would start with, without creating or
+  loading it. `session/new`, `session/load`, `session/resume`, and
+  `session/fork` accept initial `configOptions`.
+- Prompt suggestions (unstable), in both protocol versions. For a client that
+  advertises `session.promptSuggestions`, each turn that ends with an answer
+  is followed by up to three suggested next prompts, from one more small
+  DeepSeek request whose tokens count toward the session's usage.
+  `--disable-prompt-suggestions` (`DSH_ACP_DISABLE_PROMPT_SUGGESTIONS`) turns
+  them off.
+- Agent skills (unstable), in ACP v2. [Agent Skills](https://agentskills.io)
+  under `<root>/.agents/skills/` and `~/.agents/skills/` are listed as `skill`
+  commands for clients that advertise `session.commands.skill`, and a prompt
+  whose first block is a `skill` block gives that skill's instructions to the
+  model.
+- `auth/status_update` notifications when a login, logout, or provider change
+  alters the authentication state.
+- ACP v2 `session/resume` with a `replayFrom` cursor now ends the replayed
+  history with a `replay_complete` update, sent before the current
+  `state_update` and the response, as schema 1.18 requires.
+
+### Changed
+
+- `agent-client-protocol` is now 5.3.0 (schema 1.18.0), and the other
+  dependencies are at their latest compatible releases.
+- The draft `auth/status`, `session/status`, and `session/set_title` methods
+  now use the SDK's types and so follow the current drafts. Clients written
+  against the earlier shapes need these changes:
+  - `auth/status` returns `state` (`authenticated` or `unauthenticated`) and
+    the configured credential as an `accounts` entry, instead of
+    `authenticated` and `message`. v1 advertises it as `auth.status: {}`
+    instead of `true`.
+  - `session/status` answers `open` and `saved` instead of `active` and
+    `inactive`.
+  - The `session/set_title` capability is `title` instead of `setTitle`. The
+    method and its result are unchanged.
+
 ## 0.6.1 - 2026-11-04
 
 ### Changed

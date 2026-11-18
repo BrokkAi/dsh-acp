@@ -811,6 +811,7 @@ mod tests {
             mcp_connect_timeout: std::time::Duration::from_secs(1),
             allow_insecure_mcp_http: false,
             disable_web: true,
+            disable_prompt_suggestions: false,
             trace: false,
         }
     }

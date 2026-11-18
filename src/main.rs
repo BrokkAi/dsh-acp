@@ -99,6 +99,16 @@ struct Cli {
     #[arg(long, env = "DSH_ACP_DISABLE_WEB", default_value_t = false)]
     disable_web: bool,
 
+    /// Never ask DeepSeek for prompt suggestions, even for a client that
+    /// supports them. Each turn that ends with an answer otherwise costs one
+    /// more small request.
+    #[arg(
+        long,
+        env = "DSH_ACP_DISABLE_PROMPT_SUGGESTIONS",
+        default_value_t = false
+    )]
+    disable_prompt_suggestions: bool,
+
     /// Include protocol traffic diagnostics on stderr (never writes stdout).
     #[arg(long, env = "DSH_ACP_TRACE", default_value_t = false)]
     trace: bool,
@@ -178,6 +188,7 @@ impl TryFrom<Cli> for Config {
             mcp_connect_timeout: std::time::Duration::from_secs(cli.mcp_connect_timeout_secs),
             allow_insecure_mcp_http: cli.allow_insecure_mcp_http,
             disable_web: cli.disable_web,
+            disable_prompt_suggestions: cli.disable_prompt_suggestions,
             trace: cli.trace,
         })
     }

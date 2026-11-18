@@ -113,6 +113,7 @@ pub struct Config {
     pub mcp_connect_timeout: Duration,
     pub allow_insecure_mcp_http: bool,
     pub disable_web: bool,
+    pub disable_prompt_suggestions: bool,
     pub trace: bool,
 }
 

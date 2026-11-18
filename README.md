@@ -10,7 +10,7 @@
 [![ACP](https://img.shields.io/badge/ACP-v1%20%7C%20v2-blue.svg)](https://agentclientprotocol.com/)
 
 `dsh-acp` is a DeepSeek-powered coding agent and ACP server built on
-`agent-client-protocol` 3.5. It negotiates ACP v2 when the client requests it
+`agent-client-protocol` 5.3. It negotiates ACP v2 when the client requests it
 and falls back to ACP v1 for older clients. It serves ACP over stdio, or over
 streamable HTTP and WebSocket with `--listen`.
 
@@ -138,6 +138,7 @@ The binary is `target/release/dsh-acp`.
 --mcp-connect-timeout-secs <N>   MCP server setup limit (default: 60)
 --allow-insecure-mcp-http        Permit plaintext HTTP MCP outside loopback
 --disable-web                    Disable web_fetch
+--disable-prompt-suggestions     Never request prompt suggestions
 --trace                          Detailed diagnostics on stderr
 --listen <ADDR>                  Serve HTTP and WebSocket at ADDR instead of stdio
 --listen-allow-remote            Let --listen use a non-loopback address
@@ -259,14 +260,14 @@ starts a new detached turn; with `idleBehavior: "promptRequired"`, it returns
 Both protocol versions also implement `session/status` from the Draft
 [Session Status RFD](https://agentclientprotocol.com/rfds/session-status),
 advertised as `sessionCapabilities.status` in v1 and `session.status` in v2.
-It reports whether a session is in memory (`active`) or only stored
-(`inactive`) without loading it, and returns `-32002` for an unknown session.
-A v2 `active` result also carries the foreground state. See
+It reports whether a session is in memory (`open`) or only stored
+(`saved`) without loading it, and returns `-32002` for an unknown session.
+A v2 `open` result also carries the foreground state. See
 [docs/acp-support.md](docs/acp-support.md#session-status).
 
 They also implement `session/set_title` from the Draft
 [Client-Set Session Titles RFD](https://agentclientprotocol.com/rfds/session-set-title),
-advertised as `sessionCapabilities.setTitle` in v1 and `session.setTitle` in
+advertised as `sessionCapabilities.title` in v1 and `session.title` in
 v2. It renames a session whether or not it is loaded and returns the
 normalized title it stored, and later prompts no longer replace that title
 with a generated one. See
@@ -297,8 +298,24 @@ method re-enables a configured provider rather than carrying a secret inline.
 Clients can ask whether a credential is configured, without logging in, through
 `auth/status` from the Draft
 [Agent Authentication State Query RFD](https://agentclientprotocol.com/rfds/get-auth-state),
-advertised as `auth.status` in the agent's capabilities. See
+advertised as `auth.status` in the agent's capabilities, and are sent
+`auth/status_update` when it changes. See
 [docs/acp-support.md](docs/acp-support.md#authentication-status).
+
+Three unstable features of ACP schema 1.18 are also implemented; details are in
+[docs/acp-support.md](docs/acp-support.md):
+
+- **`session/options`**, in both versions: the config options a session would
+  start with, without creating or loading one. Session setup requests accept
+  initial `configOptions`.
+- **Prompt suggestions**, in both versions, for clients that advertise
+  `session.promptSuggestions`: up to three likely next prompts after each
+  answered turn. This costs one more small DeepSeek request per turn;
+  `--disable-prompt-suggestions` turns it off.
+- **Agent skills**, in v2: [Agent Skills](https://agentskills.io) under
+  `<root>/.agents/skills/` and `~/.agents/skills/` are listed for clients
+  that advertise `session.commands.skill`, and a prompt invokes one with a
+  `skill` content block.
 
 Legacy SSE-only MCP transports are best effort and are not advertised.
 MCP-over-ACP follows a draft RFD and is advertised in both protocol versions;
