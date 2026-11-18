@@ -1,11 +1,9 @@
 //! `session/set_title`, from the draft
 //! [Client-Set Session Titles RFD](https://agentclientprotocol.com/rfds/session-set-title).
 //!
-//! agent-client-protocol 3.5 has no types for this method, so its request and
-//! result are hand-rolled here until the SDK has them. Both protocol versions
-//! store the title the same way; each sends its own `session_info_update`.
-//! Each version's `initialize` adds the `setTitle` session capability with
-//! `agent::with_extra_capabilities`.
+//! The request is read as JSON so a malformed one gets this module's errors.
+//! Both protocol versions store the title the same way; each sends its own
+//! `session_info_update` and answers with its own SDK response.
 
 use agent_client_protocol::{Error, ErrorCode};
 use serde_json::Value;

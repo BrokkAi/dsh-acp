@@ -49,7 +49,7 @@ use crate::{
     mcp::{AcpConnection, McpSession, mcp_result_text},
     model::{
         ChatMessage, ClientPromptMode, ClientSystemPrompt, ContentPart, ImageUrl, MessageContent,
-        PendingUserMessage, PersistedCompaction, PersistedDiff, Role, SessionRecord,
+        PendingUserMessage, PersistedCompaction, PersistedDiff, Role, SessionConfig, SessionRecord,
         SessionRuntime, TokenUsage, ToolOutcomeStatus, ensure_session_unique_tool_call_ids,
     },
     session::{self, SessionPresence, SessionStore, session_title},
@@ -195,8 +195,11 @@ fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
                             responder: agent_client_protocol::v1::Responder<
                     AuthenticateResponse,
                 >,
-                            _connection: ConnectionTo<Client>| {
-                    harness.clone().authenticate(request, responder).await
+                            connection: ConnectionTo<Client>| {
+                    harness
+                        .clone()
+                        .authenticate(request, responder, connection)
+                        .await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -206,8 +209,8 @@ fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
                 let harness = harness.clone();
                 async move |request: LogoutRequest,
                             responder: agent_client_protocol::v1::Responder<LogoutResponse>,
-                            _connection: ConnectionTo<Client>| {
-                    harness.clone().logout(request, responder).await
+                            connection: ConnectionTo<Client>| {
+                    harness.clone().logout(request, responder, connection).await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -230,8 +233,11 @@ fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
                 let harness = harness.clone();
                 async move |request: SetProviderRequest,
                             responder: agent_client_protocol::v1::Responder<SetProviderResponse>,
-                            _connection: ConnectionTo<Client>| {
-                    harness.clone().set_provider(request, responder).await
+                            connection: ConnectionTo<Client>| {
+                    harness
+                        .clone()
+                        .set_provider(request, responder, connection)
+                        .await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -243,8 +249,11 @@ fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
                             responder: agent_client_protocol::v1::Responder<
                     DisableProviderResponse,
                 >,
-                            _connection: ConnectionTo<Client>| {
-                    harness.clone().disable_provider(request, responder).await
+                            connection: ConnectionTo<Client>| {
+                    harness
+                        .clone()
+                        .disable_provider(request, responder, connection)
+                        .await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -365,6 +374,19 @@ fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
         .on_receive_request(
             {
                 let harness = harness.clone();
+                async move |request: agent_client_protocol::v1::schema::SessionOptionsRequest,
+                            responder: agent_client_protocol::v1::Responder<
+                    agent_client_protocol::v1::schema::SessionOptionsResponse,
+                >,
+                            _connection: ConnectionTo<Client>| {
+                    harness.clone().session_options(request, responder).await
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let harness = harness.clone();
                 async move |request: SetSessionConfigOptionRequest,
                             responder: agent_client_protocol::v1::Responder<
                     SetSessionConfigOptionResponse,
@@ -396,8 +418,8 @@ fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
                             responder: agent_client_protocol::v1::Responder<Value>,
                             connection: ConnectionTo<Client>| {
                     match request.method.as_str() {
-                        // Answered as JSON: the SDK capability types cannot advertise
-                        // `auth/status`, `session/status`, or `session/set_title` yet.
+                        // Handled as JSON so that `initialize` can pick the protocol
+                        // version and malformed draft-method requests get our errors.
                         "initialize" => {
                             match InitializeRequest::parse_message(&request.method, &request.params)
                             {
@@ -428,7 +450,14 @@ fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
                                 .session_set_title(request.params, responder, connection)
                                 .await
                         }
-                        auth_status::METHOD => responder.respond(harness.auth_status().await),
+                        auth_status::METHOD => respond_json(
+                            responder,
+                            auth_status::auth_status_message!(
+                                agent_client_protocol::v1::schema,
+                                AuthStatusResponse,
+                                harness.auth_status().await
+                            ),
+                        ),
                         _ => responder.respond_with_error(Error::method_not_found()),
                     }
                 }
@@ -447,24 +476,35 @@ fn v1_component(harness: Harness) -> impl ConnectTo<Client> {
         )
 }
 
-/// Serializes an `initialize` response and adds capability markers the SDK's
-/// capability types have no field for yet. Each marker is the JSON pointer of
-/// an existing capabilities object, a field name, and its value.
-pub(crate) fn with_extra_capabilities(
-    response: impl serde::Serialize,
-    markers: &[(&str, &str, Value)],
-) -> Result<Value, Error> {
-    let mut response = serde_json::to_value(response).map_err(Error::into_internal_error)?;
-    for (pointer, name, value) in markers {
-        response
-            .pointer_mut(pointer)
-            .and_then(Value::as_object_mut)
-            .ok_or_else(|| {
-                Error::internal_error().data(format!("initialize response has no {pointer}"))
-            })?
-            .insert((*name).to_string(), value.clone());
+/// Rejects initial config options that name one option twice.
+pub(crate) fn reject_duplicate_config_ids(
+    ids: impl IntoIterator<Item = String>,
+) -> Result<(), Error> {
+    let mut seen = std::collections::HashSet::new();
+    for id in ids {
+        if !seen.insert(id.clone()) {
+            return Err(
+                Error::invalid_params().data(format!("config option {id} is set more than once"))
+            );
+        }
     }
-    Ok(response)
+    Ok(())
+}
+
+/// Serializes a typed SDK response for a request handled as JSON.
+pub(crate) fn typed_json(response: impl serde::Serialize) -> Result<Value, Error> {
+    serde_json::to_value(response).map_err(Error::into_internal_error)
+}
+
+/// Answers a request handled as JSON with a typed SDK response.
+fn respond_json(
+    responder: agent_client_protocol::v1::Responder<Value>,
+    response: impl serde::Serialize,
+) -> agent_client_protocol::Result<()> {
+    match typed_json(response) {
+        Ok(response) => responder.respond(response),
+        Err(error) => responder.respond_with_error(error),
+    }
 }
 
 /// The session ID, prompt, and idle behavior of a `_session/steering`
@@ -529,6 +569,9 @@ impl Harness {
             .resume(SessionResumeCapabilities::new())
             .close(SessionCloseCapabilities::new())
             .fork(SessionForkCapabilities::new())
+            .status(agent_client_protocol::v1::schema::SessionStatusCapabilities::new())
+            .options(agent_client_protocol::v1::schema::SessionOptionsCapabilities::new())
+            .title(agent_client_protocol::v1::schema::SessionTitleCapabilities::new())
             .system_prompt(
                 SessionSystemPromptCapabilities::new().mode(
                     SessionSystemPromptModeCapabilities::new()
@@ -549,7 +592,11 @@ impl Harness {
             )
             .mcp_capabilities(McpCapabilities::new().http(true).sse(false).acp(true))
             .session_capabilities(session_capabilities)
-            .auth(AgentAuthCapabilities::new().logout(LogoutCapabilities::new()))
+            .auth(
+                AgentAuthCapabilities::new()
+                    .logout(LogoutCapabilities::new())
+                    .status(agent_client_protocol::v1::schema::AuthStatusCapabilities::new()),
+            )
             .providers(ProvidersCapabilities::new());
 
         let response = InitializeResponse::new(ProtocolVersion::V1)
@@ -566,31 +613,14 @@ impl Harness {
                 "steering".to_string(),
                 json!({"supported": true, "idleBehaviors": ["promptRequired"]}),
             )])));
-        match with_extra_capabilities(
-            response,
-            &[
-                (
-                    "/agentCapabilities/sessionCapabilities",
-                    "status",
-                    json!({}),
-                ),
-                (
-                    "/agentCapabilities/sessionCapabilities",
-                    "setTitle",
-                    json!({}),
-                ),
-                ("/agentCapabilities/auth", "status", json!(true)),
-            ],
-        ) {
-            Ok(response) => responder.respond(response),
-            Err(error) => responder.respond_with_error(error),
-        }
+        respond_json(responder, response)
     }
 
     async fn authenticate(
         self,
         request: AuthenticateRequest,
         responder: agent_client_protocol::v1::Responder<AuthenticateResponse>,
+        connection: ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         if request.method_id.to_string() != "deepseek-api-key" {
             return responder
@@ -603,8 +633,10 @@ impl Harness {
             .credential(&self.config)
             .is_some();
         if has_credential {
+            let before = self.auth_status().await;
             self.provider.write().await.enabled = true;
-            responder.respond(AuthenticateResponse::new())
+            responder.respond(AuthenticateResponse::new())?;
+            self.announce_auth_status(&before, &connection).await
         } else {
             responder.respond_with_error(Error::auth_required().data(
                 "Configure DEEPSEEK_API_KEY or provider Authorization headers before authenticating",
@@ -616,9 +648,30 @@ impl Harness {
         self,
         _request: LogoutRequest,
         responder: agent_client_protocol::v1::Responder<LogoutResponse>,
+        connection: ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
+        let before = self.auth_status().await;
         self.provider.write().await.enabled = false;
-        responder.respond(LogoutResponse::new())
+        responder.respond(LogoutResponse::new())?;
+        self.announce_auth_status(&before, &connection).await
+    }
+
+    /// Sends `auth/status_update` when the auth state differs from `before`,
+    /// the state before the request that just changed it.
+    async fn announce_auth_status(
+        &self,
+        before: &auth_status::AuthStatus,
+        connection: &ConnectionTo<Client>,
+    ) -> agent_client_protocol::Result<()> {
+        let status = self.auth_status().await;
+        if status == *before {
+            return Ok(());
+        }
+        connection.send_notification(auth_status::auth_status_message!(
+            agent_client_protocol::v1::schema,
+            AuthStatusUpdateNotification,
+            status
+        ))
     }
 
     async fn list_providers(
@@ -642,6 +695,7 @@ impl Harness {
         self,
         request: SetProviderRequest,
         responder: agent_client_protocol::v1::Responder<SetProviderResponse>,
+        connection: ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         if request.provider_id.to_string() != "deepseek" {
             return responder.respond_with_error(
@@ -657,26 +711,31 @@ impl Harness {
             return responder
                 .respond_with_error(Error::invalid_params().data("provider base URL is invalid"));
         }
+        let before = self.auth_status().await;
         *self.provider.write().await = ProviderRouting {
             enabled: true,
             base_url: request.base_url,
             headers: request.headers,
         };
-        responder.respond(SetProviderResponse::new())
+        responder.respond(SetProviderResponse::new())?;
+        self.announce_auth_status(&before, &connection).await
     }
 
     async fn disable_provider(
         self,
         request: DisableProviderRequest,
         responder: agent_client_protocol::v1::Responder<DisableProviderResponse>,
+        connection: ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         if request.provider_id.to_string() != "deepseek" {
             return responder.respond_with_error(
                 Error::invalid_params().data("only the deepseek provider is supported"),
             );
         }
+        let before = self.auth_status().await;
         self.provider.write().await.enabled = false;
-        responder.respond(DisableProviderResponse::new())
+        responder.respond(DisableProviderResponse::new())?;
+        self.announce_auth_status(&before, &connection).await
     }
 
     async fn new_session(
@@ -692,6 +751,14 @@ impl Harness {
             Ok(prompt) => prompt,
             Err(error) => return responder.respond_with_error(error),
         };
+        if let Err(error) = reject_duplicate_config_ids(
+            request
+                .config_options
+                .iter()
+                .map(|option| option.config_id.to_string()),
+        ) {
+            return responder.respond_with_error(error);
+        }
         let runtime = match self
             .store
             .create(
@@ -716,11 +783,19 @@ impl Harness {
             let _ = self.store.delete(&runtime.snapshot().await.id).await;
             return responder.respond_with_error(error);
         }
+        if !request.config_options.is_empty() {
+            self.apply_initial_config(&runtime, &request.config_options)
+                .await;
+            if let Err(error) = self.store.save(&runtime).await {
+                let _ = self.store.delete(&runtime.snapshot().await.id).await;
+                return responder.respond_with_error(error);
+            }
+        }
         let record = runtime.snapshot().await;
         responder.respond(
             NewSessionResponse::new(record.id.clone())
-                .modes(Some(mode_state(&record)))
-                .config_options(Some(self.config_options(&record))),
+                .modes(Some(mode_state(&record.config)))
+                .config_options(Some(self.config_options(&record.config))),
         )?;
         send_available_commands(&connection, &record.id)
     }
@@ -735,6 +810,14 @@ impl Harness {
             Ok(prompt) => prompt,
             Err(error) => return responder.respond_with_error(error),
         };
+        if let Err(error) = reject_duplicate_config_ids(
+            request
+                .config_options
+                .iter()
+                .map(|option| option.config_id.to_string()),
+        ) {
+            return responder.respond_with_error(error);
+        }
         let runtime = match self.store.get(&request.session_id.to_string()).await {
             Ok(runtime) => runtime,
             Err(error) => return responder.respond_with_error(error),
@@ -792,6 +875,8 @@ impl Harness {
         if let Err(error) = self.store.refresh_workspace(&runtime).await {
             return responder.respond_with_error(error);
         }
+        self.apply_initial_config(&runtime, &request.config_options)
+            .await;
         if let Err(error) = self.store.save(&runtime).await {
             return responder.respond_with_error(error);
         }
@@ -809,8 +894,8 @@ impl Harness {
         }
         responder.respond(
             LoadSessionResponse::new()
-                .modes(Some(mode_state(&record)))
-                .config_options(Some(self.config_options(&record))),
+                .modes(Some(mode_state(&record.config)))
+                .config_options(Some(self.config_options(&record.config))),
         )?;
         send_available_commands(&connection, &record.id)
     }
@@ -825,6 +910,14 @@ impl Harness {
             Ok(prompt) => prompt,
             Err(error) => return responder.respond_with_error(error),
         };
+        if let Err(error) = reject_duplicate_config_ids(
+            request
+                .config_options
+                .iter()
+                .map(|option| option.config_id.to_string()),
+        ) {
+            return responder.respond_with_error(error);
+        }
         let runtime = match self.store.get(&request.session_id.to_string()).await {
             Ok(runtime) => runtime,
             Err(error) => return responder.respond_with_error(error),
@@ -883,14 +976,16 @@ impl Harness {
         if let Err(error) = self.store.refresh_workspace(&runtime).await {
             return responder.respond_with_error(error);
         }
+        self.apply_initial_config(&runtime, &request.config_options)
+            .await;
         if let Err(error) = self.store.save(&runtime).await {
             return responder.respond_with_error(error);
         }
         let record = runtime.snapshot().await;
         responder.respond(
             ResumeSessionResponse::new()
-                .modes(Some(mode_state(&record)))
-                .config_options(Some(self.config_options(&record))),
+                .modes(Some(mode_state(&record.config)))
+                .config_options(Some(self.config_options(&record.config))),
         )?;
         send_available_commands(&connection, &record.id)
     }
@@ -901,6 +996,14 @@ impl Harness {
         responder: agent_client_protocol::v1::Responder<ForkSessionResponse>,
         connection: ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
+        if let Err(error) = reject_duplicate_config_ids(
+            request
+                .config_options
+                .iter()
+                .map(|option| option.config_id.to_string()),
+        ) {
+            return responder.respond_with_error(error);
+        }
         let source_runtime = match self.store.get(&request.session_id.to_string()).await {
             Ok(runtime) => runtime,
             Err(error) => return responder.respond_with_error(error),
@@ -981,6 +1084,8 @@ impl Harness {
             let _ = self.store.delete(&runtime_id).await;
             return responder.respond_with_error(error);
         }
+        self.apply_initial_config(&runtime, &request.config_options)
+            .await;
         if let Err(error) = self.store.save(&runtime).await {
             let _ = self.store.delete(&runtime_id).await;
             return responder.respond_with_error(error);
@@ -988,8 +1093,8 @@ impl Harness {
         let record = runtime.snapshot().await;
         responder.respond(
             ForkSessionResponse::new(record.id.clone())
-                .modes(Some(mode_state(&record)))
-                .config_options(Some(self.config_options(&record))),
+                .modes(Some(mode_state(&record.config)))
+                .config_options(Some(self.config_options(&record.config))),
         )?;
         send_available_commands(&connection, &record.id)
     }
@@ -1092,9 +1197,14 @@ impl Harness {
             Err(error) => return responder.respond_with_error(error),
         };
         // v1 has no foreground state model, so the response has no `state`.
+        use agent_client_protocol::v1::schema::{SessionStatus, SessionStatusResponse};
         match self.store.presence(session_id).await {
-            Ok(SessionPresence::Active(_)) => responder.respond(json!({"status": "active"})),
-            Ok(SessionPresence::Inactive) => responder.respond(json!({"status": "inactive"})),
+            Ok(SessionPresence::Active(_)) => {
+                respond_json(responder, SessionStatusResponse::new(SessionStatus::Open))
+            }
+            Ok(SessionPresence::Inactive) => {
+                respond_json(responder, SessionStatusResponse::new(SessionStatus::Saved))
+            }
             Ok(SessionPresence::Unknown) => {
                 responder.respond_with_error(session_status::unknown_session(session_id))
             }
@@ -1125,7 +1235,10 @@ impl Harness {
                 ),
             ));
         }
-        responder.respond(json!({"title": stored.title}))
+        respond_json(
+            responder,
+            agent_client_protocol::v1::schema::SetSessionTitleResponse::new(stored.title),
+        )
     }
 
     async fn set_session_mode(
@@ -1162,9 +1275,66 @@ impl Harness {
         connection.send_notification(SessionNotification::new(
             SessionId::new(runtime.snapshot().await.id),
             agent_client_protocol::v1::schema::SessionUpdate::ConfigOptionUpdate(
-                ConfigOptionUpdate::new(self.config_options(&runtime.snapshot().await)),
+                ConfigOptionUpdate::new(self.config_options(&runtime.snapshot().await.config)),
             ),
         ))
+    }
+
+    /// `session/options`: the config options a session would start with.
+    /// It creates, loads, and changes nothing, and connects to no MCP server.
+    async fn session_options(
+        self,
+        request: agent_client_protocol::v1::schema::SessionOptionsRequest,
+        responder: agent_client_protocol::v1::Responder<
+            agent_client_protocol::v1::schema::SessionOptionsResponse,
+        >,
+    ) -> agent_client_protocol::Result<()> {
+        if !self.initialized.load(Ordering::Acquire) {
+            return responder.respond_with_error(Error::invalid_request().data("initialize first"));
+        }
+        let session_id = request.session_id.as_ref().map(ToString::to_string);
+        match self
+            .store
+            .config_preview(
+                &request.cwd,
+                &request.additional_directories,
+                session_id.as_deref(),
+            )
+            .await
+        {
+            Ok(config) => responder.respond(
+                agent_client_protocol::v1::schema::SessionOptionsResponse::new()
+                    .modes(mode_state(&config))
+                    .config_options(self.config_options(&config)),
+            ),
+            Err(error) => responder.respond_with_error(error),
+        }
+    }
+
+    /// Applies a setup request's initial config options in order, without
+    /// notifications. An unknown option, a mismatched value type, or a value
+    /// that is not allowed is ignored, as the protocol requires.
+    async fn apply_initial_config(
+        &self,
+        runtime: &SessionRuntime,
+        options: &[agent_client_protocol::v1::schema::InitialSessionConfigOption],
+    ) {
+        if options.is_empty() {
+            return;
+        }
+        let mut state = runtime.state.lock().await;
+        let before = state.record.config.clone();
+        for option in options {
+            let _ = apply_config_value(
+                &mut state.record,
+                &option.config_id.to_string(),
+                &option.value,
+                &self.config.models,
+            );
+        }
+        if state.record.config != before {
+            state.record.touch();
+        }
     }
 
     async fn set_session_config(
@@ -1190,7 +1360,7 @@ impl Harness {
             return responder.respond_with_error(error);
         }
         let record = runtime.snapshot().await;
-        let options = self.config_options(&record);
+        let options = self.config_options(&record.config);
         connection.send_notification(SessionNotification::new(
             request.session_id.clone(),
             agent_client_protocol::v1::schema::SessionUpdate::ConfigOptionUpdate(
@@ -1226,13 +1396,16 @@ impl Harness {
         let prompt_connection = connection.clone();
         let active_prompt = runtime.state.lock().await.active_prompt.clone();
         let request_cancellation = responder.cancellation();
+        let session_id = request.session_id.clone();
+        let suggestions_connection = connection.clone();
+        let offers_suggestions = offers_prompt_suggestions(&client_capabilities);
         let spawn_result = connection.spawn(async move {
             // `$/cancel_request` stops the turn the way `session/cancel` does,
             // so tool calls still get their final state and are saved. It
             // cancels only this child token, so the session token still shows
             // whether session/cancel or a close reached the turn.
             let turn_cancellation = cancellation.child_token();
-            let turn = harness.run_prompt(
+            let turn = harness.clone().run_prompt(
                 runtime.clone(),
                 request,
                 prompt_connection,
@@ -1254,7 +1427,11 @@ impl Harness {
             // is cancelled no other error code is valid.
             let cancelled_by_request = request_cancellation.is_cancelled();
             let stopped_by_request = cancelled_by_request && !cancellation.is_cancelled();
-            match result {
+            let ended_turn = matches!(
+                &result,
+                Ok(response) if response.stop_reason == StopReason::EndTurn
+            );
+            let responded = match result {
                 Ok(response)
                     if stopped_by_request && response.stop_reason == StopReason::Cancelled =>
                 {
@@ -1274,13 +1451,33 @@ impl Harness {
                     responder.respond_with_error(Error::request_cancelled())
                 }
                 Err(error) => responder.respond_with_error(error),
+            };
+            if offers_suggestions && ended_turn && responded.is_ok() {
+                harness
+                    .offer_prompt_suggestions(&runtime, &session_id, &suggestions_connection)
+                    .await;
             }
+            responded
         });
         if let Err(error) = spawn_result {
             active_prompt.store(false, Ordering::Release);
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Offers the prompts likely to follow the turn that just ended. Only
+    /// called for a client that advertised prompt suggestions.
+    async fn offer_prompt_suggestions(
+        &self,
+        runtime: &SessionRuntime,
+        session_id: &SessionId,
+        connection: &ConnectionTo<Client>,
+    ) {
+        crate::prompt_suggestions::suggest(self, runtime, |suggestions| {
+            send_prompt_suggestions(connection, session_id, suggestions).is_ok()
+        })
+        .await;
     }
 
     async fn steering(
@@ -1344,18 +1541,32 @@ impl Harness {
             let work_runtime = runtime.clone();
             let work_connection = connection.clone();
             let capabilities = self.client_capabilities.read().await.clone();
+            let offers_suggestions = offers_prompt_suggestions(&capabilities);
+            let work_session_id = session_id.clone();
             let spawn_result = connection.spawn(async move {
                 let result = self
+                    .clone()
                     .run_prompt(
-                        work_runtime,
+                        work_runtime.clone(),
                         request,
-                        work_connection,
+                        work_connection.clone(),
                         capabilities,
                         cancellation,
                     )
                     .await;
-                if let Err(error) = result {
-                    tracing::warn!(?error, "detached steering turn failed");
+                match result {
+                    Ok(response)
+                        if offers_suggestions && response.stop_reason == StopReason::EndTurn =>
+                    {
+                        self.offer_prompt_suggestions(
+                            &work_runtime,
+                            &work_session_id,
+                            &work_connection,
+                        )
+                        .await;
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(?error, "detached steering turn failed"),
                 }
                 Ok(())
             });
@@ -1460,6 +1671,10 @@ impl Harness {
             return Err(Error::request_cancelled());
         }
         let session_id = request.session_id.clone();
+        // The suggestions offered after the last turn are now stale.
+        if runtime.state.lock().await.prompt_suggestions.start_turn() {
+            let _ = send_prompt_suggestions(&connection, &session_id, Vec::new());
+        }
         let prompt = content_blocks_to_prompt(&request.prompt)?;
         if prompt.text.trim().is_empty() && !prompt.has_images {
             return Err(Error::invalid_params().data("prompt contains no usable content"));
@@ -2306,7 +2521,7 @@ impl Harness {
         connection.send_notification(SessionNotification::new(
             session_id.clone(),
             agent_client_protocol::v1::schema::SessionUpdate::ConfigOptionUpdate(
-                ConfigOptionUpdate::new(self.config_options(&runtime.snapshot().await)),
+                ConfigOptionUpdate::new(self.config_options(&runtime.snapshot().await.config)),
             ),
         ))?;
         Ok(Some(
@@ -2316,7 +2531,7 @@ impl Harness {
         ))
     }
 
-    fn config_options(&self, record: &SessionRecord) -> Vec<SessionConfigOption> {
+    fn config_options(&self, config: &SessionConfig) -> Vec<SessionConfigOption> {
         let model_options = self
             .config
             .models
@@ -2344,7 +2559,7 @@ impl Harness {
             SessionConfigOption::select(
                 "model",
                 "Model",
-                record.config.model.clone(),
+                config.model.clone(),
                 model_options,
             )
             .description("DeepSeek model used for this session.")
@@ -2352,7 +2567,7 @@ impl Harness {
             SessionConfigOption::select(
                 "mode",
                 "Session mode",
-                record.config.mode.clone(),
+                config.mode.clone(),
                 vec![
                     SessionConfigSelectOption::new("agent", "Agent"),
                     SessionConfigSelectOption::new("plan", "Plan"),
@@ -2363,7 +2578,7 @@ impl Harness {
             SessionConfigOption::select(
                 "permission_mode",
                 "Tool permissions",
-                record.config.permission_mode.as_str(),
+                config.permission_mode.as_str(),
                 permission_options,
             )
             .description(
@@ -2372,7 +2587,7 @@ impl Harness {
             SessionConfigOption::select(
                 "reasoning_effort",
                 "Thinking effort",
-                record.config.reasoning_effort.as_str(),
+                config.reasoning_effort.as_str(),
                 ReasoningEffort::VALUES
                     .into_iter()
                     .map(|effort| {
@@ -2386,7 +2601,7 @@ impl Harness {
             SessionConfigOption::select(
                 "web_fetch",
                 "web_fetch access",
-                if record.config.network {
+                if config.network {
                     "enabled"
                 } else {
                     "disabled"
@@ -2471,9 +2686,40 @@ fn apply_config_value(
     }
 }
 
-fn mode_state(record: &SessionRecord) -> SessionModeState {
+/// Whether the client advertised `prompt_suggestions_update` support.
+fn offers_prompt_suggestions(capabilities: &ClientCapabilities) -> bool {
+    capabilities
+        .session
+        .as_ref()
+        .is_some_and(|session| session.prompt_suggestions.is_some())
+}
+
+/// Replaces the client's list of prompt suggestions. An empty list withdraws
+/// them.
+fn send_prompt_suggestions(
+    connection: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    suggestions: Vec<String>,
+) -> Result<(), Error> {
+    use agent_client_protocol::v1::schema::{PromptSuggestion, PromptSuggestionsUpdate};
+    connection.send_notification(SessionNotification::new(
+        session_id.clone(),
+        agent_client_protocol::v1::schema::SessionUpdate::PromptSuggestionsUpdate(
+            PromptSuggestionsUpdate::new(
+                suggestions
+                    .into_iter()
+                    .map(|text| {
+                        PromptSuggestion::new(vec![ContentBlock::Text(TextContent::new(text))])
+                    })
+                    .collect(),
+            ),
+        ),
+    ))
+}
+
+fn mode_state(config: &SessionConfig) -> SessionModeState {
     SessionModeState::new(
-        SessionModeId::new(record.config.mode.clone()),
+        SessionModeId::new(config.mode.clone()),
         vec![
             SessionMode::new("agent", "Agent")
                 .description("Inspect, edit, test, and complete the requested task."),

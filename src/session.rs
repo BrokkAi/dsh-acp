@@ -43,6 +43,8 @@ pub struct SessionStore {
     default_model: Arc<str>,
     default_permission: crate::config::PermissionMode,
     default_reasoning_effort: crate::config::ReasoningEffort,
+    /// The user's home directory, where the user's own skills are found.
+    home: Option<Arc<Path>>,
 }
 
 #[derive(Clone, Debug)]
@@ -77,6 +79,7 @@ impl SessionStore {
             default_model: Arc::from(config.default_model.as_str()),
             default_permission: config.permission_mode,
             default_reasoning_effort: config.reasoning_effort,
+            home: crate::skills::user_home().map(Arc::from),
         })
     }
 
@@ -97,6 +100,7 @@ impl SessionStore {
             default_model: self.default_model.clone(),
             default_permission: self.default_permission,
             default_reasoning_effort: self.default_reasoning_effort,
+            home: self.home.clone(),
         }
     }
 
@@ -195,6 +199,51 @@ impl SessionStore {
             }
             Err(error) => Err(Error::into_internal_error(error)),
         }
+    }
+
+    /// The config `session/options` reports: a new session's when
+    /// `session_id` is `None`, otherwise that session's, under the roots rules
+    /// of `session/new` and `session/resume`.
+    ///
+    /// Nothing is created, loaded, or changed. A stored session's record is
+    /// read from disk and left out of memory.
+    pub async fn config_preview(
+        &self,
+        cwd: &Path,
+        additional_directories: &[PathBuf],
+        session_id: Option<&str>,
+    ) -> Result<crate::model::SessionConfig, Error> {
+        let Some(id) = session_id else {
+            crate::workspace::WorkspaceRoots::open(cwd, additional_directories)?;
+            return Ok(crate::model::SessionConfig::new(
+                self.default_model.to_string(),
+                self.default_permission,
+                self.default_reasoning_effort,
+            ));
+        };
+        let (stored_cwd, config) = match self.presence(id).await? {
+            SessionPresence::Active(runtime) => {
+                let state = runtime.state.lock().await;
+                (state.record.cwd.clone(), state.record.config.clone())
+            }
+            SessionPresence::Inactive => {
+                let record = self.read_record(id).await?;
+                (record.cwd, record.config)
+            }
+            SessionPresence::Unknown => {
+                return Err(crate::session_status::unknown_session(id));
+            }
+        };
+        let requested_cwd = crate::workspace::canonical_directory(cwd)?;
+        if stored_cwd != requested_cwd {
+            return Err(Error::invalid_params().data(format!(
+                "session cwd mismatch: stored {}, requested {}",
+                stored_cwd.display(),
+                requested_cwd.display()
+            )));
+        }
+        validate_roots(cwd, additional_directories)?;
+        Ok(config)
     }
 
     /// Stores a title the client chose, and reports where the session was.
@@ -428,6 +477,20 @@ impl SessionStore {
             .retain(|_, elicitation| elicitation.session_id != session_id);
     }
 
+    /// Where skills are searched for a session with these workspace roots.
+    pub(crate) fn skill_roots<'a>(
+        &'a self,
+        cwd: &'a Path,
+        additional_directories: &'a [PathBuf],
+    ) -> crate::skills::SkillRoots<'a> {
+        crate::skills::SkillRoots {
+            workspace: std::iter::once(cwd)
+                .chain(additional_directories.iter().map(PathBuf::as_path))
+                .collect(),
+            home: self.home.as_deref(),
+        }
+    }
+
     pub fn effective_system_prompt(&self, record: &SessionRecord) -> Result<String, Error> {
         // An override replaces only the harness's own text. Launch
         // configuration and AGENTS.md files still follow it.
@@ -648,14 +711,17 @@ pub fn session_title(record: &SessionRecord) -> Option<String> {
         .iter()
         .find(|message| message.role == Role::User)
         .and_then(|message| message.text_content())
-        .map(|content| {
-            let single_line = content.split_whitespace().collect::<Vec<_>>().join(" ");
-            if single_line.chars().count() > 80 {
-                format!("{}...", single_line.chars().take(77).collect::<String>())
-            } else {
-                single_line
-            }
-        })
+        .map(title_from_text)
+}
+
+/// A generated title: `text` on one line, cut to 80 characters.
+pub(crate) fn title_from_text(text: &str) -> String {
+    let single_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.chars().count() > 80 {
+        format!("{}...", single_line.chars().take(77).collect::<String>())
+    } else {
+        single_line
+    }
 }
 
 pub(crate) fn validate_roots(cwd: &Path, additional: &[PathBuf]) -> Result<(), Error> {
@@ -688,6 +754,7 @@ mod tests {
             mcp_connect_timeout: std::time::Duration::from_secs(1),
             allow_insecure_mcp_http: false,
             disable_web: true,
+            disable_prompt_suggestions: false,
             trace: false,
         };
         let store = SessionStore::open(&config).await.unwrap();
@@ -732,6 +799,7 @@ mod tests {
             mcp_connect_timeout: std::time::Duration::from_secs(1),
             allow_insecure_mcp_http: false,
             disable_web: true,
+            disable_prompt_suggestions: false,
             trace: false,
         };
         let store = SessionStore::open(&config).await.unwrap();
@@ -768,6 +836,7 @@ mod tests {
             mcp_connect_timeout: std::time::Duration::from_secs(1),
             allow_insecure_mcp_http: false,
             disable_web: true,
+            disable_prompt_suggestions: false,
             trace: false,
         };
         let store = SessionStore::open(&config).await.unwrap();
@@ -824,6 +893,7 @@ mod tests {
             mcp_connect_timeout: std::time::Duration::from_secs(1),
             allow_insecure_mcp_http: false,
             disable_web: true,
+            disable_prompt_suggestions: false,
             trace: false,
         };
         let store = SessionStore::open(&config).await.unwrap();
@@ -917,6 +987,7 @@ mod tests {
             mcp_connect_timeout: std::time::Duration::from_secs(1),
             allow_insecure_mcp_http: false,
             disable_web: true,
+            disable_prompt_suggestions: false,
             trace: false,
         };
         let store = SessionStore::open(&config).await.unwrap();
@@ -996,6 +1067,7 @@ mod tests {
             mcp_connect_timeout: std::time::Duration::from_secs(1),
             allow_insecure_mcp_http: false,
             disable_web: true,
+            disable_prompt_suggestions: false,
             trace: false,
         };
         let store = SessionStore::open(&config).await.unwrap();
@@ -1064,6 +1136,7 @@ mod tests {
             mcp_connect_timeout: std::time::Duration::from_secs(1),
             allow_insecure_mcp_http: false,
             disable_web: true,
+            disable_prompt_suggestions: false,
             trace: false,
         };
         let store = SessionStore::open(&config).await.unwrap();
@@ -1160,6 +1233,7 @@ mod tests {
             mcp_connect_timeout: std::time::Duration::from_secs(1),
             allow_insecure_mcp_http: false,
             disable_web: true,
+            disable_prompt_suggestions: false,
             trace: false,
         };
         let store = SessionStore::open(&config).await.unwrap();
@@ -1196,6 +1270,7 @@ mod tests {
             mcp_connect_timeout: std::time::Duration::from_secs(1),
             allow_insecure_mcp_http: false,
             disable_web: true,
+            disable_prompt_suggestions: false,
             trace: false,
         };
         let store = SessionStore::open(&config).await.unwrap();
@@ -1237,6 +1312,7 @@ mod tests {
             mcp_connect_timeout: std::time::Duration::from_secs(1),
             allow_insecure_mcp_http: false,
             disable_web: true,
+            disable_prompt_suggestions: false,
             trace: false,
         };
         let store = SessionStore::open(&config).await.unwrap();

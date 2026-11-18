@@ -30,6 +30,8 @@ struct Peer {
     /// Each `elicitation/complete` the agent sent, with how many updates the
     /// peer had received by then.
     elicitation_completions: Vec<(Value, usize)>,
+    /// Each `auth/status_update` notification the agent sent, in order.
+    auth_updates: Vec<Value>,
     /// Each `mcp/message` request the agent sent, in order.
     mcp_requests: Vec<Value>,
     /// Answers `mcp/message` requests as an MCP-over-ACP provider: the reply's
@@ -214,6 +216,10 @@ impl Peer {
             if value.get("method").and_then(Value::as_str) == Some("elicitation/complete") {
                 self.elicitation_completions
                     .push((value, self.updates.len()));
+                continue;
+            }
+            if value.get("method").and_then(Value::as_str) == Some("auth/status_update") {
+                self.auth_updates.push(value);
                 continue;
             }
             return value;
@@ -745,11 +751,11 @@ async fn session_status_reports_sessions_without_loading_them() {
     let status = peer
         .request("session/status", json!({"sessionId": session_id}))
         .await;
-    assert_eq!(status, json!({"status": "active"}));
+    assert_eq!(status, json!({"status": "open"}));
     let status = peer
         .request("session/status", json!({"sessionId": closed_id}))
         .await;
-    assert_eq!(status, json!({"status": "inactive"}));
+    assert_eq!(status, json!({"status": "saved"}));
     for unknown in [deleted_id.as_str(), "dsh-never-created", "../outside", ""] {
         let error = peer
             .request_error("session/status", json!({"sessionId": unknown}))
@@ -814,7 +820,7 @@ async fn session_status_reports_sessions_without_loading_them() {
         let status = peer
             .request("session/status", json!({"sessionId": session_id}))
             .await;
-        assert_eq!(status, json!({"status": "inactive"}));
+        assert_eq!(status, json!({"status": "saved"}));
     }
     let error = peer
         .request_error("session/status", json!({"sessionId": deleted_id}))
@@ -830,7 +836,7 @@ async fn session_status_reports_sessions_without_loading_them() {
     let status = peer
         .request("session/status", json!({"sessionId": session_id}))
         .await;
-    assert_eq!(status, json!({"status": "active"}));
+    assert_eq!(status, json!({"status": "open"}));
 
     drop(peer.stdin);
     let exit = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait())
@@ -866,7 +872,7 @@ async fn v2_session_status_reports_foreground_state() {
         .await;
     assert_eq!(
         status,
-        json!({"status": "active", "state": {"state": "idle"}})
+        json!({"status": "open", "state": {"state": "idle"}})
     );
 
     peer.request(
@@ -897,7 +903,7 @@ async fn v2_session_status_reports_foreground_state() {
         .await;
     assert_eq!(
         status,
-        json!({"status": "active", "state": {"state": "requires_action"}})
+        json!({"status": "open", "state": {"state": "requires_action"}})
     );
     peer.write(json!({
         "jsonrpc": "2.0",
@@ -912,7 +918,7 @@ async fn v2_session_status_reports_foreground_state() {
         .await;
     assert_eq!(
         status,
-        json!({"status": "active", "state": {"state": "idle"}})
+        json!({"status": "open", "state": {"state": "idle"}})
     );
 
     peer.request("session/close", json!({"sessionId": session_id}))
@@ -920,7 +926,7 @@ async fn v2_session_status_reports_foreground_state() {
     let status = peer
         .request("session/status", json!({"sessionId": session_id}))
         .await;
-    assert_eq!(status, json!({"status": "inactive"}));
+    assert_eq!(status, json!({"status": "saved"}));
     peer.request("session/delete", json!({"sessionId": session_id}))
         .await;
     let error = peer
@@ -992,7 +998,7 @@ async fn v2_session_status_reports_a_running_turn() {
         .await;
     assert_eq!(
         status,
-        json!({"status": "active", "state": {"state": "running"}})
+        json!({"status": "open", "state": {"state": "running"}})
     );
 
     peer.write(json!({
@@ -1008,7 +1014,7 @@ async fn v2_session_status_reports_a_running_turn() {
         .await;
     assert_eq!(
         status,
-        json!({"status": "active", "state": {"state": "idle"}})
+        json!({"status": "open", "state": {"state": "idle"}})
     );
 
     drop(peer.stdin);
@@ -1309,7 +1315,7 @@ async fn v2_session_status_answers_while_an_mcp_call_is_in_flight() {
         .expect("session/status waited for the MCP call");
         assert_eq!(
             status,
-            json!({"status": "active", "state": {"state": state}}),
+            json!({"status": "open", "state": {"state": state}}),
             "{state}"
         );
     }
@@ -1428,10 +1434,9 @@ async fn initialize_advertising_auth_status(peer: &mut Peer, protocol: &AuthProt
                 json!({"protocolVersion": 1, "clientCapabilities": {}}),
             )
             .await;
-        // The RFD's v1 example uses a boolean.
         (
             result["agentCapabilities"]["auth"].clone(),
-            json!({"logout": {}, "status": true}),
+            json!({"logout": {}, "status": {}}),
         )
     } else {
         let result = peer
@@ -1463,15 +1468,27 @@ async fn auth_status(peer: &mut Peer, secrets: &[&str]) -> (bool, String) {
             "auth/status leaked a credential: {text}"
         );
     }
-    (
-        status["authenticated"]
-            .as_bool()
-            .expect("authenticated is a boolean"),
-        status["message"]
-            .as_str()
-            .expect("message is a string")
-            .to_string(),
-    )
+    let state = status["state"].as_str().expect("state is a string");
+    assert!(
+        ["authenticated", "unauthenticated"].contains(&state),
+        "unexpected state: {status}"
+    );
+    let authenticated = state == "authenticated";
+    // At most one account, active exactly when it is in use. The returned
+    // text is its label and source, or empty without a credential.
+    let accounts = status
+        .get("accounts")
+        .map_or(&[][..], |accounts| accounts.as_array().unwrap());
+    assert!(accounts.len() <= 1, "{status}");
+    let account = accounts.first().map_or_else(String::new, |account| {
+        assert_eq!(account["active"], authenticated, "{status}");
+        format!(
+            "{}: {}",
+            account["label"].as_str().unwrap(),
+            account["description"].as_str().unwrap()
+        )
+    });
+    (authenticated, account)
 }
 
 #[tokio::test]
@@ -1496,7 +1513,7 @@ async fn auth_status_reports_the_configured_key_until_sign_out() {
         peer.request(protocol.logout, json!({})).await;
         let (authenticated, message) = auth_status(&mut peer, &secrets).await;
         assert!(!authenticated, "v{v}: after {}: {message}", protocol.logout);
-        assert!(message.contains("disabled"), "v{v}: {message}");
+        assert!(message.contains("DEEPSEEK_API_KEY"), "v{v}: {message}");
 
         peer.request(protocol.login, json!({"methodId": "deepseek-api-key"}))
             .await;
@@ -1507,7 +1524,7 @@ async fn auth_status_reports_the_configured_key_until_sign_out() {
             .await;
         let (authenticated, message) = auth_status(&mut peer, &secrets).await;
         assert!(!authenticated, "v{v}: after providers/disable: {message}");
-        assert!(message.contains("disabled"), "v{v}: {message}");
+        assert!(message.contains("DEEPSEEK_API_KEY"), "v{v}: {message}");
 
         peer.request(
             "providers/set",
@@ -1527,7 +1544,34 @@ async fn auth_status_reports_the_configured_key_until_sign_out() {
         let status = peer
             .request("auth/status", json!({"_meta": {"trace": "abc"}}))
             .await;
-        assert_eq!(status["authenticated"], true, "v{v}: with _meta");
+        assert_eq!(status["state"], "authenticated", "v{v}: with _meta");
+
+        // Each change above was announced once, and asking was not.
+        let states: Vec<&Value> = peer
+            .auth_updates
+            .iter()
+            .map(|update| &update["params"]["state"])
+            .collect();
+        assert_eq!(
+            states,
+            [
+                "unauthenticated",
+                "authenticated",
+                "unauthenticated",
+                "authenticated"
+            ],
+            "v{v}: {:?}",
+            peer.auth_updates
+        );
+        assert_eq!(
+            peer.auth_updates[3]["params"]["accounts"][0]["label"], "DeepSeek provider header",
+            "v{v}"
+        );
+        // A request that leaves the state as it was announces nothing.
+        peer.request(protocol.logout, json!({})).await;
+        peer.request(protocol.logout, json!({})).await;
+        auth_status(&mut peer, &secrets).await;
+        assert_eq!(peer.auth_updates.len(), 5, "v{v}: {:?}", peer.auth_updates);
     }
 }
 
@@ -1576,14 +1620,15 @@ async fn auth_status_reports_missing_credentials() {
             .await;
         let reply = peer.next_message().await;
         assert_eq!(reply["id"], 900, "v{v}: {reply}");
-        assert_eq!(reply["result"]["authenticated"], false, "v{v}: {reply}");
+        assert_eq!(
+            reply["result"],
+            json!({"state": "unauthenticated"}),
+            "v{v}: {reply}"
+        );
 
         let (authenticated, message) = auth_status(&mut peer, &secrets).await;
         assert!(!authenticated, "v{v}: no key: {message}");
-        assert!(
-            message.contains("No DeepSeek credentials"),
-            "v{v}: {message}"
-        );
+        assert!(message.is_empty(), "v{v}: {message}");
 
         let login = peer
             .request_error(protocol.login, json!({"methodId": "deepseek-api-key"}))
@@ -1611,10 +1656,7 @@ async fn auth_status_reports_missing_credentials() {
             !authenticated,
             "v{v}: headers without Authorization: {message}"
         );
-        assert!(
-            message.contains("No DeepSeek credentials"),
-            "v{v}: {message}"
-        );
+        assert!(message.is_empty(), "v{v}: {message}");
 
         peer.request(
             "providers/set",
@@ -1636,7 +1678,7 @@ async fn auth_status_reports_missing_credentials() {
         peer.request(protocol.logout, json!({})).await;
         let (authenticated, message) = auth_status(&mut peer, &secrets).await;
         assert!(!authenticated, "v{v}: after {}: {message}", protocol.logout);
-        assert!(message.contains("disabled"), "v{v}: {message}");
+        assert!(message.contains("Authorization header"), "v{v}: {message}");
 
         peer.request(protocol.login, json!({"methodId": "deepseek-api-key"}))
             .await;
@@ -1662,9 +1704,9 @@ async fn initialize_advertising_set_title(peer: &mut Peer, version: u64) {
     };
     let result = peer.request("initialize", params).await;
     let marker = if version == 1 {
-        &result["agentCapabilities"]["sessionCapabilities"]["setTitle"]
+        &result["agentCapabilities"]["sessionCapabilities"]["title"]
     } else {
-        &result["capabilities"]["session"]["setTitle"]
+        &result["capabilities"]["session"]["title"]
     };
     assert_eq!(marker, &json!({}), "v{version}: {result}");
 }
@@ -1844,7 +1886,7 @@ async fn set_title_renames_a_session_that_is_not_loaded() {
         let status = peer
             .request("session/status", json!({"sessionId": session_id}))
             .await;
-        assert_eq!(status["status"], "inactive", "v{version}: not loaded");
+        assert_eq!(status["status"], "saved", "v{version}: not loaded");
         assert_eq!(
             listed_title(&mut peer, &session_id).await,
             "Migration plan",
@@ -2122,6 +2164,573 @@ async fn sessions_stored_without_the_title_flag_still_get_generated_titles() {
     }
 }
 
+/// The current value of config option `id` in a `configOptions` list.
+fn config_value<'a>(options: &'a Value, id: &str) -> &'a Value {
+    options
+        .as_array()
+        .expect("configOptions is an array")
+        .iter()
+        // v1 names the option `id`, v2 `configId`.
+        .find(|option| option["id"] == id || option["configId"] == id)
+        .map(|option| &option["currentValue"])
+        .unwrap_or_else(|| panic!("no config option {id} in {options}"))
+}
+
+/// An initial config option entry that selects `value` for `id`.
+fn initial_config(version: u64, id: &str, value: &str) -> Value {
+    if version == 1 {
+        json!({"configId": id, "value": value})
+    } else {
+        json!({"configId": id, "type": "id", "value": value})
+    }
+}
+
+#[tokio::test]
+async fn session_options_previews_config_and_setup_requests_take_initial_values() {
+    for version in [1, 2] {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().to_string_lossy().to_string();
+        let mut peer = spawn_peer(temp.path(), None).await;
+        let initialize = peer.request("initialize", initialize_params(version)).await;
+        let marker = if version == 1 {
+            &initialize["agentCapabilities"]["sessionCapabilities"]["options"]
+        } else {
+            &initialize["capabilities"]["session"]["options"]
+        };
+        assert_eq!(marker, &json!({}), "v{version}: {initialize}");
+
+        // A new session's options, without creating one.
+        let preview = peer
+            .request(
+                "session/options",
+                json!({"cwd": cwd, "additionalDirectories": []}),
+            )
+            .await;
+        let options = &preview["configOptions"];
+        assert_eq!(config_value(options, "mode"), "agent", "v{version}");
+        assert_eq!(config_value(options, "reasoning_effort"), "high");
+        if version == 1 {
+            assert_eq!(preview["modes"]["currentModeId"], "agent");
+        } else {
+            assert!(!preview["availableCommands"].as_array().unwrap().is_empty());
+        }
+        let listed = peer.request("session/list", json!({})).await;
+        assert_eq!(listed["sessions"], json!([]), "v{version}: nothing created");
+        assert!(peer.updates.is_empty(), "v{version}: {:?}", peer.updates);
+
+        // Initial values apply in order. An unknown option and a value that
+        // is not allowed are ignored.
+        let session = peer
+            .request(
+                "session/new",
+                json!({
+                    "cwd": cwd,
+                    "mcpServers": [],
+                    "additionalDirectories": [],
+                    "configOptions": [
+                        initial_config(version, "mode", "plan"),
+                        initial_config(version, "no_such_option", "x"),
+                        initial_config(version, "permission_mode", "sometimes"),
+                        initial_config(version, "reasoning_effort", "low"),
+                    ]
+                }),
+            )
+            .await;
+        let session_id = session["sessionId"].as_str().unwrap().to_string();
+        let options = &session["configOptions"];
+        assert_eq!(config_value(options, "mode"), "plan", "v{version}");
+        assert_eq!(config_value(options, "permission_mode"), "ask");
+        assert_eq!(config_value(options, "reasoning_effort"), "low");
+        if version == 1 {
+            assert_eq!(session["modes"]["currentModeId"], "plan");
+        }
+        assert!(
+            !peer.updates.iter().any(|update| {
+                update["params"]["update"]["sessionUpdate"] == "config_option_update"
+            }),
+            "v{version}: initial values send no config update: {:?}",
+            peer.updates
+        );
+        assert_eq!(
+            stored_record(temp.path(), &session_id)["config"]["mode"],
+            "plan",
+            "v{version}: the initial values are saved"
+        );
+
+        // An existing session's options, whether or not it is loaded.
+        for loaded in [true, false] {
+            if !loaded {
+                peer.request("session/close", json!({"sessionId": session_id}))
+                    .await;
+            }
+            let preview = peer
+                .request(
+                    "session/options",
+                    json!({"cwd": cwd, "sessionId": session_id}),
+                )
+                .await;
+            let options = &preview["configOptions"];
+            assert_eq!(config_value(options, "mode"), "plan", "v{version}");
+            assert_eq!(config_value(options, "reasoning_effort"), "low");
+        }
+        let status = peer
+            .request("session/status", json!({"sessionId": session_id}))
+            .await;
+        assert_eq!(status["status"], "saved", "v{version}: not loaded");
+
+        let unknown = peer
+            .request_error(
+                "session/options",
+                json!({"cwd": cwd, "sessionId": "dsh-never-created"}),
+            )
+            .await;
+        assert_eq!(unknown["code"], -32002, "v{version}: {unknown}");
+        let elsewhere = tempfile::tempdir().unwrap();
+        let mismatch = peer
+            .request_error(
+                "session/options",
+                json!({
+                    "cwd": elsewhere.path().to_string_lossy(),
+                    "sessionId": session_id
+                }),
+            )
+            .await;
+        assert_eq!(mismatch["code"], -32602, "v{version}: {mismatch}");
+
+        // Naming an option twice fails the request and creates nothing.
+        let duplicate = peer
+            .request_error(
+                "session/new",
+                json!({
+                    "cwd": cwd,
+                    "mcpServers": [],
+                    "additionalDirectories": [],
+                    "configOptions": [
+                        initial_config(version, "mode", "plan"),
+                        initial_config(version, "mode", "agent"),
+                    ]
+                }),
+            )
+            .await;
+        assert_eq!(duplicate["code"], -32602, "v{version}: {duplicate}");
+        if version == 2 {
+            let unsupported = peer
+                .request_error(
+                    "session/new",
+                    json!({
+                        "cwd": cwd,
+                        "mcpServers": [],
+                        "additionalDirectories": [],
+                        "configOptions": [
+                            {"configId": "mode", "type": "number", "value": 3}
+                        ]
+                    }),
+                )
+                .await;
+            assert_eq!(unsupported["code"], -32602, "v{version}: {unsupported}");
+        }
+        let listed = peer.request("session/list", json!({})).await;
+        assert_eq!(listed["sessions"].as_array().unwrap().len(), 1);
+
+        // A resume applies initial values on top of the stored ones.
+        let resumed = peer
+            .request(
+                "session/resume",
+                json!({
+                    "sessionId": session_id,
+                    "cwd": cwd,
+                    "mcpServers": [],
+                    "additionalDirectories": [],
+                    "configOptions": [initial_config(version, "mode", "agent")]
+                }),
+            )
+            .await;
+        let options = &resumed["configOptions"];
+        assert_eq!(config_value(options, "mode"), "agent", "v{version}");
+        assert_eq!(config_value(options, "reasoning_effort"), "low");
+
+        exit_peer(peer).await;
+    }
+}
+
+/// `initialize` params for a client that offers prompt suggestions.
+fn initialize_offering_prompt_suggestions(version: u64) -> Value {
+    if version == 1 {
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {"session": {"promptSuggestions": {}}}
+        })
+    } else {
+        json!({
+            "protocolVersion": 2,
+            "info": {"name": "suggestions-test-client", "version": "1.0.0"},
+            "capabilities": {"session": {"promptSuggestions": {}}}
+        })
+    }
+}
+
+/// A model reply whose whole text is `text`.
+fn mock_reply_stream(text: &str) -> String {
+    encode_sse(&[
+        json!({"choices":[{"delta":{"content": text}}]}),
+        json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+        json!({"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":2,"total_tokens":22}}),
+    ])
+}
+
+/// The prompt texts of each `prompt_suggestions_update` the peer has
+/// received, in order.
+fn suggestion_updates(peer: &Peer) -> Vec<Vec<String>> {
+    peer.updates
+        .iter()
+        .map(|update| &update["params"]["update"])
+        .filter(|update| update["sessionUpdate"] == "prompt_suggestions_update")
+        .map(|update| {
+            update["suggestions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|suggestion| {
+                    assert_eq!(suggestion["prompt"].as_array().unwrap().len(), 1);
+                    assert_eq!(suggestion["prompt"][0]["type"], "text");
+                    suggestion["prompt"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Reads updates until the peer has received `count` suggestion updates.
+async fn await_suggestion_updates(peer: &mut Peer, count: usize) {
+    while suggestion_updates(peer).len() < count {
+        let message = peer.next_message().await;
+        assert_eq!(message["method"], "session/update", "{message}");
+        peer.updates.push(message);
+    }
+}
+
+#[tokio::test]
+async fn a_finished_turn_offers_prompt_suggestions_to_a_client_that_takes_them() {
+    for version in [1, 2] {
+        let temp = tempfile::tempdir().unwrap();
+        let Some((base_url, server)) = mock_sequence_server(vec![
+            mock_text_stream(),
+            mock_reply_stream(
+                "```json\n[\"Run the tests\", \"Commit the change\", \"Run the tests\"]\n```",
+            ),
+            mock_text_stream(),
+            mock_reply_stream("[]"),
+        ])
+        .await
+        else {
+            eprintln!("skipping prompt suggestions test: loopback networking is unavailable");
+            return;
+        };
+        let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+        peer.request(
+            "initialize",
+            initialize_offering_prompt_suggestions(version),
+        )
+        .await;
+        let session_id = peer_new_session(&mut peer, &temp.path().to_string_lossy()).await;
+
+        prompt_until_end_turn(&mut peer, version, &session_id, "Fix the parser").await;
+        await_suggestion_updates(&mut peer, 1).await;
+        assert_eq!(
+            suggestion_updates(&peer),
+            [["Run the tests", "Commit the change"]],
+            "v{version}"
+        );
+
+        // The next turn withdraws them. It ends with nothing to suggest, so
+        // no further update follows; its request is still counted as usage.
+        prompt_until_end_turn(&mut peer, version, &session_id, "Now the lexer").await;
+        await_suggestion_updates(&mut peer, 2).await;
+        assert!(suggestion_updates(&peer)[1].is_empty(), "v{version}");
+        for _ in 0..200 {
+            if stored_record(temp.path(), &session_id)["usage"]["total_tokens"] == 88 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            stored_record(temp.path(), &session_id)["usage"]["total_tokens"],
+            88,
+            "v{version}: both turns and both suggestion requests are counted"
+        );
+        peer.request("session/list", json!({})).await;
+        assert_eq!(suggestion_updates(&peer).len(), 2, "v{version}");
+        exit_peer(peer).await;
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 4, "v{version}");
+        // The suggestions request is small: no tools, no thinking, and only
+        // the last exchange, not the session's history or system prompt.
+        let request = &requests[1];
+        assert!(request.get("tools").is_none(), "v{version}: {request}");
+        assert_eq!(request["reasoning_effort"], "none", "v{version}");
+        assert_eq!(request["max_tokens"], 300, "v{version}");
+        let messages = request["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2, "v{version}: {request}");
+        let quoted = messages[1]["content"].as_str().unwrap();
+        assert!(quoted.contains("Fix the parser"), "v{version}: {quoted}");
+        assert!(quoted.contains("mock answer"), "v{version}: {quoted}");
+        // Suggestions are not history.
+        let stored = stored_record(temp.path(), &session_id).to_string();
+        assert!(!stored.contains("Run the tests"), "v{version}: {stored}");
+    }
+}
+
+#[tokio::test]
+async fn prompt_suggestions_can_be_disabled_at_launch() {
+    for version in [1, 2] {
+        let temp = tempfile::tempdir().unwrap();
+        let Some((base_url, server)) = mock_sequence_server(vec![mock_text_stream()]).await else {
+            eprintln!("skipping prompt suggestions test: loopback networking is unavailable");
+            return;
+        };
+        let mut peer = spawn_peer_with_args(
+            temp.path(),
+            Some(&base_url),
+            &["--disable-prompt-suggestions"],
+        )
+        .await;
+        peer.request(
+            "initialize",
+            initialize_offering_prompt_suggestions(version),
+        )
+        .await;
+        let session_id = peer_new_session(&mut peer, &temp.path().to_string_lossy()).await;
+        prompt_until_end_turn(&mut peer, version, &session_id, "Fix the parser").await;
+        // The only request the server accepts was the turn's own.
+        assert_eq!(server.await.unwrap().len(), 1, "v{version}");
+        peer.request("session/list", json!({})).await;
+        assert!(suggestion_updates(&peer).is_empty(), "v{version}");
+        exit_peer(peer).await;
+    }
+}
+
+/// The `skill` entries of an `availableCommands` list.
+fn skill_commands(commands: &Value) -> Vec<&Value> {
+    commands
+        .as_array()
+        .expect("availableCommands is an array")
+        .iter()
+        .filter(|command| command["type"] == "skill")
+        .collect()
+}
+
+#[tokio::test]
+async fn v2_lists_skills_and_applies_the_one_a_prompt_invokes() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().to_string_lossy().to_string();
+    let skill_dir = temp.path().join(".agents/skills/review");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: review\ndescription: Review the current change\n---\nRead the diff first.\n",
+    )
+    .unwrap();
+    // The peer's home directory is `home` under its data directory.
+    let user_skill_dir = temp.path().join("home/.agents/skills/notes");
+    std::fs::create_dir_all(&user_skill_dir).unwrap();
+    std::fs::write(
+        user_skill_dir.join("SKILL.md"),
+        "---\nname: notes\ndescription: Keep notes\n---\nKeep notes in NOTES.md.\n",
+    )
+    .unwrap();
+    // The project's skill of the same name overrides the user's.
+    let shadowed_dir = temp.path().join("home/.agents/skills/review");
+    std::fs::create_dir_all(&shadowed_dir).unwrap();
+    std::fs::write(
+        shadowed_dir.join("SKILL.md"),
+        "---\nname: review\ndescription: The user's review\n---\nShadowed.\n",
+    )
+    .unwrap();
+    let Some((base_url, server)) =
+        mock_sequence_server(vec![mock_text_stream(), mock_text_stream()]).await
+    else {
+        eprintln!("skipping skills test: loopback networking is unavailable");
+        return;
+    };
+
+    // A client that does not take `skill` entries is sent none.
+    let mut plain = spawn_peer(temp.path(), None).await;
+    let initialize = plain.request("initialize", initialize_params(2)).await;
+    assert_eq!(
+        initialize["capabilities"]["session"]["prompt"]["skill"],
+        json!({}),
+        "{initialize}"
+    );
+    let session = plain
+        .request(
+            "session/new",
+            json!({"cwd": cwd, "mcpServers": [], "additionalDirectories": []}),
+        )
+        .await;
+    assert!(skill_commands(&session["availableCommands"]).is_empty());
+    exit_peer(plain).await;
+
+    let mut peer = spawn_peer(temp.path(), Some(&base_url)).await;
+    peer.request(
+        "initialize",
+        json!({
+            "protocolVersion": 2,
+            "info": {"name": "skills-test-client", "version": "1.0.0"},
+            "capabilities": {"session": {"commands": {"skill": {}}}}
+        }),
+    )
+    .await;
+    let preview = peer.request("session/options", json!({"cwd": cwd})).await;
+    assert_eq!(skill_commands(&preview["availableCommands"]).len(), 2);
+    let session = peer
+        .request(
+            "session/new",
+            json!({"cwd": cwd, "mcpServers": [], "additionalDirectories": []}),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+    let skills = skill_commands(&session["availableCommands"]);
+    assert_eq!(skills.len(), 2, "{session}");
+    // Project skills come first.
+    assert_eq!(skills[0]["name"], "review");
+    assert_eq!(skills[0]["description"], "Review the current change");
+    assert_eq!(skills[1]["name"], "notes");
+    assert_eq!(skills[1]["description"], "Keep notes");
+    let path = std::path::Path::new(skills[0]["path"].as_str().unwrap());
+    assert!(path.is_absolute(), "{path:?}");
+    assert!(path.ends_with(".agents/skills/review/SKILL.md"), "{path:?}");
+    assert_eq!(
+        session["availableCommands"].as_array().unwrap().len(),
+        7,
+        "the slash commands are still listed"
+    );
+
+    // A prompt may invoke one skill the session has, as its first block.
+    for (prompt, reason) in [
+        (
+            json!([{"type": "skill", "name": "no-such-skill"}]),
+            "an unknown skill",
+        ),
+        (
+            json!([{"type": "skill", "name": "help"}]),
+            "a slash command is not a skill",
+        ),
+        (
+            json!([
+                {"type": "text", "text": "Check it"},
+                {"type": "skill", "name": "review"}
+            ]),
+            "a skill block after the first block",
+        ),
+    ] {
+        let error = peer
+            .request_error(
+                "session/prompt",
+                json!({"sessionId": session_id, "prompt": prompt}),
+            )
+            .await;
+        assert_eq!(error["code"], -32602, "{reason}: {error}");
+    }
+    let steering = peer
+        .request_error(
+            "_session/steering",
+            json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "skill", "name": "review"}]
+            }),
+        )
+        .await;
+    assert_eq!(steering["code"], -32602, "{steering}");
+
+    peer.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [
+                {"type": "skill", "name": "review"},
+                {"type": "text", "text": "Check the parser change"}
+            ]
+        }),
+    )
+    .await;
+    let idle = next_v2_idle(&mut peer).await;
+    assert_eq!(idle["params"]["update"]["stopReason"], "end_turn", "{idle}");
+    // The title is what the user wrote, not the skill's text.
+    assert_eq!(
+        listed_title(&mut peer, &session_id).await,
+        "Check the parser change"
+    );
+    // A skill needs no input.
+    peer.request(
+        "session/prompt",
+        json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "skill", "name": "notes"}]
+        }),
+    )
+    .await;
+    let idle = next_v2_idle(&mut peer).await;
+    assert_eq!(idle["params"]["update"]["stopReason"], "end_turn", "{idle}");
+
+    // Replay shows the prompt as the client sent it.
+    let replay_start = peer.updates.len();
+    peer.request(
+        "session/resume",
+        json!({
+            "sessionId": session_id,
+            "cwd": cwd,
+            "mcpServers": [],
+            "additionalDirectories": [],
+            "replayFrom": {"type": "start"}
+        }),
+    )
+    .await;
+    assert!(
+        peer.updates[replay_start..].iter().any(|update| {
+            let update = &update["params"]["update"];
+            update["sessionUpdate"] == "user_message"
+                && update["content"]
+                    == json!([
+                        {"type": "skill", "name": "review"},
+                        {"type": "text", "text": "Check the parser change"}
+                    ])
+        }),
+        "{:?}",
+        &peer.updates[replay_start..]
+    );
+    exit_peer(peer).await;
+
+    // The model gets the skill's instructions ahead of the user's text.
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let last_user = |request: &Value| {
+        request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|message| message["role"] == "user")
+            .unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let first = last_user(&requests[0]);
+    assert!(
+        first.starts_with("The user invoked the skill \"review\""),
+        "{first}"
+    );
+    assert!(first.contains("Read the diff first."), "{first}");
+    assert!(!first.contains("description:"), "{first}");
+    assert!(first.ends_with("Check the parser change"), "{first}");
+    let second = last_user(&requests[1]);
+    assert!(second.contains("Keep notes in NOTES.md."), "{second}");
+}
+
 async fn spawn_peer(data_dir: &std::path::Path, base_url: Option<&str>) -> Peer {
     spawn_peer_with_args(data_dir, base_url, &[]).await
 }
@@ -2175,7 +2784,11 @@ async fn spawn_peer_with_options(
         .stderr(stderr)
         // The default log filter, whatever the test's environment: tests that
         // pipe stderr depend on how much the server logs.
-        .env_remove("RUST_LOG");
+        .env_remove("RUST_LOG")
+        // A home directory of the test's own, so the skills of whoever runs
+        // the tests are never found.
+        .env("HOME", data_dir.join("home"))
+        .env("USERPROFILE", data_dir.join("home"));
     if let Some(base_url) = base_url {
         command
             .arg("--base-url")
@@ -2204,6 +2817,7 @@ async fn spawn_peer_with_options(
         elicitation_requests: Vec::new(),
         elicitation_answer: Some("accept"),
         elicitation_completions: Vec::new(),
+        auth_updates: Vec::new(),
         mcp_requests: Vec::new(),
         mcp_provider: serve_acp_mcp,
     }
@@ -5805,6 +6419,27 @@ async fn v2_prompt_runs_local_tool_loop_and_permission_request() {
         update["params"]["update"]["sessionUpdate"] == "agent_message"
             && update["params"]["update"]["content"][0]["text"] == "mock answer"
     }));
+    // The replay ends with one `replay_complete`; only the current state
+    // snapshot follows it.
+    let kinds: Vec<&str> = replayed
+        .iter()
+        .map(|update| {
+            update["params"]["update"]["sessionUpdate"]
+                .as_str()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| **kind == "replay_complete")
+            .count(),
+        1
+    );
+    assert_eq!(
+        &kinds[kinds.len() - 2..],
+        ["replay_complete", "state_update"]
+    );
     assert!(replayed.iter().any(|update| {
         update["params"]["update"]["sessionUpdate"] == "tool_call_update"
             && update["params"]["update"]["status"] == "completed"
@@ -5833,6 +6468,28 @@ async fn v2_prompt_runs_local_tool_loop_and_permission_request() {
                 })
             })
     }));
+
+    // A resume that asks for no replay sends no marker.
+    let resume_start = peer.updates.len();
+    peer.request(
+        "session/resume",
+        json!({
+            "sessionId": session_id,
+            "cwd": temp.path().to_string_lossy(),
+            "mcpServers": [],
+            "additionalDirectories": []
+        }),
+    )
+    .await;
+    let kinds: Vec<&str> = peer.updates[resume_start..]
+        .iter()
+        .map(|update| {
+            update["params"]["update"]["sessionUpdate"]
+                .as_str()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(kinds, ["state_update"]);
 
     drop(peer.stdin);
     let status = tokio::time::timeout(std::time::Duration::from_secs(5), peer.child.wait())

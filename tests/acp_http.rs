@@ -287,6 +287,11 @@ impl Peer {
                 }
                 return message["result"].clone();
             }
+            // The agent announces a change of auth state after it answers
+            // the request that made it.
+            if message["method"] == "auth/status_update" {
+                continue;
+            }
             assert_eq!(message["method"], "session/update", "{message}");
             self.updates.push(message);
         }
