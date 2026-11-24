@@ -1187,11 +1187,12 @@ async fn rejected_requests_log_little_and_the_connection_keeps_serving() {
 
 #[tokio::test]
 async fn a_burst_of_rejected_requests_does_not_fill_an_unread_stderr_pipe() {
-    // Each rejection still logs one warning of a few hundred bytes. Linux
-    // pipes hold 64 KiB, but macOS and Windows pipes can hold much less, so
-    // the burst is smaller there. Before #53 a single rejection logged about
-    // 1 MB, which filled any pipe and stalled the connection.
-    let burst = if cfg!(target_os = "linux") { 50 } else { 6 };
+    // Each rejection logs a small, bounded amount of text. Linux pipes are
+    // not guaranteed to hold 64 KiB; this container uses 8 KiB. Before #53 a
+    // single rejection logged about 1 MB, which filled any pipe and stalled
+    // the connection, so a small burst still catches that regression across
+    // platforms.
+    let burst = 5;
     for version in [1, 2] {
         let temp = tempfile::tempdir().unwrap();
         // Piped and never read, like a client that ignores stderr.

@@ -715,7 +715,7 @@ impl Harness {
         *self.provider.write().await = ProviderRouting {
             enabled: true,
             base_url: request.base_url,
-            headers: request.headers,
+            headers: request.headers.into_iter().collect(),
         };
         responder.respond(SetProviderResponse::new())?;
         self.announce_auth_status(&before, &connection).await

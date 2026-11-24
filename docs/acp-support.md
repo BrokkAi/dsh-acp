@@ -82,7 +82,7 @@ HTTP (POST, GET event streams, DELETE) and WebSocket instead, per the
 [Streamable HTTP & WebSocket Transport RFD](https://agentclientprotocol.com/rfds/streamable-http-websocket-transport).
 The RFD is in the Active stage of the RFD process, which signals current work,
 not stability; the wire format may still change. The transport is the SDK's
-`agent-client-protocol-http` 5.3 server, unchanged, so where that server
+`agent-client-protocol-http` 5.5.1 server, unchanged, so where that server
 differs from the RFD, dsh-acp does too. For example, it answers a JSON-RPC
 batch with `400` and one Invalid Request error instead of `501`. It also
 opens an event stream for an `Acp-Session-Id` the connection does not know
@@ -112,7 +112,7 @@ trade-offs of `--listen-allow-remote`.
 `session/status` follows the
 [Session Status RFD](https://agentclientprotocol.com/rfds/session-status),
 which is still a Draft. The response and capability marker are the unstable
-types of `agent-client-protocol` 5.3 and may change with the RFD. Both
+types of `agent-client-protocol` 5.5.1 and may change with the RFD. Both
 versions advertise it with an empty marker:
 `agentCapabilities.sessionCapabilities.status` in v1 and
 `capabilities.session.status` in v2.
@@ -151,7 +151,7 @@ reported as `saved` and fails when resumed.
 `session/set_title` follows the
 [Client-Set Session Titles RFD](https://agentclientprotocol.com/rfds/session-set-title),
 which is still a Draft. The response and capability marker are the unstable
-types of `agent-client-protocol` 5.3 and may change with the RFD. Both
+types of `agent-client-protocol` 5.5.1 and may change with the RFD. Both
 versions advertise it with an empty marker:
 `agentCapabilities.sessionCapabilities.title` in v1 and
 `capabilities.session.title` in v2. Releases through 0.6.1 followed an
@@ -199,7 +199,7 @@ process holds, but `dsh-acp` cannot tell that one does.
 `auth/status` follows the
 [Agent Authentication State Query RFD](https://agentclientprotocol.com/rfds/get-auth-state),
 which is still a Draft. The response and capability marker are the unstable
-types of `agent-client-protocol` 5.3 and may change with the RFD. Both
+types of `agent-client-protocol` 5.5.1 and may change with the RFD. Both
 versions advertise it with an empty marker:
 `agentCapabilities.auth.status` in v1 and `capabilities.auth.status` in v2.
 
@@ -264,9 +264,10 @@ token usage, with `_meta["mjolnir.dev/usage-scope"] = "turn"`. Session
 
 ## Session options
 
-`session/options` is unstable in ACP schema 1.18 and may change. Both versions
-advertise it with an empty marker: `agentCapabilities.sessionCapabilities.options`
-in v1 and `capabilities.session.options` in v2.
+`session/options` is unstable in ACP schema 1.21.2 and may change. Both
+versions advertise it with an empty marker:
+`agentCapabilities.sessionCapabilities.options` in v1 and
+`capabilities.session.options` in v2.
 
 The request takes a `cwd`, optional `additionalDirectories`, and an optional
 `sessionId`, and returns the `configOptions` that session would start with. v1
@@ -298,7 +299,7 @@ and the source's values for a fork, and are saved. The response's
 
 ## Prompt suggestions
 
-Prompt suggestions are unstable in ACP schema 1.18 and may change. A client
+Prompt suggestions are unstable in ACP schema 1.21.2 and may change. A client
 opts in with the `session.promptSuggestions` client capability, in either
 protocol version.
 
@@ -320,7 +321,7 @@ Suggestions are not session history. They are not stored and not replayed.
 
 ## Agent skills
 
-Agent skills are unstable in ACP schema 1.18, exist only in protocol v2, and
+Agent skills are unstable in ACP schema 1.21.2, exist only in protocol v2, and
 may change. The agent advertises `capabilities.session.prompt.skill: {}`: a
 prompt may carry one `skill` content block, as its first block.
 
