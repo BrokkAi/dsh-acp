@@ -10,7 +10,7 @@
 [![ACP](https://img.shields.io/badge/ACP-v1%20%7C%20v2-blue.svg)](https://agentclientprotocol.com/)
 
 `dsh-acp` is a DeepSeek-powered coding agent and ACP server built on
-`agent-client-protocol` 5.3. It negotiates ACP v2 when the client requests it
+`agent-client-protocol` 5.5.1. It negotiates ACP v2 when the client requests it
 and falls back to ACP v1 for older clients. It serves ACP over stdio, or over
 streamable HTTP and WebSocket with `--listen`.
 
@@ -305,8 +305,8 @@ advertised as `auth.status` in the agent's capabilities, and are sent
 `auth/status_update` when it changes. See
 [docs/acp-support.md](docs/acp-support.md#authentication-status).
 
-Three unstable features of ACP schema 1.18 are also implemented; details are in
-[docs/acp-support.md](docs/acp-support.md):
+Three unstable features of ACP schema 1.21.2 are also implemented; details are
+in [docs/acp-support.md](docs/acp-support.md):
 
 - **`session/options`**, in both versions: the config options a session would
   start with, without creating or loading one. Session setup requests accept

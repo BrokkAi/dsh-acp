@@ -485,7 +485,7 @@ impl V2Harness {
         *self.base.provider.write().await = crate::agent::ProviderRouting {
             enabled: true,
             base_url: request.base_url,
-            headers: request.headers,
+            headers: request.headers.into_iter().collect(),
         };
         responder.respond(SetProviderResponse::new())?;
         self.announce_auth_status(&before, &connection).await
@@ -1750,10 +1750,9 @@ impl V2Harness {
                 send_update(
                     connection,
                     session_id,
-                    SessionUpdate::CompactionUpdate(CompactionUpdate::new(
-                        compaction_id,
-                        CompactionStatus::Completed,
-                    )),
+                    SessionUpdate::CompactionUpdate(
+                        CompactionUpdate::new(compaction_id).status(CompactionStatus::Completed),
+                    ),
                 )?;
                 compaction_reported = true;
             }
@@ -2841,7 +2840,7 @@ fn diff_content(diff: &PersistedDiff) -> ToolCallContent {
         DiffChange::add(&diff.path)
     }
     .file_type(Some(DiffFileType::Text));
-    ToolCallContent::Diff(Diff::patch(git_patch(diff), vec![operation]))
+    ToolCallContent::Diff(Box::new(Diff::patch(git_patch(diff), vec![operation])))
 }
 
 enum PermissionDecision {
@@ -3089,7 +3088,9 @@ fn replay_history(
         send_update(
             connection,
             &v2_session_id(&record.id),
-            SessionUpdate::CompactionUpdate(CompactionUpdate::new(compaction.id.clone(), status)),
+            SessionUpdate::CompactionUpdate(
+                CompactionUpdate::new(compaction.id.clone()).status(status),
+            ),
         )?;
     }
     send_update(

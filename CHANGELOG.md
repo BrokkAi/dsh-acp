@@ -4,6 +4,13 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.7.1 - 2026-11-24
+
+- `agent-client-protocol` and `agent-client-protocol-http` are now 5.5.1
+  (schema 1.21.2). Provider headers are converted from the schema's ordered map
+  at the SDK boundary, and v2 diffs and compaction status use the updated
+  payload builders.
+
 ## Unreleased
 
 ## 0.7.0 - 2026-11-18
@@ -466,7 +473,10 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 - Integration coverage for v1/v2 handshakes, images, tools, failed-tool replay,
   terminal output, commands, cancellation, and steering.
 
-[Unreleased]: https://github.com/BrokkAi/dsh-acp/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/BrokkAi/dsh-acp/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/BrokkAi/dsh-acp/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/BrokkAi/dsh-acp/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/BrokkAi/dsh-acp/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/BrokkAi/dsh-acp/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/BrokkAi/dsh-acp/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/BrokkAi/dsh-acp/compare/v0.2.3...v0.3.0
