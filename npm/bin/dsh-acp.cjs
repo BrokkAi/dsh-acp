@@ -2,6 +2,7 @@
 'use strict';
 
 const { spawn } = require('node:child_process');
+const { createRequire } = require('node:module');
 const path = require('node:path');
 
 function targetFor(platform, arch, glibc) {
@@ -33,8 +34,26 @@ function main() {
     return;
   }
 
+  const env = { ...process.env };
+  const args = process.argv.slice(2);
+  const localOnly = args.includes('--version') || args.includes('--help') || args.includes('-h');
+  if (!localOnly && !env.DSH_ACP_DSH_COMMAND && !env.DSH_ACP_DSH_JS) {
+    try {
+      const requireFromPackage = createRequire(__filename);
+      const manifest = requireFromPackage.resolve('@deepseek-ai/dsh/package.json');
+      const packageRoot = path.dirname(manifest);
+      env.DSH_ACP_DSH_JS = path.join(packageRoot, 'lib', 'bin.js');
+      env.DSH_ACP_NODE = process.execPath;
+      env.DSH_ACP_RUNTIME_MODULES = path.resolve(packageRoot, '..', '..');
+    } catch (error) {
+      console.error(`dsh-acp: Could not locate the pinned @deepseek-ai/dsh runtime: ${error.message}`);
+      process.exitCode = 1;
+      return;
+    }
+  }
+
   // Keep ACP stdin/stdout byte-for-byte intact, including when launched by npx.
-  const child = spawn(binary, process.argv.slice(2), { stdio: 'inherit' });
+  const child = spawn(binary, args, { stdio: 'inherit', env });
   const handlers = new Map();
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
     const handler = () => child.kill(signal);

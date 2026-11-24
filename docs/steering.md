@@ -68,8 +68,7 @@ Any `idleBehavior` other than `promptRequired` is rejected with `-32602`.
 Steered input is acknowledged with a normal user-message update and retained in
 session history. Multiple steering requests for a session are serialized.
 
-DeepSeek streams a single HTTP generation and cannot accept Codex-style
-mid-generation input. Steering is therefore applied at the next safe boundary:
-after the current generation and any already-requested tool calls, before the
-session reports idle. It does not silently start a second concurrent model
-request.
+Active steering is forwarded to the exact DSH Agent inbox. DeepSeek Harness
+consumes it at its next safe step boundary; it does not silently start a second
+concurrent model request. The Rust frontend still owns ACP acknowledgment,
+`promptRequired`, and the session turn lock.

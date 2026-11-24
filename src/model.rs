@@ -394,6 +394,11 @@ pub struct SessionRecord {
     pub context_used: u64,
     #[serde(default)]
     pub parent_session_id: Option<String>,
+    /// Exact DSH session events observed on this connection. DSH remains the
+    /// execution owner; this projection makes ACP load replay independent of
+    /// backend-specific Rust message reconstruction.
+    #[serde(default)]
+    pub dsh_events: Vec<serde_json::Value>,
 }
 
 impl SessionRecord {
@@ -430,6 +435,7 @@ impl SessionRecord {
             usage: TokenUsage::default(),
             context_used: 0,
             parent_session_id,
+            dsh_events: Vec::new(),
         }
     }
 

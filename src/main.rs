@@ -26,7 +26,7 @@ struct Cli {
     #[arg(
         long,
         env = "DEEPSEEK_BASE_URL",
-        default_value = "https://api.deepseek.com"
+        default_value = "https://api.deepseek.com/anthropic"
     )]
     base_url: String,
 
@@ -117,6 +117,30 @@ struct Cli {
         value_parser = clap::builder::BoolishValueParser::new())]
     trace: bool,
 
+    /// The pinned `dsh` executable used as the execution runtime.
+    #[arg(long, env = "DSH_ACP_DSH_COMMAND", default_value = "dsh")]
+    dsh_command: std::path::PathBuf,
+
+    /// Run DSH's JavaScript entry point with this Node executable.
+    #[arg(long, env = "DSH_ACP_DSH_JS", hide = true)]
+    dsh_js: Option<std::path::PathBuf>,
+
+    /// Node executable paired with --dsh-js.
+    #[arg(long, env = "DSH_ACP_NODE", hide = true, default_value = "node")]
+    node: std::path::PathBuf,
+
+    /// DSH profile under which the ACP runtime plugin is mounted.
+    #[arg(long, env = "DSH_ACP_DSH_PROFILE", default_value = "sdk")]
+    dsh_profile: String,
+
+    /// Explicit DSH home. When omitted, DSH chooses its own.
+    #[arg(long, env = "DSH_ACP_DSH_HOME")]
+    dsh_home: Option<std::path::PathBuf>,
+
+    /// Node_modules directory containing the pinned DSH packages.
+    #[arg(long, env = "DSH_ACP_RUNTIME_MODULES", hide = true)]
+    dsh_runtime_modules: Option<std::path::PathBuf>,
+
     /// Serve ACP over streamable HTTP and WebSocket at http://ADDR/acp
     /// instead of stdio, e.g. 127.0.0.1:8787 (port 0 picks a free port).
     ///
@@ -177,6 +201,10 @@ impl TryFrom<Cli> for Config {
             (None, Some(path)) => Some(read_api_key_file(&path)?),
             (None, None) => std::env::var("DEEPSEEK_API_KEY").ok(),
         };
+        let (dsh_command, dsh_prefix_args) = match cli.dsh_js {
+            Some(script) => (cli.node, vec![script.to_string_lossy().into_owned()]),
+            None => (cli.dsh_command, Vec::new()),
+        };
         Ok(Self {
             api_key,
             base_url: cli.base_url,
@@ -195,6 +223,11 @@ impl TryFrom<Cli> for Config {
             disable_web: cli.disable_web,
             disable_prompt_suggestions: cli.disable_prompt_suggestions,
             trace: cli.trace,
+            dsh_command,
+            dsh_prefix_args,
+            dsh_profile: cli.dsh_profile,
+            dsh_home: cli.dsh_home,
+            dsh_runtime_modules: cli.dsh_runtime_modules,
         })
     }
 }

@@ -1828,8 +1828,7 @@ fn is_public_ip(address: std::net::IpAddr) -> bool {
             }
             // IETF protocol assignments and documentation, plus deprecated
             // 6to4 and the newer documentation prefix.
-            !(segments[0] == 0x2001 && segments[1] <= 0x01ff)
-                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+            !(segments[0] == 0x2001 && (segments[1] <= 0x01ff || segments[1] == 0x0db8))
                 && segments[0] != 0x2002
                 && !(segments[0] == 0x3fff && segments[1] <= 0x0fff)
         }

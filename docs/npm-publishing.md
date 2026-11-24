@@ -4,7 +4,10 @@ The public package is `@brokkai/dsh-acp`; its executable is `dsh-acp`.
 `npm/package.json` is a private packaging template. The packager takes the
 version from `Cargo.toml`, removes `private`, and bundles the six verified
 native release binaries with a small Node.js launcher. It includes no npm
-dependencies or install scripts. Do not publish the template directory.
+dependencies beyond the exact official `@deepseek-ai/dsh@0.2.2-rc.5` runtime
+and no install scripts. The launcher resolves that runtime and its module root
+for the native bridge. Node.js 24.9 or newer is required. Do not publish the
+template directory.
 
 ## Release workflow
 

@@ -24,12 +24,12 @@ use agent_client_protocol::{
         PlanEntry, PlanEntryPriority, PlanEntryStatus, PromptCapabilities, PromptRequest,
         PromptResponse, ProviderCurrentConfig, ProviderId, ProviderInfo, ProvidersCapabilities,
         RequestPermissionOutcome, RequestPermissionRequest, ResumeSessionRequest,
-        ResumeSessionResponse, SelectedPermissionOutcome, SessionAdditionalDirectoriesCapabilities,
-        SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
-        SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
-        SessionDeleteCapabilities, SessionForkCapabilities, SessionId, SessionInfo,
-        SessionInfoUpdate, SessionListCapabilities, SessionMode, SessionModeId, SessionModeState,
-        SessionNotification, SessionResumeCapabilities, SessionSystemPromptCapabilities,
+        ResumeSessionResponse, SelectedPermissionOutcome, SessionCapabilities,
+        SessionCloseCapabilities, SessionConfigOption, SessionConfigOptionCategory,
+        SessionConfigOptionValue, SessionConfigSelectOption, SessionDeleteCapabilities,
+        SessionForkCapabilities, SessionId, SessionInfo, SessionInfoUpdate,
+        SessionListCapabilities, SessionMode, SessionModeId, SessionModeState, SessionNotification,
+        SessionResumeCapabilities, SessionSystemPromptCapabilities,
         SessionSystemPromptModeCapabilities, SessionSystemPromptOverrideCapabilities,
         SetProviderRequest, SetProviderResponse, SetSessionConfigOptionRequest,
         SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
@@ -38,7 +38,6 @@ use agent_client_protocol::{
         UsageUpdate,
     },
 };
-use chrono::SecondsFormat;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -46,7 +45,8 @@ use crate::{
     auth_status,
     config::{Config, PermissionMode, ReasoningEffort},
     deepseek::{Completion, DeepSeekClient, StreamEvent},
-    mcp::{AcpConnection, McpSession, mcp_result_text},
+    dsh::DshRuntimeProvider,
+    mcp::{AcpConnection, mcp_result_text},
     model::{
         ChatMessage, ClientPromptMode, ClientSystemPrompt, ContentPart, ImageUrl, MessageContent,
         PendingUserMessage, PersistedCompaction, PersistedDiff, Role, SessionConfig, SessionRecord,
@@ -72,6 +72,7 @@ pub(crate) struct Harness {
     pub(crate) client_capabilities: Arc<tokio::sync::RwLock<ClientCapabilities>>,
     pub(crate) initialized: Arc<AtomicBool>,
     pub(crate) provider: Arc<tokio::sync::RwLock<ProviderRouting>>,
+    pub(crate) dsh: DshRuntimeProvider,
 }
 
 #[derive(Clone, Debug)]
@@ -138,9 +139,10 @@ fn default_log_filter(trace: bool) -> String {
 pub async fn run(config: Config) -> agent_client_protocol::Result<()> {
     init_tracing(&config);
     let store = SessionStore::open(&config).await?;
-    component(Harness::new(config, store))
-        .connect_to(stdio_transport())
-        .await
+    let harness = Harness::new(config, store);
+    // A bad or missing pinned runtime must fail before ACP claims stdin/stdout.
+    harness.dsh.get().await?;
+    component(harness).connect_to(stdio_transport()).await
 }
 
 /// Send diagnostics to stderr, which never carries ACP traffic.
@@ -166,12 +168,96 @@ impl Harness {
             headers: std::collections::HashMap::new(),
         };
         Self {
+            dsh: DshRuntimeProvider::new(config.dsh_runtime_config()),
             config,
             store,
             client_capabilities: Arc::new(tokio::sync::RwLock::new(ClientCapabilities::default())),
             initialized: Arc::new(AtomicBool::new(false)),
             provider: Arc::new(tokio::sync::RwLock::new(provider)),
         }
+    }
+
+    pub(crate) async fn open_dsh_session(
+        &self,
+        record: &SessionRecord,
+        resume: bool,
+    ) -> Result<(), Error> {
+        let runtime = self.dsh.get().await?;
+        let mut initialize = json!({
+            "provider": "deepseek-official",
+            "model": record.config.model,
+            "reasoningEffort": dsh_reasoning_effort(record.config.reasoning_effort),
+            "permissionMode": record.config.permission_mode.as_str(),
+        });
+        if let Some(max_tokens) = self.config.max_tokens {
+            initialize["maxTokens"] = json!(max_tokens);
+        }
+        runtime.request("dsh/initialize", initialize).await?;
+        let mut session = json!({
+            "sessionId": record.id,
+            "cwd": record.cwd,
+            "provider": "deepseek-official",
+            "model": record.config.model,
+            "reasoningEffort": dsh_reasoning_effort(record.config.reasoning_effort),
+        });
+        if let Some(max_tokens) = self.config.max_tokens {
+            session["maxTokens"] = json!(max_tokens);
+        }
+        runtime
+            .request(
+                if resume {
+                    "dsh/session/resume"
+                } else {
+                    "dsh/session/open"
+                },
+                session,
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn close_dsh_session(&self, session_id: &str) -> Result<(), Error> {
+        self.dsh
+            .get()
+            .await?
+            .request("dsh/session/close", json!({"sessionId": session_id}))
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn sync_dsh_config(&self, record: &SessionRecord) -> Result<(), Error> {
+        let runtime = self.dsh.get().await?;
+        runtime
+            .request(
+                "dsh/session/set_mode",
+                json!({
+                    "sessionId": record.id,
+                    "modeId": record.config.mode,
+                }),
+            )
+            .await?;
+        runtime
+            .request(
+                "dsh/session/set_config",
+                json!({
+                    "sessionId": record.id,
+                    "provider": "deepseek-official",
+                    "model": record.config.model,
+                    "reasoningEffort": dsh_reasoning_effort(record.config.reasoning_effort),
+                    "permissionMode": record.config.permission_mode.as_str(),
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+fn dsh_reasoning_effort(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::None => "off",
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::Max => "max",
     }
 }
 
@@ -491,6 +577,15 @@ pub(crate) fn reject_duplicate_config_ids(
     Ok(())
 }
 
+fn reject_additional_directories(directories: &[std::path::PathBuf]) -> Result<(), Error> {
+    if directories.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::invalid_params()
+            .data("additionalDirectories is not supported by the pinned DSH runtime"))
+    }
+}
+
 /// Serializes a typed SDK response for a request handled as JSON.
 pub(crate) fn typed_json(response: impl serde::Serialize) -> Result<Value, Error> {
     serde_json::to_value(response).map_err(Error::into_internal_error)
@@ -565,7 +660,6 @@ impl Harness {
         let session_capabilities = SessionCapabilities::new()
             .list(SessionListCapabilities::new())
             .delete(SessionDeleteCapabilities::new())
-            .additional_directories(SessionAdditionalDirectoriesCapabilities::new())
             .resume(SessionResumeCapabilities::new())
             .close(SessionCloseCapabilities::new())
             .fork(SessionForkCapabilities::new())
@@ -590,7 +684,7 @@ impl Harness {
                     )
                     .embedded_context(true),
             )
-            .mcp_capabilities(McpCapabilities::new().http(true).sse(false).acp(true))
+            .mcp_capabilities(McpCapabilities::new().http(true).sse(false))
             .session_capabilities(session_capabilities)
             .auth(
                 AgentAuthCapabilities::new()
@@ -711,6 +805,21 @@ impl Harness {
             return responder
                 .respond_with_error(Error::invalid_params().data("provider base URL is invalid"));
         }
+        if let Err(error) = self
+            .dsh
+            .get()
+            .await?
+            .request(
+                "dsh/provider/set",
+                json!({
+                    "baseUrl": request.base_url.clone(),
+                    "headers": serde_json::to_value(&request.headers).map_err(Error::into_internal_error)?,
+                }),
+            )
+            .await
+        {
+            return responder.respond_with_error(error);
+        }
         let before = self.auth_status().await;
         *self.provider.write().await = ProviderRouting {
             enabled: true,
@@ -733,6 +842,15 @@ impl Harness {
             );
         }
         let before = self.auth_status().await;
+        if let Err(error) = self
+            .dsh
+            .get()
+            .await?
+            .request("dsh/provider/disable", json!({}))
+            .await
+        {
+            return responder.respond_with_error(error);
+        }
         self.provider.write().await.enabled = false;
         responder.respond(DisableProviderResponse::new())?;
         self.announce_auth_status(&before, &connection).await
@@ -746,6 +864,9 @@ impl Harness {
     ) -> agent_client_protocol::Result<()> {
         if !self.initialized.load(Ordering::Acquire) {
             return responder.respond_with_error(Error::invalid_request().data("initialize first"));
+        }
+        if let Err(error) = reject_additional_directories(&request.additional_directories) {
+            return responder.respond_with_error(error);
         }
         let system_prompt = match client_system_prompt(request.system_prompt.as_ref()) {
             Ok(prompt) => prompt,
@@ -773,6 +894,14 @@ impl Harness {
             Err(error) => return responder.respond_with_error(error),
         };
         if let Err(error) = self
+            .open_dsh_session(&runtime.snapshot().await, false)
+            .await
+        {
+            let _ = self.close_dsh_session(&runtime.snapshot().await.id).await;
+            let _ = self.store.delete(&runtime.snapshot().await.id).await;
+            return responder.respond_with_error(error);
+        }
+        if let Err(error) = self
             .attach_mcp(
                 &runtime,
                 &request.mcp_servers,
@@ -780,13 +909,20 @@ impl Harness {
             )
             .await
         {
+            let _ = self.close_dsh_session(&runtime.snapshot().await.id).await;
             let _ = self.store.delete(&runtime.snapshot().await.id).await;
             return responder.respond_with_error(error);
         }
         if !request.config_options.is_empty() {
             self.apply_initial_config(&runtime, &request.config_options)
                 .await;
+            if let Err(error) = self.sync_dsh_config(&runtime.snapshot().await).await {
+                let _ = self.close_dsh_session(&runtime.snapshot().await.id).await;
+                let _ = self.store.delete(&runtime.snapshot().await.id).await;
+                return responder.respond_with_error(error);
+            }
             if let Err(error) = self.store.save(&runtime).await {
+                let _ = self.close_dsh_session(&runtime.snapshot().await.id).await;
                 let _ = self.store.delete(&runtime.snapshot().await.id).await;
                 return responder.respond_with_error(error);
             }
@@ -797,7 +933,7 @@ impl Harness {
                 .modes(Some(mode_state(&record.config)))
                 .config_options(Some(self.config_options(&record.config))),
         )?;
-        send_available_commands(&connection, &record.id)
+        self.send_dsh_commands(&connection, &record.id).await
     }
 
     async fn load_session(
@@ -810,6 +946,9 @@ impl Harness {
             Ok(prompt) => prompt,
             Err(error) => return responder.respond_with_error(error),
         };
+        if let Err(error) = reject_additional_directories(&request.additional_directories) {
+            return responder.respond_with_error(error);
+        }
         if let Err(error) = reject_duplicate_config_ids(
             request
                 .config_options
@@ -860,6 +999,9 @@ impl Harness {
                 Err(error) => return responder.respond_with_error(error),
             }
         };
+        if let Err(error) = self.open_dsh_session(&runtime.snapshot().await, true).await {
+            return responder.respond_with_error(error);
+        }
         // A load whose MCP servers fail to connect leaves the session as it was.
         if let Err(error) = self
             .attach_mcp(
@@ -869,15 +1011,30 @@ impl Harness {
             )
             .await
         {
+            let _ = self
+                .close_dsh_session(&request.session_id.to_string())
+                .await;
             return responder.respond_with_error(error);
         }
         instructions.install(&mut runtime.state.lock().await.record);
         if let Err(error) = self.store.refresh_workspace(&runtime).await {
+            let _ = self
+                .close_dsh_session(&request.session_id.to_string())
+                .await;
             return responder.respond_with_error(error);
         }
         self.apply_initial_config(&runtime, &request.config_options)
             .await;
+        if let Err(error) = self.sync_dsh_config(&runtime.snapshot().await).await {
+            let _ = self
+                .close_dsh_session(&request.session_id.to_string())
+                .await;
+            return responder.respond_with_error(error);
+        }
         if let Err(error) = self.store.save(&runtime).await {
+            let _ = self
+                .close_dsh_session(&request.session_id.to_string())
+                .await;
             return responder.respond_with_error(error);
         }
         let record = runtime.snapshot().await;
@@ -897,7 +1054,7 @@ impl Harness {
                 .modes(Some(mode_state(&record.config)))
                 .config_options(Some(self.config_options(&record.config))),
         )?;
-        send_available_commands(&connection, &record.id)
+        self.send_dsh_commands(&connection, &record.id).await
     }
 
     async fn resume_session(
@@ -910,6 +1067,9 @@ impl Harness {
             Ok(prompt) => prompt,
             Err(error) => return responder.respond_with_error(error),
         };
+        if let Err(error) = reject_additional_directories(&request.additional_directories) {
+            return responder.respond_with_error(error);
+        }
         if let Err(error) = reject_duplicate_config_ids(
             request
                 .config_options
@@ -960,6 +1120,9 @@ impl Harness {
                 Err(error) => return responder.respond_with_error(error),
             }
         };
+        if let Err(error) = self.open_dsh_session(&runtime.snapshot().await, true).await {
+            return responder.respond_with_error(error);
+        }
         // A resume whose MCP servers fail to connect leaves the session as it
         // was.
         if let Err(error) = self
@@ -970,15 +1133,30 @@ impl Harness {
             )
             .await
         {
+            let _ = self
+                .close_dsh_session(&request.session_id.to_string())
+                .await;
             return responder.respond_with_error(error);
         }
         instructions.install(&mut runtime.state.lock().await.record);
         if let Err(error) = self.store.refresh_workspace(&runtime).await {
+            let _ = self
+                .close_dsh_session(&request.session_id.to_string())
+                .await;
             return responder.respond_with_error(error);
         }
         self.apply_initial_config(&runtime, &request.config_options)
             .await;
+        if let Err(error) = self.sync_dsh_config(&runtime.snapshot().await).await {
+            let _ = self
+                .close_dsh_session(&request.session_id.to_string())
+                .await;
+            return responder.respond_with_error(error);
+        }
         if let Err(error) = self.store.save(&runtime).await {
+            let _ = self
+                .close_dsh_session(&request.session_id.to_string())
+                .await;
             return responder.respond_with_error(error);
         }
         let record = runtime.snapshot().await;
@@ -987,7 +1165,7 @@ impl Harness {
                 .modes(Some(mode_state(&record.config)))
                 .config_options(Some(self.config_options(&record.config))),
         )?;
-        send_available_commands(&connection, &record.id)
+        self.send_dsh_commands(&connection, &record.id).await
     }
 
     async fn fork_session(
@@ -996,6 +1174,9 @@ impl Harness {
         responder: agent_client_protocol::v1::Responder<ForkSessionResponse>,
         connection: ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
+        if let Err(error) = reject_additional_directories(&request.additional_directories) {
+            return responder.respond_with_error(error);
+        }
         if let Err(error) = reject_duplicate_config_ids(
             request
                 .config_options
@@ -1049,6 +1230,29 @@ impl Harness {
             Err(error) => return responder.respond_with_error(error),
         };
         let runtime_id = runtime.snapshot().await.id;
+        let fork = match self.dsh.get().await {
+            Ok(dsh) => {
+                dsh.request(
+                    "dsh/session/fork",
+                    json!({
+                        "sourceSessionId": source.id,
+                        "childSessionId": runtime_id.clone(),
+                        "cwd": source.cwd,
+                        "provider": "deepseek-official",
+                        "model": source.config.model,
+                        "reasoningEffort": dsh_reasoning_effort(source.config.reasoning_effort),
+                        "permissionMode": source.config.permission_mode.as_str(),
+                    }),
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = fork {
+            let _ = self.close_dsh_session(&runtime_id).await;
+            let _ = self.store.delete(&runtime_id).await;
+            return responder.respond_with_error(error);
+        }
         let refresh = {
             let mut state = runtime.state.lock().await;
             let mut candidate = state.record.clone();
@@ -1086,6 +1290,10 @@ impl Harness {
         }
         self.apply_initial_config(&runtime, &request.config_options)
             .await;
+        if let Err(error) = self.sync_dsh_config(&runtime.snapshot().await).await {
+            let _ = self.store.delete(&runtime_id).await;
+            return responder.respond_with_error(error);
+        }
         if let Err(error) = self.store.save(&runtime).await {
             let _ = self.store.delete(&runtime_id).await;
             return responder.respond_with_error(error);
@@ -1096,7 +1304,7 @@ impl Harness {
                 .modes(Some(mode_state(&record.config)))
                 .config_options(Some(self.config_options(&record.config))),
         )?;
-        send_available_commands(&connection, &record.id)
+        self.send_dsh_commands(&connection, &record.id).await
     }
 
     async fn list_sessions(
@@ -1120,16 +1328,54 @@ impl Harness {
             },
             None => 0,
         };
-        let records = match self.store.list(request.cwd.as_deref()).await {
-            Ok(records) => records,
+        let local_titles = self
+            .store
+            .list(None)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|record| record.title.map(|title| (record.id, title)))
+            .collect::<std::collections::HashMap<_, _>>();
+        let listed = match self.dsh.get().await {
+            Ok(runtime) => {
+                runtime
+                    .request("dsh/session/list", json!({"cwd": request.cwd}))
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        let listed = match listed {
+            Ok(listed) => listed,
             Err(error) => return responder.respond_with_error(error),
         };
+        let records = listed
+            .get("sessions")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         let total = records.len();
         let sessions = records
             .into_iter()
             .skip(offset)
             .take(PAGE_SIZE)
-            .map(session_info)
+            .filter_map(|record| {
+                let id = record.get("sessionId")?.as_str()?.to_string();
+                let cwd = record.get("cwd")?.as_str()?.to_string();
+                let local_title = local_titles.get(&id).cloned();
+                let mut info = SessionInfo::new(id, cwd);
+                let dsh_title = record
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                let title = dsh_title.or(local_title);
+                if let Some(title) = title {
+                    info = info.title(title);
+                }
+                if let Some(updated) = record.get("updatedAt").and_then(Value::as_str) {
+                    info = info.updated_at(updated.to_string());
+                }
+                Some(info)
+            })
             .collect::<Vec<_>>();
         let next = offset.saturating_add(sessions.len());
         responder.respond(
@@ -1143,6 +1389,18 @@ impl Harness {
         request: DeleteSessionRequest,
         responder: agent_client_protocol::v1::Responder<DeleteSessionResponse>,
     ) -> agent_client_protocol::Result<()> {
+        if let Err(error) = self
+            .dsh
+            .get()
+            .await?
+            .request(
+                "dsh/session/delete",
+                json!({"sessionId": request.session_id.to_string()}),
+            )
+            .await
+        {
+            return responder.respond_with_error(error);
+        }
         match self.store.delete(&request.session_id.to_string()).await {
             Ok(()) => responder.respond(DeleteSessionResponse::new()),
             Err(error) => responder.respond_with_error(error),
@@ -1177,6 +1435,12 @@ impl Harness {
                 break;
             }
             notified.await;
+        }
+        if let Err(error) = self
+            .close_dsh_session(&request.session_id.to_string())
+            .await
+        {
+            tracing::warn!(?error, "failed to close DSH session");
         }
         match self.store.close(&request.session_id.to_string()).await {
             Ok(()) => responder.respond(CloseSessionResponse::new()),
@@ -1225,6 +1489,18 @@ impl Harness {
             Ok(stored) => stored,
             Err(error) => return responder.respond_with_error(error),
         };
+        if let Err(error) = self
+            .dsh
+            .get()
+            .await?
+            .request(
+                "dsh/session/set_title",
+                json!({"sessionId": stored.session_id.clone(), "title": stored.title.clone()}),
+            )
+            .await
+        {
+            return responder.respond_with_error(error);
+        }
         if stored.loaded {
             // The result carries the title, so a client does not depend on
             // this and a failed send does not fail the request.
@@ -1261,6 +1537,21 @@ impl Harness {
             let mut state = runtime.state.lock().await;
             state.record.config.mode = mode.clone();
             state.record.touch();
+        }
+        if let Err(error) = self
+            .dsh
+            .get()
+            .await?
+            .request(
+                "dsh/session/set_mode",
+                json!({
+                    "sessionId": request.session_id.to_string(),
+                    "modeId": mode,
+                }),
+            )
+            .await
+        {
+            return responder.respond_with_error(error);
         }
         if let Err(error) = self.store.save(&runtime).await {
             return responder.respond_with_error(error);
@@ -1356,10 +1647,28 @@ impl Harness {
         }
         state.record.touch();
         drop(state);
+        let record = runtime.snapshot().await;
+        if let Err(error) = self
+            .dsh
+            .get()
+            .await?
+            .request(
+                "dsh/session/set_config",
+                json!({
+                    "sessionId": request.session_id.to_string(),
+                    "provider": "deepseek-official",
+                    "model": record.config.model,
+                    "reasoningEffort": dsh_reasoning_effort(record.config.reasoning_effort),
+                    "permissionMode": record.config.permission_mode.as_str(),
+                }),
+            )
+            .await
+        {
+            return responder.respond_with_error(error);
+        }
         if let Err(error) = self.store.save(&runtime).await {
             return responder.respond_with_error(error);
         }
-        let record = runtime.snapshot().await;
         let options = self.config_options(&record.config);
         connection.send_notification(SessionNotification::new(
             request.session_id.clone(),
@@ -1398,7 +1707,7 @@ impl Harness {
         let request_cancellation = responder.cancellation();
         let session_id = request.session_id.clone();
         let suggestions_connection = connection.clone();
-        let offers_suggestions = offers_prompt_suggestions(&client_capabilities);
+        let offers_suggestions = false;
         let spawn_result = connection.spawn(async move {
             // `$/cancel_request` stops the turn the way `session/cancel` does,
             // so tool calls still get their final state and are saved. It
@@ -1541,7 +1850,7 @@ impl Harness {
             let work_runtime = runtime.clone();
             let work_connection = connection.clone();
             let capabilities = self.client_capabilities.read().await.clone();
-            let offers_suggestions = offers_prompt_suggestions(&capabilities);
+            let offers_suggestions = false;
             let work_session_id = session_id.clone();
             let spawn_result = connection.spawn(async move {
                 let result = self
@@ -1578,10 +1887,23 @@ impl Harness {
             return responder.respond(json!({"outcome": "startedNewTurn"}));
         }
 
-        let blocks = serde_json::to_value(&prompt)
-            .ok()
-            .and_then(|value| value.as_array().cloned())
-            .unwrap_or_default();
+        let prompt_json = serde_json::to_value(&prompt).map_err(Error::into_internal_error)?;
+        if let Err(error) = self
+            .dsh
+            .get()
+            .await?
+            .request(
+                "dsh/session/steer",
+                json!({
+                    "sessionId": session_id.to_string(),
+                    "contentBlocks": prompt_json,
+                }),
+            )
+            .await
+        {
+            return responder.respond_with_error(error);
+        }
+        let blocks = prompt_json.as_array().cloned().unwrap_or_default();
         let (message_id, previous_index, previous_seq) = {
             let mut state = runtime.state.lock().await;
             let previous_index = state.record.pending_steering.len();
@@ -1619,6 +1941,14 @@ impl Harness {
         if let Ok(runtime) = self.store.get(&notification.session_id.to_string()).await {
             runtime.state.lock().await.cancellation.cancel();
         }
+        if let Ok(runtime) = self.dsh.get().await {
+            let _ = runtime
+                .request(
+                    "dsh/session/cancel",
+                    json!({"sessionId": notification.session_id.to_string()}),
+                )
+                .await;
+        }
     }
 
     /// Connects the servers a lifecycle request declares. `acp` is the
@@ -1628,28 +1958,64 @@ impl Harness {
         &self,
         runtime: &SessionRuntime,
         servers: &[agent_client_protocol::v1::schema::McpServer],
-        acp: AcpConnection,
+        _acp: AcpConnection,
     ) -> Result<(), Error> {
-        if servers.is_empty() {
-            runtime.state.lock().await.mcp = None;
-            return Ok(());
-        }
-        // Connecting belongs to this lifecycle request, not to a turn. The
-        // session token is the last turn's, which stays cancelled after
-        // `session/cancel` until the next turn replaces it. Nothing cancels
-        // this one, so the connect timeout is what bounds the wait.
-        let mcp = McpSession::connect(
-            servers,
-            Some(&acp),
-            self.config.mcp_connect_timeout,
-            self.config.allow_insecure_mcp_http,
-            &CancellationToken::new(),
-        )
-        .await?;
-        runtime.state.lock().await.mcp = Some(Arc::new(mcp));
+        let record = runtime.snapshot().await;
+        self.dsh
+            .get()
+            .await?
+            .request(
+                "dsh/session/mcp",
+                json!({
+                    "sessionId": record.id,
+                    "servers": serde_json::to_value(servers).map_err(Error::into_internal_error)?,
+                }),
+            )
+            .await?;
         Ok(())
     }
 
+    async fn send_dsh_commands(
+        &self,
+        connection: &ConnectionTo<Client>,
+        session_id: &str,
+    ) -> Result<(), Error> {
+        let response = match self
+            .dsh
+            .get()
+            .await?
+            .request("dsh/session/commands", json!({"sessionId": session_id}))
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(?error, "failed to read DSH command catalog");
+                return send_available_commands(connection, session_id);
+            }
+        };
+        let commands = response
+            .get("commands")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|command| {
+                let name = command.get("name")?.as_str()?;
+                let description = command.get("description").and_then(Value::as_str)?;
+                Some(AvailableCommand::new(
+                    name.to_string(),
+                    description.to_string(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        connection.send_notification(SessionNotification::new(
+            SessionId::new(session_id.to_string()),
+            agent_client_protocol::v1::schema::SessionUpdate::AvailableCommandsUpdate(
+                AvailableCommandsUpdate::new(commands),
+            ),
+        ))
+    }
+
+    #[allow(unreachable_code)]
     async fn run_prompt(
         self,
         runtime: SessionRuntime,
@@ -1658,7 +2024,6 @@ impl Harness {
         client_capabilities: ClientCapabilities,
         cancellation: CancellationToken,
     ) -> Result<PromptResponse, Error> {
-        let lifecycle = runtime.lifecycle.lock().await;
         let _guard = {
             let state = runtime.state.lock().await;
             state.active_prompt.store(true, Ordering::Release);
@@ -1679,6 +2044,16 @@ impl Harness {
         if prompt.text.trim().is_empty() && !prompt.has_images {
             return Err(Error::invalid_params().data("prompt contains no usable content"));
         }
+
+        return self
+            .run_dsh_turn(
+                runtime,
+                request,
+                connection,
+                client_capabilities,
+                cancellation,
+            )
+            .await;
 
         if let Some(command_response) = self
             .handle_command(&runtime, &connection, &session_id, &prompt.text)
@@ -1738,7 +2113,6 @@ impl Harness {
             }
             return Err(error);
         }
-        drop(lifecycle);
         let record = {
             // Sent under the state lock, so this never announces a title that
             // `session/set_title` has already replaced.
@@ -2043,6 +2417,296 @@ impl Harness {
                 state.record.touch();
                 drop(state);
                 self.store.save(&runtime).await?;
+            }
+        }
+    }
+
+    async fn run_dsh_turn(
+        &self,
+        runtime: SessionRuntime,
+        request: PromptRequest,
+        connection: ConnectionTo<Client>,
+        client_capabilities: ClientCapabilities,
+        cancellation: CancellationToken,
+    ) -> Result<PromptResponse, Error> {
+        let session_id = request.session_id.clone();
+        let record = runtime.snapshot().await;
+        self.open_dsh_session(&record, false).await?;
+        let dsh = self.dsh.get().await?;
+        let mut events = dsh.subscribe();
+        let mut requests = dsh.subscribe_requests();
+
+        let prompt_blocks =
+            serde_json::to_value(&request.prompt).map_err(Error::into_internal_error)?;
+        {
+            let mut state = runtime.state.lock().await;
+            let index = state.record.messages.len();
+            let content = content_blocks_to_prompt(&request.prompt)?;
+            state
+                .record
+                .messages
+                .push(ChatMessage::user_content(content.content));
+            state.record.prompt_blocks.insert(
+                index.to_string(),
+                prompt_blocks.as_array().cloned().unwrap_or_default(),
+            );
+            state.record.touch();
+        }
+        self.store.save(&runtime).await?;
+
+        let query = dsh
+            .request(
+                "session/query",
+                json!({
+                    "sessionId": session_id.to_string(),
+                    "contentBlocks": prompt_blocks,
+                }),
+            )
+            .await?;
+        if query.get("kind").and_then(Value::as_str) == Some("command")
+            && let Some(execution) = query.get("execution")
+            && execution
+                .get("result")
+                .and_then(|result| result.get("kind"))
+                == Some(&Value::String("error".to_string()))
+        {
+            return Err(Error::invalid_params().data(
+                execution
+                    .get("result")
+                    .and_then(|result| result.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("DSH command failed"),
+            ));
+        }
+
+        let wait = dsh.request("session/wait", json!({"sessionId": session_id.to_string()}));
+        tokio::pin!(wait);
+        let mut stop_reason = StopReason::EndTurn;
+        let mut turn_failure = None;
+        let mut cancel_sent = false;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled(), if !cancel_sent => {
+                    cancel_sent = true;
+                    let _ = dsh.request(
+                        "dsh/session/cancel",
+                        json!({"sessionId": session_id.to_string()}),
+                    ).await;
+                    stop_reason = StopReason::Cancelled;
+                }
+                request = requests.recv() => {
+                    match request {
+                        Ok(request) => {
+                            if let Err(error) = self
+                                .handle_dsh_request(&dsh, &connection, &client_capabilities, request)
+                                .await
+                            {
+                                tracing::warn!(?error, "failed to answer a DSH client request");
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "lagged DSH request notifications");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return Err(
+                            Error::internal_error().data("DSH runtime request channel closed")
+                        ),
+                    }
+                }
+                notification = events.recv() => {
+                    let notification = notification.map_err(|error| {
+                        Error::internal_error().data(format!("DSH runtime event stream failed: {error}"))
+                    })?;
+                    if let Some((reason, failure)) = apply_dsh_notification(
+                        &connection,
+                        &runtime,
+                        &session_id,
+                        &notification,
+                    ).await? {
+                        if let Some(reason) = reason {
+                            stop_reason = reason;
+                        }
+                        turn_failure = failure.or(turn_failure);
+                    }
+                }
+                result = &mut wait => {
+                    if let Err(error) = result {
+                        if cancellation.is_cancelled() {
+                            stop_reason = StopReason::Cancelled;
+                        } else {
+                            return Err(error);
+                        }
+                    }
+                    while let Ok(notification) = events.try_recv() {
+                        if let Some((reason, failure)) = apply_dsh_notification(
+                            &connection,
+                            &runtime,
+                            &session_id,
+                            &notification,
+                        ).await? {
+                            if let Some(reason) = reason {
+                                stop_reason = reason;
+                            }
+                            turn_failure = failure.or(turn_failure);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        self.store.save(&runtime).await?;
+        if let Some(error) = turn_failure {
+            return Err(error);
+        }
+        Ok(PromptResponse::new(stop_reason))
+    }
+
+    async fn handle_dsh_request(
+        &self,
+        dsh: &crate::dsh::DshRuntime,
+        connection: &ConnectionTo<Client>,
+        capabilities: &ClientCapabilities,
+        request: Value,
+    ) -> Result<(), Error> {
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        let method = request
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let params = request.get("params").cloned().unwrap_or(Value::Null);
+        match method {
+            "approval/request" => {
+                let session_id = SessionId::new(
+                    params
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+                let call_id = params
+                    .get("callId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("dsh-approval")
+                    .to_string();
+                let tool_name = params
+                    .get("toolName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("DSH tool");
+                let fields = ToolCallUpdateFields::new()
+                    .title(Some(tool_name.to_string()))
+                    .kind(Some(tool_kind(tool_name)))
+                    .status(Some(ToolCallStatus::Pending));
+                let permission = RequestPermissionRequest::new(
+                    session_id,
+                    ToolCallUpdate::new(call_id, fields),
+                    vec![
+                        PermissionOption::new(
+                            PermissionOptionId::new("allow-once"),
+                            "Allow once",
+                            PermissionOptionKind::AllowOnce,
+                        ),
+                        PermissionOption::new(
+                            PermissionOptionId::new("reject-once"),
+                            "Reject",
+                            PermissionOptionKind::RejectOnce,
+                        ),
+                    ],
+                );
+                let response = connection.send_request(permission).block_task().await?;
+                let outcome = match response.outcome {
+                    RequestPermissionOutcome::Selected(selected)
+                        if selected.option_id.to_string() == "allow-once" =>
+                    {
+                        "allowed-once"
+                    }
+                    RequestPermissionOutcome::Cancelled => "cancelled",
+                    _ => "rejected",
+                };
+                dsh.respond(id, json!({"outcome": outcome})).await
+            }
+            "user-question/ask" => {
+                let questions = params
+                    .get("questions")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let supports_form = capabilities
+                    .elicitation
+                    .as_ref()
+                    .is_some_and(|elicitation| elicitation.supports_form());
+                if !supports_form {
+                    return dsh
+                        .respond_error(id, "the ACP client does not support form elicitation")
+                        .await;
+                }
+                let mut answers = Vec::new();
+                for question in questions {
+                    let question_id = question
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("question")
+                        .to_string();
+                    let message = question
+                        .get("question")
+                        .and_then(Value::as_str)
+                        .unwrap_or("DSH needs input");
+                    let scope = ElicitationSessionScope::new(SessionId::new(
+                        params
+                            .get("sessionId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    ));
+                    let schema = ElicitationSchema::new()
+                        .title(
+                            question
+                                .get("header")
+                                .and_then(Value::as_str)
+                                .unwrap_or("Question"),
+                        )
+                        .string("response", true);
+                    let request = CreateElicitationRequest::new(
+                        ElicitationMode::Form(ElicitationFormMode::new(scope, schema)),
+                        message,
+                    );
+                    let response = connection.send_request(request).block_task().await?;
+                    match response.action {
+                        ElicitationAction::Accept(action) => {
+                            let text = action
+                                .content
+                                .as_ref()
+                                .and_then(|content| content.get("response"))
+                                .map(elicitation_value_text)
+                                .unwrap_or_default();
+                            answers.push(json!({
+                                "id": question_id,
+                                "selected": [],
+                                "custom": text,
+                            }));
+                        }
+                        ElicitationAction::Decline | ElicitationAction::Cancel => {
+                            return dsh.respond(id, json!({"cancelled": true})).await;
+                        }
+                        _ => {
+                            return dsh
+                                .respond_error(
+                                    id,
+                                    "the ACP client returned an unsupported elicitation action",
+                                )
+                                .await;
+                        }
+                    }
+                }
+                dsh.respond(id, json!({"answers": answers})).await
+            }
+            _ => {
+                dsh.respond_error(
+                    id,
+                    format!("unsupported DSH runtime request method: {method}"),
+                )
+                .await
             }
         }
     }
@@ -2686,14 +3350,6 @@ fn apply_config_value(
     }
 }
 
-/// Whether the client advertised `prompt_suggestions_update` support.
-fn offers_prompt_suggestions(capabilities: &ClientCapabilities) -> bool {
-    capabilities
-        .session
-        .as_ref()
-        .is_some_and(|session| session.prompt_suggestions.is_some())
-}
-
 /// Replaces the client's list of prompt suggestions. An empty list withdraws
 /// them.
 fn send_prompt_suggestions(
@@ -2727,14 +3383,6 @@ fn mode_state(config: &SessionConfig) -> SessionModeState {
                 .description("Read-only analysis and planning; mutating tools are disabled."),
         ],
     )
-}
-
-fn session_info(record: SessionRecord) -> SessionInfo {
-    let title = session_title(&record);
-    SessionInfo::new(record.id, record.cwd)
-        .additional_directories(record.additional_directories)
-        .title(title)
-        .updated_at(record.updated_at.to_rfc3339_opts(SecondsFormat::Secs, true))
 }
 
 fn send_agent_chunk(
@@ -2786,6 +3434,319 @@ fn send_available_commands(
             ]),
         ),
     ))
+}
+
+async fn apply_dsh_notification(
+    connection: &ConnectionTo<Client>,
+    runtime: &SessionRuntime,
+    session_id: &SessionId,
+    notification: &Value,
+) -> Result<Option<(Option<StopReason>, Option<Error>)>, Error> {
+    let incoming_session = notification
+        .pointer("/params/sessionId")
+        .and_then(Value::as_str);
+    if incoming_session.is_some_and(|id| id != session_id.to_string()) {
+        return Ok(None);
+    }
+    match notification.get("method").and_then(Value::as_str) {
+        Some("dsh/assistant-stream") => {
+            let frame = notification
+                .get("params")
+                .and_then(|params| params.get("frame"));
+            let Some(frame) = frame else {
+                return Ok(None);
+            };
+            if frame.get("type").and_then(Value::as_str) != Some("chunk") {
+                return Ok(None);
+            }
+            let chunk = frame.get("chunk").cloned().unwrap_or(Value::Null);
+            let message_id = frame
+                .get("attemptId")
+                .and_then(Value::as_str)
+                .unwrap_or("dsh-message");
+            match chunk.get("type").and_then(Value::as_str) {
+                Some("text-delta") => {
+                    if let Some(text) = chunk.get("text").and_then(Value::as_str) {
+                        send_agent_chunk(
+                            connection,
+                            session_id,
+                            message_id,
+                            text.to_string(),
+                            false,
+                        )?;
+                    }
+                }
+                Some("reasoning-delta") => {
+                    if let Some(text) = chunk.get("text").and_then(Value::as_str) {
+                        send_agent_chunk(
+                            connection,
+                            session_id,
+                            message_id,
+                            text.to_string(),
+                            true,
+                        )?;
+                    }
+                }
+                _ => {}
+            }
+            Ok(None)
+        }
+        Some("session.event") => {
+            let Some(event) = notification.pointer("/params/event") else {
+                return Ok(None);
+            };
+            let event_type = event
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let data = event.get("data").cloned().unwrap_or(Value::Null);
+            {
+                let mut state = runtime.state.lock().await;
+                state.record.dsh_events.push(event.clone());
+                match event_type {
+                    "assistant/message" => {
+                        let blocks = data
+                            .pointer("/message/content")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        let text = blocks
+                            .iter()
+                            .filter(|block| {
+                                block.get("type").and_then(Value::as_str) == Some("text")
+                            })
+                            .filter_map(|block| block.get("text").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("");
+                        let reasoning = blocks
+                            .iter()
+                            .filter(|block| {
+                                block.get("type").and_then(Value::as_str) == Some("reasoning")
+                            })
+                            .filter_map(|block| block.get("text").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("");
+                        if !text.is_empty() || !reasoning.is_empty() {
+                            state.record.messages.push(ChatMessage::assistant(
+                                (!text.is_empty()).then_some(text),
+                                (!reasoning.is_empty()).then_some(reasoning),
+                            ));
+                        }
+                        if let Some(usage) = data.get("usage") {
+                            state.record.usage.prompt_tokens = usage
+                                .get("inputTokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0);
+                            state.record.usage.completion_tokens = usage
+                                .get("outputTokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0);
+                            state.record.usage.total_tokens = state
+                                .record
+                                .usage
+                                .prompt_tokens
+                                .saturating_add(state.record.usage.completion_tokens);
+                            state.record.context_used = state.record.usage.total_tokens;
+                        }
+                    }
+                    "session/title" => {
+                        if let Some(title) = data.get("title").and_then(Value::as_str) {
+                            state.record.title = Some(title.to_string());
+                        }
+                    }
+                    "tool/call" => {
+                        let call_id = data
+                            .get("callId")
+                            .and_then(Value::as_str)
+                            .unwrap_or("dsh-tool");
+                        let name = data.get("name").and_then(Value::as_str).unwrap_or("tool");
+                        let arguments = data
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or("{}");
+                        let mut message = ChatMessage::assistant(None, None);
+                        message.tool_calls.push(crate::model::ToolCall {
+                            id: call_id.to_string(),
+                            kind: "function".to_string(),
+                            function: crate::model::FunctionCall {
+                                name: name.to_string(),
+                                arguments: arguments.to_string(),
+                            },
+                        });
+                        state.record.messages.push(message);
+                    }
+                    "tool/result" => {
+                        let call_id = data
+                            .pointer("/message/toolCallId")
+                            .and_then(Value::as_str)
+                            .unwrap_or("dsh-tool");
+                        let is_error = data
+                            .pointer("/message/isError")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let text = data
+                            .pointer("/message/content")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter(|block| {
+                                block.get("type").and_then(Value::as_str) == Some("text")
+                            })
+                            .filter_map(|block| block.get("text").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        state
+                            .record
+                            .messages
+                            .push(ChatMessage::tool(call_id.to_string(), text.clone()));
+                        state.record.tool_outcomes.insert(
+                            call_id.to_string(),
+                            crate::model::PersistedToolOutcome {
+                                status: if is_error {
+                                    ToolOutcomeStatus::Failed
+                                } else {
+                                    ToolOutcomeStatus::Completed
+                                },
+                                text,
+                                raw_output: data.clone(),
+                                structured_content: Vec::new(),
+                                diff: None,
+                                terminal: None,
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+                state.record.touch();
+            }
+            match event_type {
+                "tool/call" => {
+                    let call_id = data
+                        .get("callId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("dsh-tool")
+                        .to_string();
+                    let name = data
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("DSH tool");
+                    let raw_input = data
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
+                        .unwrap_or(Value::Null);
+                    connection.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        agent_client_protocol::v1::schema::SessionUpdate::ToolCall(
+                            ToolCall::new(call_id, name)
+                                .name(name.to_string())
+                                .kind(tool_kind(name))
+                                .status(ToolCallStatus::Pending)
+                                .raw_input(raw_input),
+                        ),
+                    ))?;
+                }
+                "tool/result" => {
+                    let call_id = data
+                        .pointer("/message/toolCallId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("dsh-tool")
+                        .to_string();
+                    let is_error = data
+                        .pointer("/message/isError")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let content = data
+                        .pointer("/message/content")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|block| {
+                            serde_json::from_value::<ContentBlock>(block.clone()).ok()
+                        })
+                        .map(|block| {
+                            ToolCallContent::Content(
+                                agent_client_protocol::v1::schema::Content::new(block),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let fields = ToolCallUpdateFields::new()
+                        .status(Some(if is_error {
+                            ToolCallStatus::Failed
+                        } else {
+                            ToolCallStatus::Completed
+                        }))
+                        .content(Some(content));
+                    connection.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        agent_client_protocol::v1::schema::SessionUpdate::ToolCallUpdate(
+                            ToolCallUpdate::new(call_id, fields),
+                        ),
+                    ))?;
+                }
+                "todo/write" => {
+                    let entries = data
+                        .get("todos")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|todo| {
+                            let content = todo.get("content")?.as_str()?.to_string();
+                            let status = match todo.get("status")?.as_str()? {
+                                "completed" => PlanEntryStatus::Completed,
+                                "in_progress" => PlanEntryStatus::InProgress,
+                                _ => PlanEntryStatus::Pending,
+                            };
+                            Some(PlanEntry::new(content, PlanEntryPriority::Medium, status))
+                        })
+                        .collect::<Vec<_>>();
+                    connection.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        agent_client_protocol::v1::schema::SessionUpdate::Plan(Plan::new(entries)),
+                    ))?;
+                }
+                "session/title" => {
+                    if let Some(title) = data.get("title").and_then(Value::as_str) {
+                        connection.send_notification(SessionNotification::new(
+                            session_id.clone(),
+                            agent_client_protocol::v1::schema::SessionUpdate::SessionInfoUpdate(
+                                SessionInfoUpdate::new().title(title.to_string()),
+                            ),
+                        ))?;
+                    }
+                }
+                "assistant/message" => {
+                    send_usage_update(connection, &runtime.snapshot().await)?;
+                }
+                "turn/end" => {
+                    let kind = data
+                        .pointer("/reason/kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("completed");
+                    let reason = match kind {
+                        "max-tokens" => StopReason::MaxTokens,
+                        "aborted" | "disposed" | "rejected" => StopReason::Cancelled,
+                        "error" => {
+                            let message = data
+                                .pointer("/reason/error/message")
+                                .or_else(|| data.pointer("/reason/failure/message"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("DSH turn failed");
+                            return Ok(Some((
+                                Some(StopReason::EndTurn),
+                                Some(Error::internal_error().data(message.to_string())),
+                            )));
+                        }
+                        _ => StopReason::EndTurn,
+                    };
+                    return Ok(Some((Some(reason), None)));
+                }
+                _ => {}
+            }
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Send a tool call's final update. `terminal` is the client terminal a

@@ -17,6 +17,14 @@ function fixture(t, withBinary = true) {
   fs.mkdirSync(path.join(root, 'bin'));
   const launcher = path.join(root, 'bin/dsh-acp.cjs');
   fs.copyFileSync(path.join(__dirname, '../bin/dsh-acp.cjs'), launcher);
+  const runtime = path.join(root, 'node_modules/@deepseek-ai/dsh');
+  fs.mkdirSync(path.join(runtime, 'lib'), { recursive: true });
+  fs.writeFileSync(path.join(runtime, 'package.json'), JSON.stringify({
+    name: '@deepseek-ai/dsh',
+    version: '0.2.2-rc.5',
+    exports: { './package.json': './package.json' },
+  }));
+  fs.writeFileSync(path.join(runtime, 'lib/bin.js'), '');
   if (withBinary) {
     const native = path.join(root, 'native', targetFor(process.platform, process.arch, true));
     fs.mkdirSync(native, { recursive: true });
@@ -57,6 +65,22 @@ test('preserves arguments, cwd, environment, stdin, stdout, stderr and exit code
   assert.equal(result.status, 17, result.stderr);
   assert.equal(result.stdout, 'ACP input\n' + JSON.stringify({ args, cwd: process.cwd(), env: 'inherited' }));
   assert.equal(result.stderr, 'child diagnostic');
+});
+
+test('resolves and passes the pinned DSH runtime and module root', (t) => {
+  const launcher = fixture(t);
+  const result = spawnSync(process.execPath, [launcher, '-e', `
+    process.stdout.write(JSON.stringify({
+      js: process.env.DSH_ACP_DSH_JS,
+      node: process.env.DSH_ACP_NODE,
+      modules: process.env.DSH_ACP_RUNTIME_MODULES
+    }));
+  `], { encoding: 'utf8', timeout: 10000 });
+  assert.equal(result.status, 0, result.stderr);
+  const resolved = JSON.parse(result.stdout);
+  assert.match(resolved.js, /@deepseek-ai[/\\]dsh[/\\]lib[/\\]bin\.js$/);
+  assert.match(resolved.modules, /node_modules$/);
+  assert.equal(path.resolve(resolved.node), path.resolve(process.execPath));
 });
 
 test('missing binary fails without contaminating ACP stdout', (t) => {

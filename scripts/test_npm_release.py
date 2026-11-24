@@ -37,6 +37,7 @@ class NpmPackaging(unittest.TestCase):
         self.assertEqual(manifest['bin'], {'dsh-acp': 'bin/dsh-acp.cjs'})
         self.assertNotIn('private', manifest)
         self.assertNotIn('scripts', manifest)
+        self.assertEqual(manifest['dependencies'], {'@deepseek-ai/dsh': '0.2.2-rc.5'})
         self.assertEqual(json.loads((output / 'package.json').read_text()), manifest)
         for target in release.TARGETS:
             native = output / 'native' / target

@@ -14,9 +14,11 @@ const version = fs.readFileSync(path.join(__dirname, '../Cargo.toml'), 'utf8').m
 // An ACP handshake needs no API key, so it proves the launcher passes stdio
 // through unchanged without any provider configuration. Like a real client,
 // keep stdin open until the response arrives; the server exits on EOF.
-async function initialize(launcher, dataDir) {
+async function initialize(launcher, dataDir, fakeDsh) {
   const env = { ...process.env };
   delete env.DEEPSEEK_API_KEY;
+  env.DSH_ACP_DSH_JS = fakeDsh;
+  env.DSH_ACP_NODE = process.execPath;
   const child = spawn(process.execPath, [launcher, '--data-dir', dataDir], { env, stdio: ['pipe', 'pipe', 'inherit'] });
   const exited = once(child, 'exit');
   const timer = setTimeout(() => child.kill(), 30000);
@@ -52,13 +54,27 @@ async function main(root) {
   fs.copyFileSync(path.join(__dirname, '../npm/bin/dsh-acp.cjs'), path.join(root, 'bin/dsh-acp.cjs'));
   fs.copyFileSync(path.resolve(process.argv[2] || path.join('target', target, 'release', binary)), path.join(native, binary));
   const launcher = path.join(root, 'bin/dsh-acp.cjs');
+  const fakeDsh = path.join(root, 'fake-dsh.mjs');
+  fs.writeFileSync(fakeDsh, `
+import readline from 'node:readline';
+const rl = readline.createInterface({ input: process.stdin });
+for await (const line of rl) {
+  const request = JSON.parse(line);
+  if (request.method !== 'dsh/hello') continue;
+  process.stdout.write(JSON.stringify({
+    jsonrpc: '2.0',
+    id: request.id,
+    result: { runtime: '@deepseek-ai/dsh', version: '0.2.2-rc.5' }
+  }) + '\\n');
+}
+`);
 
   const result = spawnSync(process.execPath, [launcher, '--version'], { encoding: 'utf8', timeout: 30000 });
   assert.equal(result.status, 0, result.stderr || String(result.error));
   assert.equal(result.stdout.trim(), `dsh-acp ${version}`);
   process.stdout.write(result.stdout);
 
-  await initialize(launcher, path.join(root, 'data'));
+  await initialize(launcher, path.join(root, 'data'), fakeDsh);
   process.stdout.write('npm launcher: ACP initialize OK\n');
 }
 

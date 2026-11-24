@@ -2,180 +2,150 @@
 
 ## Process model
 
-`dsh-acp` is an ACP server for one connection at a time. It owns session
-state, the DeepSeek HTTP client, MCP connections, and tool execution. Logs and
-tracing go to stderr.
+`dsh-acp` is a Rust ACP server and DSH runtime supervisor.
 
-By default the connection is stdio: stdout carries JSON-RPC only, and the
-process ends with it. With `--listen`, the process instead serves the SDK's
-streamable HTTP and WebSocket server (`agent-client-protocol-http`) at `/acp`
-until it is stopped, and serves the connections it accepts one after another.
-A middleware in front of the SDK router checks `Host`, refuses any `Origin`,
-and requires the bearer token before a request reaches the SDK; ACP traffic
-never sees a request that fails.
+```text
+ACP client
+  |
+  | ACP v1 or v2
+  v
+Rust frontend
+  |
+  | private JSON-RPC over child stdio
+  v
+pinned official DSH SDK profile + dsh-acp runtime plugin
+  |
+  +-- DSH model adapters and HTTP calls
+  +-- DSH agent loop and tools
+  +-- DSH permissions and user questions
+  +-- DSH sessions and persistence
+  +-- DSH MCP clients
+  +-- DSH plugins
+```
 
-Each connection gets its own `Harness`: client capabilities, the initialized
-flag, provider routing (`providers/set`, `providers/disable`, logout), and a
-session store with nothing in memory over the shared session files. A
-connection therefore starts exactly as a new stdio process would, and its
-memory is its own: loaded sessions, running turns, MCP servers, "allow always"
-approvals, and pending steering. When a connection ends, its turns, commands,
-and MCP servers are dropped and killed with it; what it saved stays on disk
-for the next connection to load or resume.
+The Rust process owns protocol negotiation, ACP method semantics, replay,
+client interactions, and transport security. DSH owns execution.
 
-The server holds one connection slot. An `initialize` POST without an
-`Acp-Connection-Id`, or a WebSocket upgrade, waits up to two seconds for a
-closing connection to release it and otherwise gets `409 Conflict`. The SDK
-creates the connection through a factory that claims the slot, so two requests
-that pass that check together cannot both connect: the second gets an agent
-that answers every request with an error. A connection releases the slot when
-it ends: on `DELETE`, when its WebSocket closes, when `initialize` fails, or,
-for HTTP, after 30 seconds without an open event stream. An HTTP client
-receives everything through those streams, so one without any for that long is
-gone; the SDK does not detect that by itself.
+This deliberately does not proxy `dsh --profile acp`; that profile is a
+separate automation-only ACP frontend and does not expose the full editor
+surface.
 
-Without `RUST_LOG`, the log filter is `dsh_acp=info,warn`, or
-`dsh_acp=trace,info` with `--trace`, and it drops the SDK's events that carry
-a `handler` field. Those describe the SDK's whole handler chain, about 1 MB
-for each rejected message, which can fill a stderr pipe the client does not
-drain. The SDK still logs each error response it sends, with its method and
-id. `RUST_LOG` replaces the default filter entirely. Hand-rolled request
-handlers answer invalid params with `respond_with_error`. Returning the error
-gets it answered too, but through the SDK's handler-error path, which logs
-that warning.
+## Runtime startup
 
-The SDK protocol router selects the v1 or v2 implementation from the first
-`initialize` request. Shared application logic lives behind that boundary so
-wire-specific behavior does not leak across versions.
+Each ACP connection has a lazy DSH runtime provider.
 
-## Session runtime
+1. The frontend writes its embedded runtime plugin to `<data-dir>/dsh-runtime/`.
+2. It starts DSH with the `sdk` profile and a generated patch that disables the
+   stock SDK protocol server and inserts the `dsh-acp` runtime plugin.
+3. It sets the pinned runtime's module root, DSH home, credential environment,
+   and API base URL.
+4. It performs `dsh/hello` and verifies the exact `0.2.2-rc.5` version.
 
-Each session contains:
+DSH is started only when the first session/list/new/resume or prompt needs it.
+ACP `initialize` itself remains cheap.
 
-- immutable identity, working directory, and additional roots;
-- model, mode, permission, thinking effort, and `web_fetch` configuration;
-- effective system instructions loaded from configuration, `AGENTS.md`, and
-  the ACP client;
-- conversation messages and original ACP prompt blocks;
-- tool outcomes, raw output, diffs, and terminal snapshots;
-- plans, compactions, message IDs, and pending steering input;
-- foreground activity flags and cancellation state.
+## Runtime plugin
 
-JSON writes use a temporary file and atomic rename. Session files live under
-`<data-dir>/sessions/` and are created with owner-only permissions on Unix.
+The embedded plugin extends `HarnessSdkJsonRpcServer` instead of
+reimplementing DSH behavior. The stock server retains:
 
-URL elicitations awaiting a completion report are connection state, not session
-data. The store keeps them in memory, keyed by `elicitationId` with the session
-that requested each, and drops a session's entries when it is closed or
-deleted. They are never written to the session file.
+- session prompt admission;
+- model execution and retries;
+- approval request dispatch;
+- user-question dispatch;
+- durable session-event publication;
+- agent status;
+- subagent lifecycle.
 
-## Prompt execution
+The plugin adds:
 
-The DeepSeek request context is bounded by the configured character budget.
-The model may emit text, reasoning, and function calls. Tool calls are
-assembled from streamed fragments, assigned session-unique IDs, authorized,
-executed, persisted, and returned to the model until the model completes or the
-user cancels the turn. A turn has no round limit.
+- `dsh/session/open`
+- `dsh/session/close`
+- `dsh/session/delete`
+- `dsh/session/list`
+- `dsh/session/resume`
+- `dsh/session/cancel`
+- `dsh/session/steer`
+- `dsh/session/set_config`
+- `dsh/session/set_mode`
+- `dsh/session/mcp`
+- `dsh/session/commands`
+- `dsh/session/set_title`
+- `dsh/session/snapshot`
+- `dsh/assistant-stream` notifications
 
-One completion is requested with up to three attempts. A rate limit or 5xx is
-retried with backoff; connection failures and responses that end without a
-`finish_reason` are retried too. Retrying stops as soon as text or reasoning
-has reached the client, because a second attempt would duplicate what the user
-already saw. An empty body is never accepted as an answer. The HTTP client
-bounds connecting and stalled reads rather than total request time, so a long
-stream that keeps producing tokens is not interrupted.
+This keeps the DSH-specific layer narrow and uses official runtime ownership
+for execution.
 
-A completion that ends with `finish_reason: "length"` is not a finished answer.
-The turn stops with `max_tokens`, and any tool call in that completion is marked
-failed rather than executed, because its arguments were cut off mid-string.
-Clients that advertise notice support also receive a warning describing the
-truncation.
+## Prompt flow
 
-ACP v2 reports foreground state independently from prompt acceptance. Cancelling
-active work stops the model stream and tool operations, emits final tool state,
-and settles to idle with the `cancelled` reason. Idle usage covers only that
-foreground turn; per-update usage continues to track the session total.
+### ACP v1
 
-An ACP v1 prompt turn runs outside the connection's ordered dispatch, so a
-`$/cancel_request` for the prompt reaches it while it runs. The notification
-cancels a child of the token `session/cancel` uses, so the turn stops the same
-way and the session token still shows whether `session/cancel` or a close
-reached the turn. A turn stopped by `$/cancel_request` alone answers the prompt
-with `-32800`; one that `session/cancel` also reached ends with
-`stopReason: "cancelled"`. Every other request is answered from the ordered
-dispatch, before a later `$/cancel_request` can be read.
+1. The client sends `session/prompt`.
+2. Rust validates and records the prompt.
+3. Rust sends `session/query` to DSH.
+4. DSH streams assistant frames and durable session events.
+5. Rust maps raw frames to ACP message/thought chunks and durable events to
+   tool, plan, title, usage, and completion updates.
+6. DSH receives reverse `approval/request` and `user-question/ask` calls; Rust
+   maps them to ACP requests.
+7. The prompt settles from DSH's turn end and `session/wait`.
 
-## Replay
+### ACP v2
 
-Full replay rebuilds retained conversation entities in order. Tool calls retain
-their terminal status, diff text and structured changes, terminal snapshots,
-and raw output. Plans and compactions are emitted as their normal ACP update
-types. Original prompt blocks are replayed when available rather than showing a
-lossy text reconstruction.
+ACP v2 `session/prompt` returns its message ID immediately. A detached Rust
+task drives the same DSH query, then emits v2 `running` and `idle` state.
+`session/cancel` cancels both the Rust token and the exact DSH session.
+
+## Sessions and persistence
+
+An ACP session ID is the DSH session ID. DSH persistence remains authoritative
+for execution history. The Rust projection stores:
+
+- original ACP prompt blocks;
+- observed DSH events;
+- replayable assistant/tool projections;
+- titles, options, compactions, and usage needed by ACP v1/v2.
+
+Session list is read from DSH persistence. Resume validates the stored cwd and
+asks DSH to restore the exact session. Close drains and disposes the DSH agent.
+Delete closes any live agent and removes the DSH persistence artifact.
+
+## MCP
+
+ACP session MCP declarations are sent to the runtime plugin. The plugin mounts
+them in the exact Agent scope using the official DSH MCP client. Tool discovery
+takes place before the session is used, and replies flow through DSH's normal
+tool-event path.
 
 ## Concurrency
 
-- One ACP connection is served at a time, so a session's updates and
-  agent-to-client requests go only to the connection that runs its turn, and
-  no two connections run turns on one session. Two processes sharing a data
-  directory are not coordinated.
-- A session has one active foreground turn.
-- Session transitions and final idle reporting use a per-session turn lock.
-- Steering requests for a session serialize through that same lock.
-- Closing prevents new prompt insertion and waits for active work to settle.
-- Calls to a stdio or HTTP MCP server are serialized per server. An
-  MCP-over-ACP request stands alone, so it takes no lock. A turn does not hold
-  the session's state lock while it waits on an MCP server, so
-  `session/cancel` and other requests for the session are not held up by a
-  slow or unresponsive server.
-- Session lifecycle requests run in the SDK's dispatch loop, so no other
-  incoming message is handled until they answer. Connecting their MCP servers
-  is bounded per server by `--mcp-connect-timeout-secs`. Servers connect one
-  after another, so a request with N servers can wait up to N times that
-  limit.
-- MCP-over-ACP servers are not contacted during a lifecycle request. The
-  client's answer to an `mcp/message` arrives through the same dispatch loop,
-  so waiting for it there would never finish. The servers keep the connection
-  of the lifecycle request that declared them, and the session's turns send
-  `mcp/message` requests over it from outside the loop: the per-round tool
-  refresh lists the tools, and dropping a request when the turn is cancelled
-  sends the client `$/cancel_request`.
-- Session-store writes are serialized process-wide. Loading a stored session
-  takes the same lock, so a title `session/set_title` writes to a stored
-  record cannot be lost to a load in progress.
+- One ACP connection is served at a time over `--listen`.
+- Each connection gets its own DSH runtime process and in-memory Harness.
+- A session has one active foreground prompt.
+- Steering serializes through the session turn lock and is forwarded to DSH.
+- Runtime events are filtered by exact session ID before projection.
+- Reverse DSH requests are answered through the ACP connection that owns the
+  turn.
 
-## Security boundaries
+## Shutdown
 
-Workspace roots are canonicalized and opened as directory capabilities when a
-session is created or loaded. File, directory, search, preview, and mutation
-operations are relative to those handles, so replacing a root or ancestor path
-after approval does not redirect them. Existing files with multiple hard links
-are rejected because their other names cannot be confined. `web_fetch` follows
-redirects itself, rejects every address in a DNS answer unless it is globally
-routable, and pins the validated addresses as the request resolver. It bypasses
-ambient proxy configuration so the checked address is the connected address.
-Web requests and sensitive-file reads require independent ACP permission
-decisions; web approvals are origin-scoped, and cross-origin redirects require
-a new request.
-Provider and MCP headers are supplied by configuration and are not persisted as
-session data. Instruction files are canonicalized against their source root,
-limited to regular files, and capped at 1 MiB.
-The session network switch controls only `web_fetch`; commands and MCP servers
-are governed by their own permission and transport policies. Remote MCP HTTP
-uses HTTPS unless plaintext is explicitly enabled, and MCP redirects are not
-followed.
+Closing a session disposes the DSH-owned Agent and flushes persistence. Ending
+an ACP connection drops its runtime provider; the child is started with
+`kill_on_drop`, and normal session close/flush completes before process exit.
 
-External input is bounded while reading: provider streams to 64 MiB, JSON to
-16 MiB, MCP messages to 8 MiB, and MCP tool metadata to 1 MiB. MCP pagination
-is capped at 100 pages and 1,024 tools. Workspace line reads scan at most
-64 MiB, edits read at most 8 MiB, and searches read at most 16 MiB per file.
+## Security
 
-`--listen` binds loopback unless `--listen-allow-remote` is given. Every request
-needs the bearer token, compared in constant time. The token comes from
-`DSH_ACP_LISTEN_TOKEN` or is generated from the operating system's random
-source; it is printed once to stderr only when generated, and is removed from
-the process environment before any thread starts, so commands and MCP servers
-do not inherit it. `Host` must be a loopback name, the bound address, or, with
-`--listen-allow-remote`, the configured host name. Requests carrying `Origin`
-are refused, the SDK's CORS support stays disabled, and its health endpoint is
-off. There is no TLS.
+DSH applies workspace confinement, command policy, approvals, credential
+resolution, MCP transport policy, and tool output limits. The Rust frontend
+retains:
+
+- ACP workspace-root validation;
+- non-loopback HTTP/WebSocket refusal by default;
+- bearer-token and Host/Origin checks;
+- structured prompt and system-prompt validation;
+- session replay bounds;
+- exact DSH version verification.
+
+Provider credentials are passed through the child environment and are removed
+from the parent environment before runtime threads start.
