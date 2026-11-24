@@ -708,7 +708,7 @@ dependencies = [
 
 [[package]]
 name = "dsh-acp"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "agent-client-protocol",
  "agent-client-protocol-http",
