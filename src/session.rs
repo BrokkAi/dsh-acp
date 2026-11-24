@@ -756,6 +756,11 @@ mod tests {
             disable_web: true,
             disable_prompt_suggestions: false,
             trace: false,
+            dsh_command: std::path::PathBuf::from("dsh"),
+            dsh_prefix_args: Vec::new(),
+            dsh_profile: "sdk".to_string(),
+            dsh_home: None,
+            dsh_runtime_modules: None,
         };
         let store = SessionStore::open(&config).await.unwrap();
         let runtime = store
@@ -801,6 +806,11 @@ mod tests {
             disable_web: true,
             disable_prompt_suggestions: false,
             trace: false,
+            dsh_command: std::path::PathBuf::from("dsh"),
+            dsh_prefix_args: Vec::new(),
+            dsh_profile: "sdk".to_string(),
+            dsh_home: None,
+            dsh_runtime_modules: None,
         };
         let store = SessionStore::open(&config).await.unwrap();
         let runtime = store
@@ -838,6 +848,11 @@ mod tests {
             disable_web: true,
             disable_prompt_suggestions: false,
             trace: false,
+            dsh_command: std::path::PathBuf::from("dsh"),
+            dsh_prefix_args: Vec::new(),
+            dsh_profile: "sdk".to_string(),
+            dsh_home: None,
+            dsh_runtime_modules: None,
         };
         let store = SessionStore::open(&config).await.unwrap();
         let runtime = store
@@ -895,6 +910,11 @@ mod tests {
             disable_web: true,
             disable_prompt_suggestions: false,
             trace: false,
+            dsh_command: std::path::PathBuf::from("dsh"),
+            dsh_prefix_args: Vec::new(),
+            dsh_profile: "sdk".to_string(),
+            dsh_home: None,
+            dsh_runtime_modules: None,
         };
         let store = SessionStore::open(&config).await.unwrap();
         let mut sessions = Vec::new();
@@ -989,6 +1009,11 @@ mod tests {
             disable_web: true,
             disable_prompt_suggestions: false,
             trace: false,
+            dsh_command: std::path::PathBuf::from("dsh"),
+            dsh_prefix_args: Vec::new(),
+            dsh_profile: "sdk".to_string(),
+            dsh_home: None,
+            dsh_runtime_modules: None,
         };
         let store = SessionStore::open(&config).await.unwrap();
         let runtime = store
@@ -1069,6 +1094,11 @@ mod tests {
             disable_web: true,
             disable_prompt_suggestions: false,
             trace: false,
+            dsh_command: std::path::PathBuf::from("dsh"),
+            dsh_prefix_args: Vec::new(),
+            dsh_profile: "sdk".to_string(),
+            dsh_home: None,
+            dsh_runtime_modules: None,
         };
         let store = SessionStore::open(&config).await.unwrap();
         let runtime = store
@@ -1138,6 +1168,11 @@ mod tests {
             disable_web: true,
             disable_prompt_suggestions: false,
             trace: false,
+            dsh_command: std::path::PathBuf::from("dsh"),
+            dsh_prefix_args: Vec::new(),
+            dsh_profile: "sdk".to_string(),
+            dsh_home: None,
+            dsh_runtime_modules: None,
         };
         let store = SessionStore::open(&config).await.unwrap();
         let runtime = store
@@ -1235,6 +1270,11 @@ mod tests {
             disable_web: true,
             disable_prompt_suggestions: false,
             trace: false,
+            dsh_command: std::path::PathBuf::from("dsh"),
+            dsh_prefix_args: Vec::new(),
+            dsh_profile: "sdk".to_string(),
+            dsh_home: None,
+            dsh_runtime_modules: None,
         };
         let store = SessionStore::open(&config).await.unwrap();
         let runtime = store
@@ -1272,6 +1312,11 @@ mod tests {
             disable_web: true,
             disable_prompt_suggestions: false,
             trace: false,
+            dsh_command: std::path::PathBuf::from("dsh"),
+            dsh_prefix_args: Vec::new(),
+            dsh_profile: "sdk".to_string(),
+            dsh_home: None,
+            dsh_runtime_modules: None,
         };
         let store = SessionStore::open(&config).await.unwrap();
         let runtime = store
@@ -1314,6 +1359,11 @@ mod tests {
             disable_web: true,
             disable_prompt_suggestions: false,
             trace: false,
+            dsh_command: std::path::PathBuf::from("dsh"),
+            dsh_prefix_args: Vec::new(),
+            dsh_profile: "sdk".to_string(),
+            dsh_home: None,
+            dsh_runtime_modules: None,
         };
         let store = SessionStore::open(&config).await.unwrap();
         let runtime = store

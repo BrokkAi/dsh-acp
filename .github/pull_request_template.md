@@ -11,7 +11,7 @@
 
 ## Compatibility and security
 
-<!-- Note ACP v1/v2, replay, permissions, filesystem, MCP, or provider impact. -->
+<!-- Note ACP v1/v2, DSH runtime/plugin compatibility, replay, permissions, or MCP impact. -->
 
 - [ ] I removed credentials, private logs, session data, and unrelated personal
       information from this change.

@@ -4,14 +4,36 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+
+- Replaced direct DeepSeek execution with the pinned official
+  `@deepseek-ai/dsh@0.2.2-rc.5` runtime. DSH now owns model calls, the agent
+  loop, tools, permissions, sessions, persistence, MCP clients, and plugins.
+- Added an embedded DSH runtime plugin that extends the official SDK server
+  with explicit session open/close/list/resume/delete, cancellation, steering,
+  mode/config changes, title updates, per-session MCP mounting, DSH command
+  discovery, and live assistant stream frames.
+- ACP v1 and v2 now execute prompts through real DSH sessions while retaining
+  the Rust frontend's protocol mapping, replay, permissions, steering, HTTP
+  transport, and compatibility extensions.
+- Exact runtime version verification runs before any DSH-backed operation.
+- The npm package installs the pinned DSH runtime and requires Node.js 24.9 or
+  newer.
+
+### Added
+
+- Real-DSH integration tests for v1/v2 streaming, asynchronous v2 prompt
+  acceptance, cancellation, permission-gated writes, session persistence,
+  list/resume/close, and runtime version enforcement.
+
 ## 0.7.1 - 2026-11-24
 
 - `agent-client-protocol` and `agent-client-protocol-http` are now 5.5.1
   (schema 1.21.2). Provider headers are converted from the schema's ordered map
   at the SDK boundary, and v2 diffs and compaction status use the updated
   payload builders.
-
-## Unreleased
 
 ## 0.7.0 - 2026-11-18
 

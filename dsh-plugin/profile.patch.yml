@@ -1,0 +1,9 @@
+# Replace the automation-only SDK protocol server with the richer ACP runtime
+# surface. The remaining SDK profile still supplies the pinned DSH agent loop,
+# tools, model adapters, persistence, approvals, user questions, and MCP.
+- id: sdk-jsonrpc-server
+  disabled: true
+
+- insert:
+    - id: dsh-acp-runtime
+      name: ./index.mjs

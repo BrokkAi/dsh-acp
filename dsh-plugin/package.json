@@ -1,0 +1,14 @@
+{
+  "name": "@brokkai/dsh-acp-runtime",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "dsh": "0.2.2-rc.5"
+  }
+}

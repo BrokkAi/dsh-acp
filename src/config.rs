@@ -115,6 +115,11 @@ pub struct Config {
     pub disable_web: bool,
     pub disable_prompt_suggestions: bool,
     pub trace: bool,
+    pub dsh_command: PathBuf,
+    pub dsh_prefix_args: Vec<String>,
+    pub dsh_profile: String,
+    pub dsh_home: Option<PathBuf>,
+    pub dsh_runtime_modules: Option<PathBuf>,
 }
 
 impl Config {
@@ -139,6 +144,12 @@ impl Config {
         }
         if self.mcp_connect_timeout.is_zero() {
             return Err(Error::invalid_params().data("MCP connect timeout must be positive"));
+        }
+        if self.dsh_command.as_os_str().is_empty() {
+            return Err(Error::invalid_params().data("DSH command must not be empty"));
+        }
+        if self.dsh_profile.trim().is_empty() {
+            return Err(Error::invalid_params().data("DSH profile must not be empty"));
         }
         Ok(())
     }
@@ -169,6 +180,20 @@ impl Config {
         self.system_prompt
             .as_deref()
             .filter(|extra| !extra.trim().is_empty())
+    }
+
+    pub fn dsh_runtime_config(&self) -> crate::dsh::RuntimeConfig {
+        crate::dsh::RuntimeConfig {
+            command: self.dsh_command.clone(),
+            prefix_args: self.dsh_prefix_args.clone(),
+            profile: self.dsh_profile.clone(),
+            home: self.dsh_home.clone(),
+            runtime_modules: self.dsh_runtime_modules.clone(),
+            api_key: self.api_key.clone(),
+            base_url: Some(self.base_url.clone()),
+            data_dir: self.data_dir.clone(),
+            request_timeout: self.http_timeout,
+        }
     }
 }
 

@@ -3,12 +3,12 @@ name = "dsh-acp"
 version = "0.7.1"
 edition = "2024"
 rust-version = "1.89"
-description = "A full-featured DeepSeek ACP agent harness"
+description = "A full-featured Agent Client Protocol server for DeepSeek Harness"
 license = "MIT"
 repository = "https://github.com/BrokkAi/dsh-acp"
 homepage = "https://github.com/BrokkAi/dsh-acp#readme"
 readme = "README.md"
-keywords = ["acp", "deepseek", "ai-agent", "coding-agent", "mcp"]
+keywords = ["acp", "deepseek", "deepseek-harness", "coding-agent", "bridge"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]

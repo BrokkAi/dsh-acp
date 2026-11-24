@@ -18,8 +18,10 @@ security advisory.
 Include the affected version or commit, impact, reproduction steps, and any
 suggested mitigation. Remove credentials and unrelated personal data from logs.
 
-Security-sensitive areas include workspace path confinement, command execution,
-MCP server launch configuration, provider headers, permission policy, terminal
-output handling, persisted session files, and the `--listen` HTTP and WebSocket
-server: its bearer token, `Host` and `Origin` checks, loopback-only default,
-and one-connection-at-a-time rule.
+DeepSeek Harness owns workspace/conversation execution, tool sandbox policy,
+credential resolution, MCP transport policy, and durable session logs.
+Security-sensitive bridge areas include the embedded runtime plugin, exact DSH
+version verification, child-process environment and lifecycle, ACP-to-DSH
+permission forwarding, session replay projection, and the `--listen` HTTP and
+WebSocket server: its bearer token, `Host` and `Origin` checks, loopback-only
+default, and one-connection-at-a-time rule.

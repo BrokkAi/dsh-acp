@@ -2,7 +2,7 @@
   "name": "@brokkai/dsh-acp",
   "version": "0.0.0",
   "private": true,
-  "description": "Run a DeepSeek coding agent in Zed, JetBrains IDEs, and other ACP clients",
+  "description": "Full-featured ACP v1/v2 server for the pinned official DeepSeek Harness runtime",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -14,11 +14,14 @@
     "dsh-acp": "bin/dsh-acp.cjs"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=24.9.0"
   },
   "os": ["darwin", "linux", "win32"],
   "cpu": ["x64", "arm64"],
   "files": ["bin/", "native/", "LICENSE", "README.md"],
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.2.2-rc.5"
+  },
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"

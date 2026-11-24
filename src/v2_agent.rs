@@ -349,11 +349,9 @@ impl V2Harness {
             .mcp(
                 v2::McpCapabilities::new()
                     .stdio(v2::McpStdioCapabilities::new())
-                    .http(v2::McpHttpCapabilities::new())
-                    .acp(v2::McpAcpCapabilities::new()),
+                    .http(v2::McpHttpCapabilities::new()),
             )
             .delete(v2::SessionDeleteCapabilities::new())
-            .additional_directories(v2::SessionAdditionalDirectoriesCapabilities::new())
             .fork(v2::SessionForkCapabilities::new())
             .status(v2::SessionStatusCapabilities::new())
             .options(v2::SessionOptionsCapabilities::new())
@@ -481,6 +479,22 @@ impl V2Harness {
             return responder
                 .respond_with_error(Error::invalid_params().data("invalid provider base URL"));
         }
+        if let Err(error) = self
+            .base
+            .dsh
+            .get()
+            .await?
+            .request(
+                "dsh/provider/set",
+                json!({
+                    "baseUrl": request.base_url.clone(),
+                    "headers": serde_json::to_value(&request.headers).map_err(Error::into_internal_error)?,
+                }),
+            )
+            .await
+        {
+            return responder.respond_with_error(error);
+        }
         let before = self.base.auth_status().await;
         *self.base.provider.write().await = crate::agent::ProviderRouting {
             enabled: true,
@@ -503,6 +517,16 @@ impl V2Harness {
             );
         }
         let before = self.base.auth_status().await;
+        if let Err(error) = self
+            .base
+            .dsh
+            .get()
+            .await?
+            .request("dsh/provider/disable", json!({}))
+            .await
+        {
+            return responder.respond_with_error(error);
+        }
         self.base.provider.write().await.enabled = false;
         responder.respond(DisableProviderResponse::new())?;
         self.announce_auth_status(&before, &connection).await
@@ -516,6 +540,9 @@ impl V2Harness {
     ) -> agent_client_protocol::Result<()> {
         if !self.initialized.load(Ordering::Acquire) {
             return responder.respond_with_error(Error::invalid_request().data("initialize first"));
+        }
+        if let Err(error) = reject_additional_paths(&request.additional_directories) {
+            return responder.respond_with_error(error);
         }
         let system_prompt = match v2_client_system_prompt(request.system_prompt.as_ref()) {
             Ok(prompt) => prompt,
@@ -539,6 +566,14 @@ impl V2Harness {
             Err(error) => return responder.respond_with_error(error),
         };
         if let Err(error) = self
+            .base
+            .open_dsh_session(&runtime.snapshot().await, false)
+            .await
+        {
+            let _ = self.base.store.delete(&runtime.snapshot().await.id).await;
+            return responder.respond_with_error(error);
+        }
+        if let Err(error) = self
             .attach_mcp(&runtime, &request.mcp_servers, &connection)
             .await
         {
@@ -553,14 +588,15 @@ impl V2Harness {
                 return responder.respond_with_error(error);
             }
         }
+        if let Err(error) = self.base.sync_dsh_config(&runtime.snapshot().await).await {
+            let _ = self.base.store.delete(&runtime.snapshot().await.id).await;
+            return responder.respond_with_error(error);
+        }
         let record = runtime.snapshot().await;
         responder.respond(
             v2::NewSessionResponse::new(record.id.clone())
                 .config_options(self.config_options(&record.config))
-                .available_commands(
-                    self.session_commands(&record.cwd, &record.additional_directories)
-                        .await,
-                ),
+                .available_commands(self.dsh_commands(&record.id).await),
         )?;
         send_update(
             &connection,
@@ -585,21 +621,58 @@ impl V2Harness {
             },
             None => 0,
         };
-        let records = match self
+        let local_titles = self
             .base
             .store
-            .list(request.cwd.as_ref().map(v2::AbsolutePath::as_ref))
+            .list(None)
             .await
-        {
-            Ok(records) => records,
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|record| record.title.map(|title| (record.id, title)))
+            .collect::<std::collections::HashMap<_, _>>();
+        let runtime = match self.base.dsh.get().await {
+            Ok(runtime) => runtime,
             Err(error) => return responder.respond_with_error(error),
         };
+        let listed = match runtime
+            .request(
+                "dsh/session/list",
+                json!({
+                    "cwd": request.cwd.as_ref().map(|cwd| cwd.0.to_string_lossy().to_string())
+                }),
+            )
+            .await
+        {
+            Ok(listed) => listed,
+            Err(error) => return responder.respond_with_error(error),
+        };
+        let records = listed
+            .get("sessions")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         let total = records.len();
         let sessions = records
             .into_iter()
             .skip(offset)
             .take(PAGE_SIZE)
-            .map(v2_session_info)
+            .filter_map(|record| {
+                let id = record.get("sessionId")?.as_str()?.to_string();
+                let cwd = record.get("cwd")?.as_str()?.to_string();
+                let title = record
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .or_else(|| local_titles.get(&id).cloned());
+                let mut info = v2::SessionInfo::new(id, cwd);
+                if let Some(title) = title {
+                    info = info.title(title);
+                }
+                if let Some(updated) = record.get("updatedAt").and_then(Value::as_str) {
+                    info = info.updated_at(updated.to_string());
+                }
+                Some(info)
+            })
             .collect::<Vec<_>>();
         let next = offset.saturating_add(sessions.len());
         responder.respond(
@@ -623,6 +696,9 @@ impl V2Harness {
             Err(error) => return responder.respond_with_error(error),
         };
         if let Err(error) = validate_initial_config(&request.config_options) {
+            return responder.respond_with_error(error);
+        }
+        if let Err(error) = reject_additional_paths(&request.additional_directories) {
             return responder.respond_with_error(error);
         }
         let runtime = match self.base.store.get(&request.session_id.to_string()).await {
@@ -656,6 +732,13 @@ impl V2Harness {
                 Err(error) => return responder.respond_with_error(error),
             }
         };
+        if let Err(error) = self
+            .base
+            .open_dsh_session(&runtime.snapshot().await, true)
+            .await
+        {
+            return responder.respond_with_error(error);
+        }
         // A resume whose MCP servers fail to connect leaves the session as it
         // was. Installing touches only the instructions, so a turn that is
         // still running keeps the messages it adds meanwhile.
@@ -671,6 +754,9 @@ impl V2Harness {
         }
         self.apply_initial_config(&runtime, &request.config_options)
             .await;
+        if let Err(error) = self.base.sync_dsh_config(&runtime.snapshot().await).await {
+            return responder.respond_with_error(error);
+        }
         if let Err(error) = self.base.store.save(&runtime).await {
             return responder.respond_with_error(error);
         }
@@ -701,10 +787,7 @@ impl V2Harness {
         responder.respond(
             v2::ResumeSessionResponse::new()
                 .config_options(self.config_options(&record.config))
-                .available_commands(
-                    self.session_commands(&record.cwd, &record.additional_directories)
-                        .await,
-                ),
+                .available_commands(self.dsh_commands(&record.id).await),
         )
     }
 
@@ -715,6 +798,9 @@ impl V2Harness {
         connection: V2ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<()> {
         if let Err(error) = validate_initial_config(&request.config_options) {
+            return responder.respond_with_error(error);
+        }
+        if let Err(error) = reject_additional_paths(&request.additional_directories) {
             return responder.respond_with_error(error);
         }
         let source_runtime = match self.base.store.get(&request.session_id.to_string()).await {
@@ -763,6 +849,28 @@ impl V2Harness {
             Err(error) => return responder.respond_with_error(error),
         };
         let runtime_id = runtime.snapshot().await.id;
+        let fork = match self.base.dsh.get().await {
+            Ok(dsh) => {
+                dsh.request(
+                    "dsh/session/fork",
+                    json!({
+                        "sourceSessionId": source.id,
+                        "childSessionId": runtime_id.clone(),
+                        "cwd": source.cwd,
+                        "provider": "deepseek-official",
+                        "model": source.config.model,
+                        "reasoningEffort": dsh_effort(source.config.reasoning_effort),
+                        "permissionMode": source.config.permission_mode.as_str(),
+                    }),
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = fork {
+            let _ = self.base.store.delete(&runtime_id).await;
+            return responder.respond_with_error(error);
+        }
         let refresh = {
             let mut state = runtime.state.lock().await;
             let mut candidate = state.record.clone();
@@ -796,6 +904,10 @@ impl V2Harness {
         }
         self.apply_initial_config(&runtime, &request.config_options)
             .await;
+        if let Err(error) = self.base.sync_dsh_config(&runtime.snapshot().await).await {
+            let _ = self.base.store.delete(&runtime_id).await;
+            return responder.respond_with_error(error);
+        }
         if let Err(error) = self.base.store.save(&runtime).await {
             let _ = self.base.store.delete(&runtime_id).await;
             return responder.respond_with_error(error);
@@ -804,10 +916,7 @@ impl V2Harness {
         responder.respond(
             v2::ForkSessionResponse::new(record.id.clone())
                 .config_options(self.config_options(&record.config))
-                .available_commands(
-                    self.session_commands(&record.cwd, &record.additional_directories)
-                        .await,
-                ),
+                .available_commands(self.dsh_commands(&record.id).await),
         )?;
         send_update(
             &connection,
@@ -821,6 +930,19 @@ impl V2Harness {
         request: v2::DeleteSessionRequest,
         responder: agent_client_protocol::v2::Responder<v2::DeleteSessionResponse>,
     ) -> agent_client_protocol::Result<()> {
+        if let Err(error) = self
+            .base
+            .dsh
+            .get()
+            .await?
+            .request(
+                "dsh/session/delete",
+                json!({"sessionId": request.session_id.to_string()}),
+            )
+            .await
+        {
+            return responder.respond_with_error(error);
+        }
         match self
             .base
             .store
@@ -860,6 +982,13 @@ impl V2Harness {
                 break;
             }
             notified.await;
+        }
+        if let Err(error) = self
+            .base
+            .close_dsh_session(&request.session_id.to_string())
+            .await
+        {
+            tracing::warn!(?error, "failed to close DSH session");
         }
         match self.base.store.close(&request.session_id.to_string()).await {
             Ok(()) => responder.respond(v2::CloseSessionResponse::new()),
@@ -913,6 +1042,19 @@ impl V2Harness {
             Ok(stored) => stored,
             Err(error) => return responder.respond_with_error(error),
         };
+        if let Err(error) = self
+            .base
+            .dsh
+            .get()
+            .await?
+            .request(
+                "dsh/session/set_title",
+                json!({"sessionId": stored.session_id.clone(), "title": stored.title.clone()}),
+            )
+            .await
+        {
+            return responder.respond_with_error(error);
+        }
         if stored.loaded {
             // The result carries the title, so a client does not depend on
             // this and a failed send does not fail the request.
@@ -964,6 +1106,31 @@ impl V2Harness {
     /// The command list of a session with these workspace roots: the harness
     /// commands, and the skills found for it when the client takes `skill`
     /// entries.
+    async fn dsh_commands(&self, session_id: &str) -> Vec<AvailableCommand> {
+        let runtime = match self.base.dsh.get().await {
+            Ok(runtime) => runtime,
+            Err(_) => return harness_commands(),
+        };
+        let response = runtime
+            .request("dsh/session/commands", json!({"sessionId": session_id}))
+            .await;
+        let Ok(response) = response else {
+            return harness_commands();
+        };
+        response
+            .get("commands")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|command| {
+                Some(AvailableCommand::Command(v2::Command::new(
+                    command.get("name")?.as_str()?,
+                    command.get("description")?.as_str()?,
+                )))
+            })
+            .collect()
+    }
+
     async fn session_commands(
         &self,
         cwd: &Path,
@@ -1101,10 +1268,29 @@ impl V2Harness {
             }
             state.record.touch();
         }
+        let record = runtime.snapshot().await;
+        if let Err(error) = self
+            .base
+            .dsh
+            .get()
+            .await?
+            .request(
+                "dsh/session/set_config",
+                json!({
+                    "sessionId": record.id,
+                    "provider": "deepseek-official",
+                    "model": record.config.model,
+                    "reasoningEffort": dsh_effort(record.config.reasoning_effort),
+                    "permissionMode": record.config.permission_mode.as_str(),
+                }),
+            )
+            .await
+        {
+            return responder.respond_with_error(error);
+        }
         if let Err(error) = self.base.store.save(&runtime).await {
             return responder.respond_with_error(error);
         }
-        let record = runtime.snapshot().await;
         let options = self.config_options(&record.config);
         send_update(
             &connection,
@@ -1147,6 +1333,8 @@ impl V2Harness {
         };
         let skill_title = skill_title(skill.as_ref(), &prompt);
         let prompt = prompt.with_skill(skill.as_ref());
+        let prompt_blocks = serde_json::to_value(message_content_to_v2_blocks(&prompt.content))
+            .map_err(Error::into_internal_error)?;
         let model = runtime.snapshot().await.config.model;
         if prompt.has_images
             && !prompt.text.trim().starts_with('/')
@@ -1263,6 +1451,7 @@ impl V2Harness {
                 work_runtime,
                 work_session_id,
                 prompt.text,
+                prompt_blocks,
                 prompt_seq,
                 capabilities,
                 prompt_connection,
@@ -1340,6 +1529,8 @@ impl V2Harness {
         };
         let skill_title = skill_title(skill.as_ref(), &payload);
         let payload = payload.with_skill(skill.as_ref());
+        let prompt_blocks = serde_json::to_value(message_content_to_v2_blocks(&payload.content))
+            .map_err(Error::into_internal_error)?;
         let model = runtime.snapshot().await.config.model;
         if payload.has_images
             && !payload.text.trim().starts_with('/')
@@ -1449,6 +1640,7 @@ impl V2Harness {
                 work_runtime,
                 work_session_id,
                 payload.text,
+                prompt_blocks,
                 prompt_seq,
                 capabilities,
                 work_connection,
@@ -1486,19 +1678,372 @@ impl V2Harness {
         {
             runtime.state.lock().await.cancellation.cancel();
         }
+        if let Ok(runtime) = self.base.dsh.get().await {
+            let _ = runtime
+                .request(
+                    "dsh/session/cancel",
+                    json!({"sessionId": notification.session_id.to_string()}),
+                )
+                .await;
+        }
+    }
+
+    async fn run_dsh_prompt_work(
+        &self,
+        runtime: SessionRuntime,
+        session_id: v2::SessionId,
+        prompt_blocks: Value,
+        capabilities: v2::ClientCapabilities,
+        connection: V2ConnectionTo<Client>,
+        cancellation: CancellationToken,
+    ) {
+        let initial_usage = runtime.snapshot().await.usage;
+        let record = runtime.snapshot().await;
+        if let Err(error) = self.base.open_dsh_session(&record, false).await {
+            self.finish_dsh_v2(
+                &runtime,
+                &session_id,
+                StopReason::Error(v2::ErrorStopReason::new().error(Some(v2_error_from(error)))),
+                &initial_usage,
+                &connection,
+            )
+            .await;
+            return;
+        }
+        let runtime_handle = match self.base.dsh.get().await {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                self.finish_dsh_v2(
+                    &runtime,
+                    &session_id,
+                    StopReason::Error(v2::ErrorStopReason::new().error(Some(v2_error_from(error)))),
+                    &initial_usage,
+                    &connection,
+                )
+                .await;
+                return;
+            }
+        };
+        let mut events = runtime_handle.subscribe();
+        let mut requests = runtime_handle.subscribe_requests();
+        if let Err(error) = runtime_handle
+            .request(
+                "session/query",
+                json!({
+                    "sessionId": session_id.to_string(),
+                    "contentBlocks": prompt_blocks,
+                }),
+            )
+            .await
+        {
+            self.finish_dsh_v2(
+                &runtime,
+                &session_id,
+                StopReason::Error(v2::ErrorStopReason::new().error(Some(v2_error_from(error)))),
+                &initial_usage,
+                &connection,
+            )
+            .await;
+            return;
+        }
+        let wait =
+            runtime_handle.request("session/wait", json!({"sessionId": session_id.to_string()}));
+        tokio::pin!(wait);
+        let mut stop_reason = StopReason::EndTurn;
+        let mut failure = None;
+        let mut wait_finished = false;
+        let mut cancel_sent = false;
+        while !wait_finished {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled(), if !cancel_sent => {
+                    cancel_sent = true;
+                    let _ = runtime_handle.request(
+                        "dsh/session/cancel",
+                        json!({"sessionId": session_id.to_string()}),
+                    ).await;
+                    stop_reason = StopReason::Cancelled;
+                }
+                request = requests.recv() => {
+                    match request {
+                        Ok(request) => {
+                            if let Err(error) = self
+                                .answer_dsh_v2_request(
+                                    &runtime_handle,
+                                    &connection,
+                                    &capabilities,
+                                    request,
+                                )
+                                .await
+                            {
+                                tracing::warn!(?error, "failed to answer a DSH request");
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "lagged DSH request notifications");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            failure = Some(Error::internal_error().data("DSH request channel closed"));
+                            wait_finished = true;
+                        }
+                    }
+                }
+                notification = events.recv() => {
+                    match notification {
+                        Ok(notification) => {
+                            match apply_v2_dsh_notification(
+                                &connection,
+                                &runtime,
+                                &session_id,
+                                &notification,
+                            ).await {
+                                Ok(Some((reason, error))) => {
+                                    if let Some(reason) = reason {
+                                        stop_reason = reason;
+                                    }
+                                    failure = error.or(failure);
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    failure = Some(error);
+                                    wait_finished = true;
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "lagged DSH session events");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            failure = Some(Error::internal_error().data("DSH event stream closed"));
+                            wait_finished = true;
+                        }
+                    }
+                }
+                result = &mut wait => {
+                    wait_finished = true;
+                    if let Err(error) = result {
+                        if cancellation.is_cancelled() {
+                            stop_reason = StopReason::Cancelled;
+                        } else {
+                            failure = Some(error);
+                        }
+                    }
+                    while let Ok(notification) = events.try_recv() {
+                        if let Ok(Some((reason, error))) = apply_v2_dsh_notification(
+                            &connection,
+                            &runtime,
+                            &session_id,
+                            &notification,
+                        ).await {
+                            if let Some(reason) = reason {
+                                stop_reason = reason;
+                            }
+                            failure = error.or(failure);
+                        }
+                    }
+                }
+            }
+        }
+        let _ = self.base.store.save(&runtime).await;
+        if let Some(error) = failure {
+            stop_reason =
+                StopReason::Error(v2::ErrorStopReason::new().error(Some(v2_error_from(error))));
+        }
+        self.finish_dsh_v2(
+            &runtime,
+            &session_id,
+            stop_reason,
+            &initial_usage,
+            &connection,
+        )
+        .await;
+    }
+
+    async fn finish_dsh_v2(
+        &self,
+        runtime: &SessionRuntime,
+        session_id: &v2::SessionId,
+        stop_reason: StopReason,
+        initial_usage: &TokenUsage,
+        connection: &V2ConnectionTo<Client>,
+    ) {
+        let usage = runtime.snapshot().await.usage;
+        let state = runtime.state.lock().await;
+        state.active_prompt.store(false, Ordering::Release);
+        state.requires_action.store(false, Ordering::Release);
+        state.activity_notify.notify_waiters();
+        let _ = send_update(
+            connection,
+            session_id,
+            SessionUpdate::StateUpdate(StateUpdate::Idle(
+                IdleStateUpdate::new()
+                    .stop_reason(Some(stop_reason))
+                    .usage(Some(v2_turn_usage(&usage, initial_usage))),
+            )),
+        );
+    }
+
+    async fn answer_dsh_v2_request(
+        &self,
+        dsh: &crate::dsh::DshRuntime,
+        connection: &V2ConnectionTo<Client>,
+        capabilities: &v2::ClientCapabilities,
+        request: Value,
+    ) -> Result<(), Error> {
+        let id = request.get("id").cloned().unwrap_or(Value::Null);
+        let method = request
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let params = request.get("params").cloned().unwrap_or(Value::Null);
+        match method {
+            "approval/request" => {
+                let session_id = v2::SessionId::new(
+                    params
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+                let call_id = params
+                    .get("callId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("dsh-approval");
+                let tool_name = params
+                    .get("toolName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("DSH tool");
+                let tool_call = ToolCallUpdate::new(call_id)
+                    .title(tool_name.to_string())
+                    .status(ToolCallStatus::Pending);
+                let decision = request_permission(
+                    connection,
+                    &session_id,
+                    tool_call,
+                    tool_name,
+                    &CancellationToken::new(),
+                )
+                .await;
+                let outcome = match decision {
+                    PermissionDecision::AllowOnce | PermissionDecision::AllowAlways => {
+                        "allowed-once"
+                    }
+                    PermissionDecision::Cancelled => "cancelled",
+                    PermissionDecision::Deny | PermissionDecision::Failed(_) => "rejected",
+                };
+                dsh.respond(id, json!({"outcome": outcome})).await
+            }
+            "user-question/ask" => {
+                let supports_form = capabilities
+                    .elicitation
+                    .as_ref()
+                    .is_some_and(|elicitation| elicitation.supports_form());
+                if !supports_form {
+                    return dsh
+                        .respond_error(id, "the ACP client does not support form elicitation")
+                        .await;
+                }
+                let questions = params
+                    .get("questions")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let session_id = v2::SessionId::new(
+                    params
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+                let mut answers = Vec::new();
+                for question in questions {
+                    let question_id = question
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("question")
+                        .to_string();
+                    let message = question
+                        .get("question")
+                        .and_then(Value::as_str)
+                        .unwrap_or("DSH needs input");
+                    let schema = v2::ElicitationSchema::new()
+                        .title(
+                            question
+                                .get("header")
+                                .and_then(Value::as_str)
+                                .unwrap_or("Question"),
+                        )
+                        .string("response", true);
+                    let request = v2::CreateElicitationRequest::new(
+                        v2::ElicitationMode::Form(v2::ElicitationFormMode::new(
+                            v2::ElicitationSessionScope::new(session_id.clone()),
+                            schema,
+                        )),
+                        message,
+                    );
+                    let response = connection.send_request(request).block_task().await?;
+                    match response.action {
+                        v2::ElicitationAction::Accept(action) => {
+                            let text = action
+                                .content
+                                .as_ref()
+                                .and_then(|content| content.get("response"))
+                                .map(elicitation_text)
+                                .unwrap_or_default();
+                            answers.push(json!({
+                                "id": question_id,
+                                "selected": [],
+                                "custom": text,
+                            }));
+                        }
+                        v2::ElicitationAction::Decline | v2::ElicitationAction::Cancel => {
+                            return dsh.respond(id, json!({"cancelled": true})).await;
+                        }
+                        _ => {
+                            return dsh
+                                .respond_error(
+                                    id,
+                                    "the ACP client returned an unsupported elicitation action",
+                                )
+                                .await;
+                        }
+                    }
+                }
+                dsh.respond(id, json!({"answers": answers})).await
+            }
+            _ => {
+                dsh.respond_error(
+                    id,
+                    format!("unsupported DSH runtime request method: {method}"),
+                )
+                .await
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(unreachable_code, unused_variables)]
     async fn run_prompt_work(
         self,
         runtime: SessionRuntime,
         session_id: v2::SessionId,
         prompt_text: String,
-        mut last_request_seq: u64,
+        prompt_blocks: Value,
+        last_request_seq: u64,
         capabilities: v2::ClientCapabilities,
         connection: V2ConnectionTo<Client>,
         cancellation: CancellationToken,
     ) {
+        self.run_dsh_prompt_work(
+            runtime,
+            session_id,
+            prompt_blocks,
+            capabilities,
+            connection,
+            cancellation,
+        )
+        .await;
+        return;
         {
             let mut state = runtime.state.lock().await;
             state.requires_action.store(false, Ordering::Release);
@@ -2913,6 +3458,318 @@ fn respond_json(
     }
 }
 
+async fn apply_v2_dsh_notification(
+    connection: &V2ConnectionTo<Client>,
+    runtime: &SessionRuntime,
+    session_id: &v2::SessionId,
+    notification: &Value,
+) -> Result<Option<(Option<StopReason>, Option<Error>)>, Error> {
+    let incoming_session = notification
+        .pointer("/params/sessionId")
+        .and_then(Value::as_str);
+    if incoming_session.is_some_and(|id| id != session_id.to_string()) {
+        return Ok(None);
+    }
+    match notification.get("method").and_then(Value::as_str) {
+        Some("dsh/assistant-stream") => {
+            let frame = notification
+                .pointer("/params/frame")
+                .cloned()
+                .unwrap_or(Value::Null);
+            if frame.get("type").and_then(Value::as_str) != Some("chunk") {
+                return Ok(None);
+            }
+            let chunk = frame.get("chunk").cloned().unwrap_or(Value::Null);
+            let message_id = frame
+                .get("attemptId")
+                .and_then(Value::as_str)
+                .unwrap_or("dsh-message");
+            match chunk.get("type").and_then(Value::as_str) {
+                Some("text-delta") => {
+                    if let Some(text) = chunk.get("text").and_then(Value::as_str) {
+                        send_chunk(connection, session_id, message_id, text.to_string(), false)?;
+                    }
+                }
+                Some("reasoning-delta") => {
+                    if let Some(text) = chunk.get("text").and_then(Value::as_str) {
+                        send_chunk(connection, session_id, message_id, text.to_string(), true)?;
+                    }
+                }
+                _ => {}
+            }
+            Ok(None)
+        }
+        Some("session.event") => {
+            let Some(event) = notification.pointer("/params/event") else {
+                return Ok(None);
+            };
+            let event_type = event
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let data = event.get("data").cloned().unwrap_or(Value::Null);
+            {
+                let mut state = runtime.state.lock().await;
+                state.record.dsh_events.push(event.clone());
+                match event_type {
+                    "assistant/message" => {
+                        let blocks = data
+                            .pointer("/message/content")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        let text = blocks
+                            .iter()
+                            .filter(|block| {
+                                block.get("type").and_then(Value::as_str) == Some("text")
+                            })
+                            .filter_map(|block| block.get("text").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("");
+                        let reasoning = blocks
+                            .iter()
+                            .filter(|block| {
+                                block.get("type").and_then(Value::as_str) == Some("reasoning")
+                            })
+                            .filter_map(|block| block.get("text").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("");
+                        if !text.is_empty() || !reasoning.is_empty() {
+                            state.record.messages.push(ChatMessage::assistant(
+                                (!text.is_empty()).then_some(text),
+                                (!reasoning.is_empty()).then_some(reasoning),
+                            ));
+                        }
+                        if let Some(usage) = data.get("usage") {
+                            state.record.usage.prompt_tokens = usage
+                                .get("inputTokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0);
+                            state.record.usage.completion_tokens = usage
+                                .get("outputTokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0);
+                            state.record.usage.total_tokens = state
+                                .record
+                                .usage
+                                .prompt_tokens
+                                .saturating_add(state.record.usage.completion_tokens);
+                            state.record.context_used = state.record.usage.total_tokens;
+                        }
+                    }
+                    "tool/call" => {
+                        let call_id = data
+                            .get("callId")
+                            .and_then(Value::as_str)
+                            .unwrap_or("dsh-tool");
+                        let name = data.get("name").and_then(Value::as_str).unwrap_or("tool");
+                        let arguments = data
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or("{}");
+                        let mut message = ChatMessage::assistant(None, None);
+                        message.tool_calls.push(crate::model::ToolCall {
+                            id: call_id.to_string(),
+                            kind: "function".to_string(),
+                            function: crate::model::FunctionCall {
+                                name: name.to_string(),
+                                arguments: arguments.to_string(),
+                            },
+                        });
+                        state.record.messages.push(message);
+                    }
+                    "tool/result" => {
+                        let call_id = data
+                            .pointer("/message/toolCallId")
+                            .and_then(Value::as_str)
+                            .unwrap_or("dsh-tool");
+                        let is_error = data
+                            .pointer("/message/isError")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let text = data
+                            .pointer("/message/content")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter(|block| {
+                                block.get("type").and_then(Value::as_str) == Some("text")
+                            })
+                            .filter_map(|block| block.get("text").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        state
+                            .record
+                            .messages
+                            .push(ChatMessage::tool(call_id.to_string(), text.clone()));
+                        state.record.tool_outcomes.insert(
+                            call_id.to_string(),
+                            crate::model::PersistedToolOutcome {
+                                status: if is_error {
+                                    ToolOutcomeStatus::Failed
+                                } else {
+                                    ToolOutcomeStatus::Completed
+                                },
+                                text,
+                                raw_output: data.clone(),
+                                structured_content: Vec::new(),
+                                diff: None,
+                                terminal: None,
+                            },
+                        );
+                    }
+                    "session/title" => {
+                        if let Some(title) = data.get("title").and_then(Value::as_str) {
+                            state.record.title = Some(title.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+                state.record.touch();
+            }
+            match event_type {
+                "tool/call" => {
+                    let call_id = data
+                        .get("callId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("dsh-tool")
+                        .to_string();
+                    let name = data
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("DSH tool")
+                        .to_string();
+                    let raw_input = data
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
+                        .unwrap_or(Value::Null);
+                    send_update(
+                        connection,
+                        session_id,
+                        SessionUpdate::ToolCallUpdate(
+                            ToolCallUpdate::new(call_id)
+                                .name(name.clone())
+                                .title(name)
+                                .status(ToolCallStatus::Pending)
+                                .raw_input(raw_input),
+                        ),
+                    )?;
+                }
+                "tool/result" => {
+                    let call_id = data
+                        .pointer("/message/toolCallId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("dsh-tool")
+                        .to_string();
+                    let is_error = data
+                        .pointer("/message/isError")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let content = data
+                        .pointer("/message/content")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|block| {
+                            serde_json::from_value::<ContentBlock>(block.clone()).ok()
+                        })
+                        .map(|block| ToolCallContent::Content(Box::new(v2::Content::new(block))))
+                        .collect::<Vec<_>>();
+                    send_update(
+                        connection,
+                        session_id,
+                        SessionUpdate::ToolCallUpdate(
+                            ToolCallUpdate::new(call_id)
+                                .status(if is_error {
+                                    ToolCallStatus::Failed
+                                } else {
+                                    ToolCallStatus::Completed
+                                })
+                                .content(Some(content)),
+                        ),
+                    )?;
+                }
+                "todo/write" => {
+                    let entries = data
+                        .get("todos")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|todo| {
+                            let content = todo.get("content")?.as_str()?.to_string();
+                            let status = match todo.get("status")?.as_str()? {
+                                "completed" => PlanEntryStatus::Completed,
+                                "in_progress" => PlanEntryStatus::InProgress,
+                                _ => PlanEntryStatus::Pending,
+                            };
+                            Some(PlanEntry::new(content, PlanEntryPriority::Medium, status))
+                        })
+                        .collect::<Vec<_>>();
+                    send_update(
+                        connection,
+                        session_id,
+                        SessionUpdate::PlanUpdate(PlanUpdate::new(PlanUpdateContent::items(
+                            "default", entries,
+                        ))),
+                    )?;
+                }
+                "session/title" => {
+                    if let Some(title) = data.get("title").and_then(Value::as_str) {
+                        send_update(
+                            connection,
+                            session_id,
+                            SessionUpdate::SessionInfoUpdate(
+                                v2::SessionInfoUpdate::new().title(title.to_string()),
+                            ),
+                        )?;
+                    }
+                }
+                "assistant/message" => {
+                    let record = runtime.snapshot().await;
+                    send_update(
+                        connection,
+                        session_id,
+                        SessionUpdate::UsageUpdate(v2::UsageUpdate::new(
+                            record.context_used,
+                            CONTEXT_WINDOW,
+                        )),
+                    )?;
+                }
+                "turn/end" => {
+                    let kind = data
+                        .pointer("/reason/kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("completed");
+                    let reason = match kind {
+                        "max-tokens" => StopReason::MaxTokens,
+                        "aborted" | "disposed" | "rejected" => StopReason::Cancelled,
+                        "error" => {
+                            let message = data
+                                .pointer("/reason/error/message")
+                                .or_else(|| data.pointer("/reason/failure/message"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("DSH turn failed");
+                            let error = Error::internal_error().data(message.to_string());
+                            return Ok(Some((
+                                Some(StopReason::Error(
+                                    v2::ErrorStopReason::new().error(Some(v2_error_from(error))),
+                                )),
+                                None,
+                            )));
+                        }
+                        _ => StopReason::EndTurn,
+                    };
+                    return Ok(Some((Some(reason), None)));
+                }
+                _ => {}
+            }
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
 fn replay_history(
     connection: &V2ConnectionTo<Client>,
     record: &SessionRecord,
@@ -3149,19 +4006,20 @@ fn harness_commands() -> Vec<AvailableCommand> {
         .collect()
 }
 
-fn v2_session_info(record: SessionRecord) -> v2::SessionInfo {
-    let title = session_title(&record);
-    v2::SessionInfo::new(record.id, record.cwd)
-        .additional_directories(record.additional_directories)
-        .title(title)
-        .updated_at(record.updated_at.to_rfc3339())
-}
-
 fn absolute_paths(paths: Vec<v2::AbsolutePath>) -> Vec<PathBuf> {
     paths
         .into_iter()
         .map(v2::AbsolutePath::into_inner)
         .collect()
+}
+
+fn reject_additional_paths(paths: &[v2::AbsolutePath]) -> Result<(), Error> {
+    if paths.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::invalid_params()
+            .data("additionalDirectories is not supported by the pinned DSH runtime"))
+    }
 }
 
 fn v2_client_system_prompt(
@@ -3190,6 +4048,15 @@ fn v2_client_system_prompt(
         .collect::<Result<Vec<_>, _>>()?
         .join("\n\n");
     Ok(Some(ClientSystemPrompt { mode, text }))
+}
+
+fn dsh_effort(effort: crate::config::ReasoningEffort) -> &'static str {
+    match effort {
+        crate::config::ReasoningEffort::None => "off",
+        crate::config::ReasoningEffort::Low => "low",
+        crate::config::ReasoningEffort::High => "high",
+        crate::config::ReasoningEffort::Max => "max",
+    }
 }
 
 struct V2PromptPayload {
@@ -3442,7 +4309,7 @@ fn convert_mcp_server(
             config.server_id.0.clone(),
         ))),
         _ => Err(Error::invalid_params()
-            .data("this v2 MCP transport is not supported by the standalone agent")),
+            .data("this v2 MCP transport is not supported by the pinned DSH runtime")),
     }
 }
 
