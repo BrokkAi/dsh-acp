@@ -6,6 +6,8 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ## Unreleased
 
+## 0.8.0 - 2026-11-24
+
 ### Changed
 
 - Replaced direct DeepSeek execution with the pinned official
@@ -495,7 +497,8 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 - Integration coverage for v1/v2 handshakes, images, tools, failed-tool replay,
   terminal output, commands, cancellation, and steering.
 
-[Unreleased]: https://github.com/BrokkAi/dsh-acp/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/BrokkAi/dsh-acp/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/BrokkAi/dsh-acp/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/BrokkAi/dsh-acp/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/BrokkAi/dsh-acp/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/BrokkAi/dsh-acp/compare/v0.5.0...v0.6.0
