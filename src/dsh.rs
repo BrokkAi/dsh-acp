@@ -418,9 +418,7 @@ mod tests {
             data_dir: temp.path().join("data"),
             request_timeout: Duration::from_secs(1),
         };
-        assert_eq!(
-            infer_runtime_modules(&config),
-            Some(temp.path().join("node_modules"))
-        );
+        let modules = std::fs::canonicalize(temp.path().join("node_modules")).unwrap();
+        assert_eq!(infer_runtime_modules(&config), Some(modules));
     }
 }
