@@ -1746,8 +1746,7 @@ impl V2Harness {
             .await;
             return;
         }
-        let wait =
-            runtime_handle.request("session/wait", json!({"sessionId": session_id.to_string()}));
+        let wait = runtime_handle.wait_session(session_id.to_string());
         tokio::pin!(wait);
         let mut stop_reason = StopReason::EndTurn;
         let mut failure = None;

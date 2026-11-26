@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -53,14 +53,37 @@ impl RuntimeConfig {
     }
 }
 
+/// Requests awaiting a response. After the runtime's stdout closes no response
+/// can arrive, so `closed` holds the failure for every later request.
+#[derive(Default)]
+struct Pending {
+    replies: HashMap<u64, oneshot::Sender<Result<Value, Error>>>,
+    closed: Option<Error>,
+}
+
+/// Removes a request's reply slot when its future finishes or is dropped, so an
+/// abandoned request cannot leave an entry behind.
+struct PendingGuard<'a> {
+    pending: &'a StdMutex<Pending>,
+    id: u64,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.replies.remove(&self.id);
+        }
+    }
+}
+
 struct RuntimeInner {
     stdin: Mutex<Option<BufWriter<ChildStdin>>>,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, Error>>>>,
+    pending: StdMutex<Pending>,
     notifications: broadcast::Sender<Value>,
     requests: broadcast::Sender<Value>,
     child: Mutex<Child>,
     next_id: AtomicU64,
-    request_timeout: Duration,
+    request_timeout: StdMutex<Duration>,
 }
 
 /// One pinned DSH process and its private JSON-RPC transport.
@@ -178,12 +201,12 @@ impl DshRuntime {
         let runtime = Self {
             inner: Arc::new(RuntimeInner {
                 stdin: Mutex::new(Some(BufWriter::new(stdin))),
-                pending: Mutex::new(HashMap::new()),
+                pending: StdMutex::new(Pending::default()),
                 notifications,
                 requests,
                 child: Mutex::new(child),
                 next_id: AtomicU64::new(1),
-                request_timeout: config.request_timeout,
+                request_timeout: StdMutex::new(config.request_timeout),
             }),
         };
         tokio::spawn(read_stdout(Arc::clone(&runtime.inner), stdout));
@@ -202,41 +225,71 @@ impl DshRuntime {
         Ok(runtime)
     }
 
+    /// Sends a request that the runtime must answer within `request_timeout`.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, Error> {
+        let timeout = *self.inner.request_timeout.lock().unwrap();
+        self.send_request(method, params, Some(timeout)).await
+    }
+
+    /// Waits until DSH finishes everything it is doing for `session_id`.
+    ///
+    /// DSH answers `session/wait` only when the whole turn ends, and a turn may
+    /// legitimately run for any length of time, so this has no deadline. It
+    /// still fails when the runtime exits: a closed runtime answers every
+    /// pending and later request with an error. Dropping the future abandons
+    /// the wait.
+    pub async fn wait_session(&self, session_id: String) -> Result<Value, Error> {
+        self.send_request("session/wait", json!({"sessionId": session_id}), None)
+            .await
+    }
+
+    /// Shortens the deadline after startup, so a test's `dsh/hello` does not
+    /// race a slow process launch on a loaded runner.
+    #[cfg(test)]
+    fn set_request_timeout(&self, timeout: Duration) {
+        *self.inner.request_timeout.lock().unwrap() = timeout;
+    }
+
+    async fn send_request(
+        &self,
+        method: &str,
+        params: Value,
+        deadline: Option<Duration>,
+    ) -> Result<Value, Error> {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (reply, response) = oneshot::channel();
-        self.inner.pending.lock().await.insert(id, reply);
+        {
+            let mut pending = self.inner.pending.lock().expect("pending lock poisoned");
+            if let Some(error) = &pending.closed {
+                return Err(error.clone());
+            }
+            pending.replies.insert(id, reply);
+        }
+        let _guard = PendingGuard {
+            pending: &self.inner.pending,
+            id,
+        };
         let frame = json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": method,
             "params": params,
         });
-        let write = async {
-            let mut stdin = self.inner.stdin.lock().await;
-            let stdin = stdin
-                .as_mut()
-                .ok_or_else(|| Error::internal_error().data("DSH runtime is closed"))?;
-            stdin
-                .write_all(format!("{frame}\n").as_bytes())
-                .await
-                .map_err(Error::into_internal_error)?;
-            stdin.flush().await.map_err(Error::into_internal_error)
+        self.write_frame(frame).await?;
+        let response = async {
+            response.await.unwrap_or_else(|_| {
+                Err(Error::internal_error().data("DSH runtime closed the request"))
+            })
         };
-        if let Err(error) = write.await {
-            self.inner.pending.lock().await.remove(&id);
-            return Err(error);
-        }
-        match tokio::time::timeout(self.inner.request_timeout, response).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(Error::internal_error().data("DSH runtime closed the request")),
-            Err(_) => {
-                self.inner.pending.lock().await.remove(&id);
-                Err(Error::internal_error().data(format!(
-                    "DSH runtime did not answer {method} within {:?}",
-                    self.inner.request_timeout
-                )))
-            }
+        match deadline {
+            None => response.await,
+            Some(deadline) => tokio::time::timeout(deadline, response)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Error::internal_error().data(format!(
+                        "DSH runtime did not answer {method} within {deadline:?}"
+                    )))
+                }),
         }
     }
 
@@ -341,7 +394,12 @@ async fn read_stdout(inner: Arc<RuntimeInner>, stdout: tokio::process::ChildStdo
         let is_response = message.get("result").is_some() || message.get("error").is_some();
         if is_response {
             if let Some(id) = response_id {
-                let reply = inner.pending.lock().await.remove(&id);
+                let reply = inner
+                    .pending
+                    .lock()
+                    .expect("pending lock poisoned")
+                    .replies
+                    .remove(&id);
                 if let Some(reply) = reply {
                     let result = if let Some(error) = message.get("error") {
                         Err(Error::new(
@@ -366,7 +424,12 @@ async fn read_stdout(inner: Arc<RuntimeInner>, stdout: tokio::process::ChildStdo
         let _ = inner.notifications.send(message);
     }
     let error = Error::internal_error().data("DSH runtime protocol stdout closed");
-    for (_, reply) in inner.pending.lock().await.drain() {
+    let replies = {
+        let mut pending = inner.pending.lock().expect("pending lock poisoned");
+        pending.closed = Some(error.clone());
+        std::mem::take(&mut pending.replies)
+    };
+    for (_, reply) in replies {
         let _ = reply.send(Err(error.clone()));
     }
 }
@@ -420,5 +483,106 @@ mod tests {
         };
         let modules = std::fs::canonicalize(temp.path().join("node_modules")).unwrap();
         assert_eq!(infer_runtime_modules(&config), Some(modules));
+    }
+
+    /// A stand-in for the DSH runtime. `dsh/hello` reports the pinned version,
+    /// `dsh/exit` ends the process without replying, and every other request is
+    /// answered after the delay named by its `delayMs` parameter or by a
+    /// `wait-<ms>` session id.
+    const FAKE_RUNTIME: &str = r#"
+const readline = require('node:readline')
+const reply = (id, result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\n')
+readline.createInterface({ input: process.stdin }).on('close', () => process.exit(0)).on('line', line => {
+  const { id, method, params } = JSON.parse(line)
+  if (method === 'dsh/hello') return reply(id, { version: 'PINNED_VERSION' })
+  if (method === 'dsh/exit') process.exit(3)
+  const named = Number((params.sessionId ?? '').split('-')[1])
+  setTimeout(() => reply(id, {}), params.delayMs ?? (named || 0))
+})
+"#;
+
+    async fn start_fake_runtime(directory: &Path) -> DshRuntime {
+        let script = directory.join("fake-runtime.cjs");
+        std::fs::write(
+            &script,
+            FAKE_RUNTIME.replace("PINNED_VERSION", PINNED_DSH_VERSION),
+        )
+        .unwrap();
+        DshRuntime::start(RuntimeConfig {
+            command: std::env::var_os("DSH_ACP_TEST_NODE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("node")),
+            prefix_args: vec![script.display().to_string()],
+            profile: "sdk".to_string(),
+            home: Some(directory.join("home")),
+            runtime_modules: None,
+            api_key: None,
+            base_url: None,
+            data_dir: directory.join("data"),
+            request_timeout: Duration::from_secs(60),
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_wait_outlasts_the_request_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = start_fake_runtime(temp.path()).await;
+        runtime.set_request_timeout(Duration::from_millis(500));
+        // The turn takes four times longer than the request timeout.
+        runtime.wait_session("wait-2000".to_string()).await.unwrap();
+        // Other requests still have the deadline.
+        let slow = runtime
+            .request("dsh/slow", json!({"delayMs": 2000}))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{slow:?}").contains("did not answer dsh/slow within 500ms"),
+            "{slow:?}"
+        );
+        runtime.close().await;
+    }
+
+    #[tokio::test]
+    async fn runtime_exit_fails_a_pending_wait_and_later_requests() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = start_fake_runtime(temp.path()).await;
+        let wait = tokio::spawn({
+            let runtime = runtime.clone();
+            async move { runtime.wait_session("wait-600000".to_string()).await }
+        });
+        // Let the wait reach the runtime before it exits.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let exit = runtime.request("dsh/exit", json!({})).await.unwrap_err();
+        assert!(format!("{exit:?}").contains("stdout closed"), "{exit:?}");
+        let wait = tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .expect("a wait must not outlive the runtime")
+            .unwrap()
+            .unwrap_err();
+        assert!(format!("{wait:?}").contains("stdout closed"), "{wait:?}");
+        let later = tokio::time::timeout(
+            Duration::from_secs(10),
+            runtime.wait_session("wait-600000".to_string()),
+        )
+        .await
+        .expect("a wait on a dead runtime must not hang")
+        .unwrap_err();
+        assert!(format!("{later:?}").contains("stdout closed"), "{later:?}");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_wait_releases_its_pending_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = start_fake_runtime(temp.path()).await;
+        let abandoned = tokio::time::timeout(
+            Duration::from_millis(200),
+            runtime.wait_session("wait-600000".to_string()),
+        )
+        .await;
+        assert!(abandoned.is_err());
+        assert!(runtime.inner.pending.lock().unwrap().replies.is_empty());
+        runtime.close().await;
     }
 }
