@@ -6,6 +6,19 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ## Unreleased
 
+## 0.8.1 - 2026-11-25
+
+### Fixed
+
+- Prompts that ran longer than `DSH_ACP_HTTP_TIMEOUT_SECS` (180 seconds by
+  default) failed with `DSH runtime did not answer session/wait`, while the DSH
+  turn kept running unobserved. 0.8.0 applied that timeout to the wait for the
+  end of the turn. The wait now has no deadline and ends when the turn does, on
+  cancellation, or when the DSH runtime exits. Other runtime requests keep the
+  timeout.
+- A request sent after the DSH runtime's output closed now fails at once
+  instead of waiting for a response that cannot arrive.
+
 ## 0.8.0 - 2026-11-24
 
 ### Changed

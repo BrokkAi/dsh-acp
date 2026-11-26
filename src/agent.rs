@@ -2479,7 +2479,7 @@ impl Harness {
             ));
         }
 
-        let wait = dsh.request("session/wait", json!({"sessionId": session_id.to_string()}));
+        let wait = dsh.wait_session(session_id.to_string());
         tokio::pin!(wait);
         let mut stop_reason = StopReason::EndTurn;
         let mut turn_failure = None;
