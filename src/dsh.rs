@@ -83,7 +83,7 @@ struct RuntimeInner {
     requests: broadcast::Sender<Value>,
     child: Mutex<Child>,
     next_id: AtomicU64,
-    request_timeout: Duration,
+    request_timeout: StdMutex<Duration>,
 }
 
 /// One pinned DSH process and its private JSON-RPC transport.
@@ -206,7 +206,7 @@ impl DshRuntime {
                 requests,
                 child: Mutex::new(child),
                 next_id: AtomicU64::new(1),
-                request_timeout: config.request_timeout,
+                request_timeout: StdMutex::new(config.request_timeout),
             }),
         };
         tokio::spawn(read_stdout(Arc::clone(&runtime.inner), stdout));
@@ -227,8 +227,8 @@ impl DshRuntime {
 
     /// Sends a request that the runtime must answer within `request_timeout`.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, Error> {
-        self.send_request(method, params, Some(self.inner.request_timeout))
-            .await
+        let timeout = *self.inner.request_timeout.lock().unwrap();
+        self.send_request(method, params, Some(timeout)).await
     }
 
     /// Waits until DSH finishes everything it is doing for `session_id`.
@@ -241,6 +241,13 @@ impl DshRuntime {
     pub async fn wait_session(&self, session_id: String) -> Result<Value, Error> {
         self.send_request("session/wait", json!({"sessionId": session_id}), None)
             .await
+    }
+
+    /// Shortens the deadline after startup, so a test's `dsh/hello` does not
+    /// race a slow process launch on a loaded runner.
+    #[cfg(test)]
+    fn set_request_timeout(&self, timeout: Duration) {
+        *self.inner.request_timeout.lock().unwrap() = timeout;
     }
 
     async fn send_request(
@@ -494,7 +501,7 @@ readline.createInterface({ input: process.stdin }).on('close', () => process.exi
 })
 "#;
 
-    async fn start_fake_runtime(directory: &Path, request_timeout: Duration) -> DshRuntime {
+    async fn start_fake_runtime(directory: &Path) -> DshRuntime {
         let script = directory.join("fake-runtime.cjs");
         std::fs::write(
             &script,
@@ -512,7 +519,7 @@ readline.createInterface({ input: process.stdin }).on('close', () => process.exi
             api_key: None,
             base_url: None,
             data_dir: directory.join("data"),
-            request_timeout,
+            request_timeout: Duration::from_secs(60),
         })
         .await
         .unwrap()
@@ -521,7 +528,8 @@ readline.createInterface({ input: process.stdin }).on('close', () => process.exi
     #[tokio::test]
     async fn session_wait_outlasts_the_request_timeout() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime = start_fake_runtime(temp.path(), Duration::from_millis(500)).await;
+        let runtime = start_fake_runtime(temp.path()).await;
+        runtime.set_request_timeout(Duration::from_millis(500));
         // The turn takes four times longer than the request timeout.
         runtime.wait_session("wait-2000".to_string()).await.unwrap();
         // Other requests still have the deadline.
@@ -539,7 +547,7 @@ readline.createInterface({ input: process.stdin }).on('close', () => process.exi
     #[tokio::test]
     async fn runtime_exit_fails_a_pending_wait_and_later_requests() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime = start_fake_runtime(temp.path(), Duration::from_secs(60)).await;
+        let runtime = start_fake_runtime(temp.path()).await;
         let wait = tokio::spawn({
             let runtime = runtime.clone();
             async move { runtime.wait_session("wait-600000".to_string()).await }
@@ -567,7 +575,7 @@ readline.createInterface({ input: process.stdin }).on('close', () => process.exi
     #[tokio::test]
     async fn dropping_a_wait_releases_its_pending_entry() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime = start_fake_runtime(temp.path(), Duration::from_secs(60)).await;
+        let runtime = start_fake_runtime(temp.path()).await;
         let abandoned = tokio::time::timeout(
             Duration::from_millis(200),
             runtime.wait_session("wait-600000".to_string()),
