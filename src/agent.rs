@@ -2431,6 +2431,9 @@ impl Harness {
     ) -> Result<PromptResponse, Error> {
         let session_id = request.session_id.clone();
         let record = runtime.snapshot().await;
+        // ACP v1 reports this turn's usage, while the record keeps the session
+        // total that usage_update publishes.
+        let initial_usage = record.usage.clone();
         self.open_dsh_session(&record, false).await?;
         let dsh = self.dsh.get().await?;
         let mut events = dsh.subscribe();
@@ -2560,7 +2563,9 @@ impl Harness {
         if let Some(error) = turn_failure {
             return Err(error);
         }
-        Ok(PromptResponse::new(stop_reason))
+        let final_usage = runtime.snapshot().await.usage;
+        let turn_usage = final_usage.saturating_sub(&initial_usage);
+        Ok(PromptResponse::new(stop_reason).usage(Some(turn_acp_usage(turn_usage))))
     }
 
     async fn handle_dsh_request(
@@ -3436,6 +3441,52 @@ fn send_available_commands(
     ))
 }
 
+/// Convert one DSH `assistant/message` usage payload to this bridge's shape.
+///
+/// DSH reports disjoint counters: `inputTokens` is uncached input only and
+/// `cacheReadTokens`/`cacheWriteTokens` are billed separately. ACP and Mjolnir
+/// price a prompt total that includes both cache buckets, so the prompt is
+/// their sum and the uncached part stays separately recorded as the cache
+/// miss. `input + output == total` is the invariant Mjolnir's pricing relies
+/// on to tell inclusive input from uncached input.
+pub(crate) fn dsh_token_usage(usage: &Value) -> TokenUsage {
+    let count = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let cache_read = count("cacheReadTokens");
+    let cache_write = count("cacheWriteTokens");
+    let uncached_input = count("inputTokens");
+    let output = count("outputTokens");
+    let prompt_tokens = uncached_input
+        .saturating_add(cache_read)
+        .saturating_add(cache_write);
+    TokenUsage {
+        prompt_tokens,
+        completion_tokens: output,
+        total_tokens: prompt_tokens.saturating_add(output),
+        prompt_cache_hit_tokens: cache_read,
+        prompt_cache_miss_tokens: uncached_input,
+        prompt_cache_write_tokens: cache_write,
+        reasoning_tokens: count("reasoningTokens"),
+    }
+}
+
+/// Add one native DSH step's usage to the session record.
+///
+/// Every `assistant/message` is one completed model call, so its usage is
+/// added to the session total and never replaces it. `context_used` instead
+/// follows the last call, which is the fill the next request would send.
+///
+/// DSH 0.2.2-rc.5 settles a successful step exactly once. A failed attempt is
+/// recorded as `assistant/attempt`, not another `assistant/message`, and a
+/// restored session's seed events never publish on `session/event`, so these
+/// samples are disjoint and accumulating them cannot double-count a step.
+pub(crate) fn record_dsh_usage(record: &mut SessionRecord, usage: &Value) {
+    let step = dsh_token_usage(usage);
+    record.usage.saturating_add(&step);
+    if step.total_tokens > 0 {
+        record.context_used = step.total_tokens;
+    }
+}
+
 async fn apply_dsh_notification(
     connection: &ConnectionTo<Client>,
     runtime: &SessionRuntime,
@@ -3533,20 +3584,7 @@ async fn apply_dsh_notification(
                             ));
                         }
                         if let Some(usage) = data.get("usage") {
-                            state.record.usage.prompt_tokens = usage
-                                .get("inputTokens")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0);
-                            state.record.usage.completion_tokens = usage
-                                .get("outputTokens")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0);
-                            state.record.usage.total_tokens = state
-                                .record
-                                .usage
-                                .prompt_tokens
-                                .saturating_add(state.record.usage.completion_tokens);
-                            state.record.context_used = state.record.usage.total_tokens;
+                            record_dsh_usage(&mut state.record, usage);
                         }
                     }
                     "session/title" => {
@@ -4489,6 +4527,8 @@ fn acp_usage(usage: TokenUsage) -> Usage {
         usage.completion_tokens,
     )
     .cached_read_tokens(Some(usage.prompt_cache_hit_tokens))
+    .cached_write_tokens(Some(usage.prompt_cache_write_tokens))
+    .thought_tokens((usage.reasoning_tokens > 0).then_some(usage.reasoning_tokens))
 }
 
 fn truncate_text(value: &str, max_bytes: usize) -> String {
@@ -4578,5 +4618,122 @@ mod tests {
                 assert!(logged.contains(kept), "trace {trace}: {kept}: {logged}");
             }
         }
+    }
+
+    fn session_record() -> SessionRecord {
+        SessionRecord::new(
+            std::env::temp_dir(),
+            Vec::new(),
+            "deepseek-v4-flash".to_string(),
+            PermissionMode::Ask,
+            ReasoningEffort::High,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn native_dsh_usage_sums_disjoint_counters_and_keeps_last_call_context() {
+        let mut record = session_record();
+        record_dsh_usage(
+            &mut record,
+            &json!({
+                "inputTokens": 10,
+                "outputTokens": 10,
+                "cacheReadTokens": 7,
+                "cacheWriteTokens": 3,
+                "reasoningTokens": 4,
+            }),
+        );
+        assert_eq!(
+            record.context_used, 30,
+            "first call fills 20 prompt + 10 output"
+        );
+        record_dsh_usage(
+            &mut record,
+            &json!({
+                "inputTokens": 4,
+                "outputTokens": 2,
+                "cacheReadTokens": 5,
+                "cacheWriteTokens": 1,
+            }),
+        );
+        assert_eq!(
+            record.usage,
+            TokenUsage {
+                prompt_tokens: 30,
+                completion_tokens: 12,
+                total_tokens: 42,
+                prompt_cache_hit_tokens: 12,
+                prompt_cache_miss_tokens: 14,
+                prompt_cache_write_tokens: 4,
+                reasoning_tokens: 4,
+            }
+        );
+        assert_eq!(
+            record.context_used, 12,
+            "context meter tracks the last model call, not the turn total"
+        );
+
+        let turn = turn_acp_usage(record.usage);
+        assert_eq!(turn.input_tokens, 30);
+        assert_eq!(turn.output_tokens, 12);
+        assert_eq!(turn.total_tokens, 42);
+        assert_eq!(turn.cached_read_tokens, Some(12));
+        assert_eq!(turn.cached_write_tokens, Some(4));
+        assert_eq!(turn.thought_tokens, Some(4));
+        assert_eq!(turn.input_tokens + turn.output_tokens, turn.total_tokens);
+        assert_eq!(
+            turn.meta
+                .as_ref()
+                .and_then(|meta| meta.get("mjolnir.dev/usage-scope"))
+                .and_then(Value::as_str),
+            Some("turn")
+        );
+    }
+
+    #[test]
+    fn native_dsh_turn_usage_is_the_delta_after_a_previous_turn() {
+        let mut record = session_record();
+        record_dsh_usage(
+            &mut record,
+            &json!({
+                "inputTokens": 10,
+                "outputTokens": 10,
+                "cacheReadTokens": 7,
+                "cacheWriteTokens": 3,
+            }),
+        );
+        record_dsh_usage(
+            &mut record,
+            &json!({
+                "inputTokens": 4,
+                "outputTokens": 2,
+                "cacheReadTokens": 5,
+                "cacheWriteTokens": 1,
+            }),
+        );
+        let initial_usage = record.usage.clone();
+
+        // A second turn starts from the persisted session total and reports
+        // only its own calls.
+        record_dsh_usage(
+            &mut record,
+            &json!({
+                "inputTokens": 6,
+                "outputTokens": 4,
+                "cacheReadTokens": 2,
+                "cacheWriteTokens": 1,
+            }),
+        );
+        let turn_usage = record.usage.saturating_sub(&initial_usage);
+        assert_eq!(turn_usage.prompt_tokens, 9);
+        assert_eq!(turn_usage.completion_tokens, 4);
+        assert_eq!(turn_usage.total_tokens, 13);
+        assert_eq!(turn_usage.prompt_cache_hit_tokens, 2);
+        assert_eq!(turn_usage.prompt_cache_miss_tokens, 6);
+        assert_eq!(turn_usage.prompt_cache_write_tokens, 1);
+        assert_eq!(record.usage.total_tokens, 55);
+        assert_eq!(record.context_used, 13);
     }
 }

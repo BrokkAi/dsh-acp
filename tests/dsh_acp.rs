@@ -409,6 +409,158 @@ async fn v2_cancel_settles_the_dsh_turn_to_idle() {
 
 #[tokio::test]
 #[ignore = "requires the pinned official DeepSeek Harness runtime"]
+async fn v1_native_dsh_usage_sums_steps_and_reports_turn_deltas() {
+    let first = json!({
+        "inputTokens": 10,
+        "outputTokens": 10,
+        "cacheReadTokens": 7,
+        "cacheWriteTokens": 3
+    });
+    let second = json!({
+        "inputTokens": 4,
+        "outputTokens": 2,
+        "cacheReadTokens": 5,
+        "cacheWriteTokens": 1
+    });
+    let third = json!({
+        "inputTokens": 6,
+        "outputTokens": 4,
+        "cacheReadTokens": 2,
+        "cacheWriteTokens": 1
+    });
+    let server = MessagesServer::scripted(
+        vec![
+            tool_write_response_with_usage(&first),
+            text_response_with_usage("write completed", &second),
+            text_response_with_usage("second answer", &third),
+        ],
+        3,
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let mut peer = Peer::spawn(home.path(), data.path(), &server.base_url).await;
+    peer.initialize(1).await;
+    let session_id = peer.new_session(2, workspace.path()).await;
+
+    let result = peer
+        .request(
+            3,
+            "session/prompt",
+            json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "Write approved.txt"}]}),
+        )
+        .await;
+    assert_eq!(result["stopReason"], "end_turn");
+    assert_turn_usage(&result["usage"], 30, 12, 12, 4);
+    assert_eq!(
+        usage_updates(&peer),
+        vec![30, 12],
+        "context_used follows each model call, not the cumulative turn total"
+    );
+    assert_eq!(peer.streamed_text(), "write completed");
+
+    let result = peer
+        .request(
+            4,
+            "session/prompt",
+            json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "Continue"}]}),
+        )
+        .await;
+    assert_eq!(result["stopReason"], "end_turn");
+    assert_turn_usage(&result["usage"], 9, 4, 2, 1);
+    assert_eq!(
+        usage_updates(&peer),
+        vec![30, 12, 13],
+        "the second turn reports its own last call"
+    );
+    assert_eq!(peer.streamed_text(), "write completedsecond answer");
+    assert_eq!(server.requests().await, 3);
+    peer.request(5, "session/close", json!({"sessionId": session_id}))
+        .await;
+    peer.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned official DeepSeek Harness runtime"]
+async fn v2_native_dsh_usage_sums_steps_and_reports_turn_deltas() {
+    let first = json!({
+        "inputTokens": 10,
+        "outputTokens": 10,
+        "cacheReadTokens": 7,
+        "cacheWriteTokens": 3
+    });
+    let second = json!({
+        "inputTokens": 4,
+        "outputTokens": 2,
+        "cacheReadTokens": 5,
+        "cacheWriteTokens": 1
+    });
+    let third = json!({
+        "inputTokens": 6,
+        "outputTokens": 4,
+        "cacheReadTokens": 2,
+        "cacheWriteTokens": 1
+    });
+    let server = MessagesServer::scripted(
+        vec![
+            tool_write_response_with_usage(&first),
+            text_response_with_usage("write completed", &second),
+            text_response_with_usage("second answer", &third),
+        ],
+        3,
+    )
+    .await;
+    let home = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let mut peer = Peer::spawn(home.path(), data.path(), &server.base_url).await;
+    peer.initialize(2).await;
+    let session_id = peer.new_session(2, workspace.path()).await;
+
+    let accepted = peer
+        .request(
+            3,
+            "session/prompt",
+            json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "Write approved.txt"}]}),
+        )
+        .await;
+    assert!(accepted["messageId"].as_str().is_some());
+    let idle = peer.wait_for_idle().await;
+    assert_eq!(idle["stopReason"], "end_turn");
+    assert_turn_usage(&idle["usage"], 30, 12, 12, 4);
+    assert_eq!(
+        usage_updates(&peer),
+        vec![30, 12],
+        "context_used follows each model call, not the cumulative turn total"
+    );
+    assert_eq!(peer.streamed_text(), "write completed");
+
+    let accepted = peer
+        .request(
+            4,
+            "session/prompt",
+            json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "Continue"}]}),
+        )
+        .await;
+    assert!(accepted["messageId"].as_str().is_some());
+    let idle = peer.wait_for_idle().await;
+    assert_eq!(idle["stopReason"], "end_turn");
+    assert_turn_usage(&idle["usage"], 9, 4, 2, 1);
+    assert_eq!(
+        usage_updates(&peer),
+        vec![30, 12, 13],
+        "the second turn reports its own last call"
+    );
+    assert_eq!(peer.streamed_text(), "write completedsecond answer");
+    assert_eq!(server.requests().await, 3);
+    peer.request(5, "session/close", json!({"sessionId": session_id}))
+        .await;
+    peer.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned official DeepSeek Harness runtime"]
 async fn session_new_mounts_an_acp_mcp_server_in_dsh() {
     let server = MessagesServer::scripted(vec![], 0).await;
     let home = TempDir::new().unwrap();
@@ -595,6 +747,36 @@ fn text_response(text: &str) -> Vec<Value> {
 }
 
 fn tool_write_response() -> Vec<Value> {
+    tool_write_response_with_usage(&json!({
+        "inputTokens": 10,
+        "outputTokens": 10,
+        "cacheReadTokens": 0,
+        "cacheWriteTokens": 0
+    }))
+}
+
+/// The fake Messages API usage fields DSH maps onto its disjoint counters.
+fn wire_usage(usage: &Value) -> Value {
+    json!({
+        "input_tokens": usage["inputTokens"],
+        "output_tokens": 0,
+        "cache_read_input_tokens": usage["cacheReadTokens"],
+        "cache_creation_input_tokens": usage["cacheWriteTokens"],
+    })
+}
+
+fn text_response_with_usage(text: &str, usage: &Value) -> Vec<Value> {
+    vec![
+        json!({"type":"message_start","message":{"id":"msg_text","model":"deepseek-v4-flash","usage":wire_usage(usage)}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":usage["outputTokens"]}}),
+        json!({"type":"message_stop"}),
+    ]
+}
+
+fn tool_write_response_with_usage(usage: &Value) -> Vec<Value> {
     let arguments = json!({
         "file_path": "approved.txt",
         "content": "approved write",
@@ -602,13 +784,61 @@ fn tool_write_response() -> Vec<Value> {
         "justification": "The user asked for this exact file write."
     });
     vec![
-        json!({"type":"message_start","message":{"id":"msg_tool","model":"deepseek-v4-flash","usage":{"input_tokens":10,"output_tokens":0}}}),
+        json!({"type":"message_start","message":{"id":"msg_tool","model":"deepseek-v4-flash","usage":wire_usage(usage)}}),
         json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"write","input":{}}}),
         json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":arguments.to_string()}}),
         json!({"type":"content_block_stop","index":0}),
-        json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":10}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":usage["outputTokens"]}}),
         json!({"type":"message_stop"}),
     ]
+}
+
+fn usage_updates(peer: &Peer) -> Vec<u64> {
+    peer.updates
+        .iter()
+        .filter(|update| update["sessionUpdate"] == "usage_update")
+        .filter_map(|update| update["used"].as_u64())
+        .collect()
+}
+
+/// A turn-scoped usage report whose input includes cache tokens, as Mjolnir
+/// prices it, with the cache buckets also declared separately.
+fn assert_turn_usage(usage: &Value, input: u64, output: u64, read: u64, write: u64) {
+    assert_eq!(usage["inputTokens"].as_u64(), Some(input), "usage: {usage}");
+    assert_eq!(
+        usage["outputTokens"].as_u64(),
+        Some(output),
+        "usage: {usage}"
+    );
+    assert_eq!(
+        usage["totalTokens"].as_u64(),
+        Some(input + output),
+        "usage: {usage}"
+    );
+    assert_eq!(
+        usage["cachedReadTokens"].as_u64(),
+        Some(read),
+        "usage: {usage}"
+    );
+    assert_eq!(
+        usage["cachedWriteTokens"].as_u64(),
+        Some(write),
+        "usage: {usage}"
+    );
+    assert_eq!(
+        usage["inputTokens"].as_u64().unwrap() + usage["outputTokens"].as_u64().unwrap(),
+        usage["totalTokens"].as_u64().unwrap(),
+        "input + output must equal total: {usage}"
+    );
+    assert_eq!(
+        usage["_meta"]["mjolnir.dev/usage-scope"].as_str(),
+        Some("turn"),
+        "usage: {usage}"
+    );
+    assert!(
+        usage.get("thoughtTokens").is_none(),
+        "DeepSeek reports no separate reasoning count: {usage}"
+    );
 }
 
 async fn read_http_json(socket: &mut TcpStream) -> Value {

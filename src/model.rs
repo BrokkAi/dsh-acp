@@ -233,6 +233,15 @@ pub struct TokenUsage {
     pub total_tokens: u64,
     pub prompt_cache_hit_tokens: u64,
     pub prompt_cache_miss_tokens: u64,
+    /// Cache writes DSH reports separately from prompt tokens.
+    ///
+    /// Defaulted so session files persisted before this counter existed still
+    /// deserialize.
+    #[serde(default)]
+    pub prompt_cache_write_tokens: u64,
+    /// Output tokens spent on reasoning, when the provider reports them.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
 }
 
 impl TokenUsage {
@@ -248,6 +257,34 @@ impl TokenUsage {
         self.prompt_cache_miss_tokens = self
             .prompt_cache_miss_tokens
             .saturating_add(other.prompt_cache_miss_tokens);
+        self.prompt_cache_write_tokens = self
+            .prompt_cache_write_tokens
+            .saturating_add(other.prompt_cache_write_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
+    }
+
+    /// The usage one turn added on top of the session total it started from.
+    ///
+    /// Counters saturate at zero so a truncated or reordered session snapshot
+    /// can never underflow a turn delta.
+    pub fn saturating_sub(&self, other: &Self) -> Self {
+        Self {
+            prompt_tokens: self.prompt_tokens.saturating_sub(other.prompt_tokens),
+            completion_tokens: self
+                .completion_tokens
+                .saturating_sub(other.completion_tokens),
+            total_tokens: self.total_tokens.saturating_sub(other.total_tokens),
+            prompt_cache_hit_tokens: self
+                .prompt_cache_hit_tokens
+                .saturating_sub(other.prompt_cache_hit_tokens),
+            prompt_cache_miss_tokens: self
+                .prompt_cache_miss_tokens
+                .saturating_sub(other.prompt_cache_miss_tokens),
+            prompt_cache_write_tokens: self
+                .prompt_cache_write_tokens
+                .saturating_sub(other.prompt_cache_write_tokens),
+            reasoning_tokens: self.reasoning_tokens.saturating_sub(other.reasoning_tokens),
+        }
     }
 }
 
@@ -751,6 +788,77 @@ mod tests {
             context.last().and_then(ChatMessage::text_content),
             Some("latest request")
         );
+    }
+
+    #[test]
+    fn usage_math_includes_cache_writes_and_reasoning() {
+        let mut usage = TokenUsage {
+            prompt_tokens: 30,
+            completion_tokens: 12,
+            total_tokens: 42,
+            prompt_cache_hit_tokens: 12,
+            prompt_cache_miss_tokens: 14,
+            prompt_cache_write_tokens: 4,
+            reasoning_tokens: 5,
+        };
+        usage.saturating_add(&TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 4,
+            total_tokens: 14,
+            prompt_cache_hit_tokens: 2,
+            prompt_cache_miss_tokens: 7,
+            prompt_cache_write_tokens: 1,
+            reasoning_tokens: 3,
+        });
+        assert_eq!(
+            usage,
+            TokenUsage {
+                prompt_tokens: 40,
+                completion_tokens: 16,
+                total_tokens: 56,
+                prompt_cache_hit_tokens: 14,
+                prompt_cache_miss_tokens: 21,
+                prompt_cache_write_tokens: 5,
+                reasoning_tokens: 8,
+            }
+        );
+        let delta = usage.saturating_sub(&TokenUsage {
+            prompt_tokens: 30,
+            completion_tokens: 12,
+            total_tokens: 42,
+            prompt_cache_hit_tokens: 12,
+            prompt_cache_miss_tokens: 14,
+            prompt_cache_write_tokens: 4,
+            reasoning_tokens: 5,
+        });
+        assert_eq!(delta.prompt_tokens, 10);
+        assert_eq!(delta.total_tokens, 14);
+        assert_eq!(delta.prompt_cache_write_tokens, 1);
+        assert_eq!(delta.reasoning_tokens, 3);
+    }
+
+    #[test]
+    fn persisted_session_without_new_usage_counters_still_deserializes() {
+        let stored = record();
+        let mut value = serde_json::to_value(&stored).unwrap();
+        let usage = value["usage"].as_object_mut().unwrap();
+        // The shape written before cache writes and reasoning were tracked.
+        assert!(usage.remove("prompt_cache_write_tokens").is_some());
+        assert!(usage.remove("reasoning_tokens").is_some());
+        usage.insert("prompt_tokens".to_string(), serde_json::json!(11));
+        usage.insert("completion_tokens".to_string(), serde_json::json!(5));
+        usage.insert("total_tokens".to_string(), serde_json::json!(16));
+        usage.insert("prompt_cache_hit_tokens".to_string(), serde_json::json!(2));
+        usage.insert("prompt_cache_miss_tokens".to_string(), serde_json::json!(9));
+
+        let restored: SessionRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.usage.prompt_tokens, 11);
+        assert_eq!(restored.usage.completion_tokens, 5);
+        assert_eq!(restored.usage.total_tokens, 16);
+        assert_eq!(restored.usage.prompt_cache_hit_tokens, 2);
+        assert_eq!(restored.usage.prompt_cache_miss_tokens, 9);
+        assert_eq!(restored.usage.prompt_cache_write_tokens, 0);
+        assert_eq!(restored.usage.reasoning_tokens, 0);
     }
 
     #[test]

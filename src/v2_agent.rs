@@ -31,7 +31,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    agent::{Harness, reject_duplicate_config_ids, steering_params, typed_json},
+    agent::{Harness, record_dsh_usage, reject_duplicate_config_ids, steering_params, typed_json},
     auth_status,
     config::ReasoningEffort,
     deepseek::{Completion, StreamEvent},
@@ -3540,20 +3540,7 @@ async fn apply_v2_dsh_notification(
                             ));
                         }
                         if let Some(usage) = data.get("usage") {
-                            state.record.usage.prompt_tokens = usage
-                                .get("inputTokens")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0);
-                            state.record.usage.completion_tokens = usage
-                                .get("outputTokens")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0);
-                            state.record.usage.total_tokens = state
-                                .record
-                                .usage
-                                .prompt_tokens
-                                .saturating_add(state.record.usage.completion_tokens);
-                            state.record.context_used = state.record.usage.total_tokens;
+                            record_dsh_usage(&mut state.record, usage);
                         }
                     }
                     "tool/call" => {
@@ -4345,32 +4332,16 @@ fn v2_usage(usage: TokenUsage) -> v2::Usage {
         usage.completion_tokens,
     )
     .cached_read_tokens(Some(usage.prompt_cache_hit_tokens))
+    .cached_write_tokens(Some(usage.prompt_cache_write_tokens))
+    .thought_tokens((usage.reasoning_tokens > 0).then_some(usage.reasoning_tokens))
 }
 
 /// A completed v2 foreground turn's own usage. `usage_update` still carries
 /// the session total, while this declares the scope the idle snapshot uses.
 fn v2_turn_usage(session_usage: &TokenUsage, initial_usage: &TokenUsage) -> v2::Usage {
-    let turn_usage = TokenUsage {
-        prompt_tokens: session_usage
-            .prompt_tokens
-            .saturating_sub(initial_usage.prompt_tokens),
-        completion_tokens: session_usage
-            .completion_tokens
-            .saturating_sub(initial_usage.completion_tokens),
-        total_tokens: session_usage
-            .total_tokens
-            .saturating_sub(initial_usage.total_tokens),
-        prompt_cache_hit_tokens: session_usage
-            .prompt_cache_hit_tokens
-            .saturating_sub(initial_usage.prompt_cache_hit_tokens),
-        prompt_cache_miss_tokens: session_usage
-            .prompt_cache_miss_tokens
-            .saturating_sub(initial_usage.prompt_cache_miss_tokens),
-    };
-    v2_usage(turn_usage).meta(Some(serde_json::Map::from_iter([(
-        "mjolnir.dev/usage-scope".to_string(),
-        json!("turn"),
-    )])))
+    v2_usage(session_usage.saturating_sub(initial_usage)).meta(Some(serde_json::Map::from_iter([
+        ("mjolnir.dev/usage-scope".to_string(), json!("turn")),
+    ])))
 }
 
 fn v2_error_from(error: Error) -> v2::Error {
@@ -4388,5 +4359,61 @@ fn elicitation_text(value: &v2::ElicitationContentValue) -> String {
         v2::ElicitationContentValue::Boolean(value) => value.to_string(),
         v2::ElicitationContentValue::StringArray(values) => values.join(", "),
         _ => serde_json::to_string(value).unwrap_or_else(|_| "<value>".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn usage(
+        prompt: u64,
+        completion: u64,
+        hit: u64,
+        miss: u64,
+        write: u64,
+        reasoning: u64,
+    ) -> TokenUsage {
+        TokenUsage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt.saturating_add(completion),
+            prompt_cache_hit_tokens: hit,
+            prompt_cache_miss_tokens: miss,
+            prompt_cache_write_tokens: write,
+            reasoning_tokens: reasoning,
+        }
+    }
+
+    #[test]
+    fn v2_turn_usage_reports_only_the_turn_delta_with_cache_and_scope() {
+        let initial = usage(30, 12, 12, 14, 4, 4);
+        let session = usage(39, 16, 14, 20, 5, 9);
+        let turn = v2_turn_usage(&session, &initial);
+
+        assert_eq!(turn.input_tokens, 9);
+        assert_eq!(turn.output_tokens, 4);
+        assert_eq!(turn.total_tokens, 13);
+        assert_eq!(turn.cached_read_tokens, Some(2));
+        assert_eq!(turn.cached_write_tokens, Some(1));
+        assert_eq!(turn.thought_tokens, Some(5));
+        assert_eq!(turn.input_tokens + turn.output_tokens, turn.total_tokens);
+        assert_eq!(
+            turn.meta
+                .as_ref()
+                .and_then(|meta| meta.get("mjolnir.dev/usage-scope"))
+                .and_then(Value::as_str),
+            Some("turn")
+        );
+    }
+
+    #[test]
+    fn v2_zero_usage_keeps_the_same_shape_as_v1() {
+        let initial = usage(0, 0, 0, 0, 0, 0);
+        let turn = v2_turn_usage(&initial, &initial);
+        assert_eq!(turn.total_tokens, 0);
+        assert_eq!(turn.cached_read_tokens, Some(0));
+        assert_eq!(turn.cached_write_tokens, Some(0));
+        assert_eq!(turn.thought_tokens, None);
     }
 }

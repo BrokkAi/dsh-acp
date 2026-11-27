@@ -760,6 +760,7 @@ fn parse_usage(value: Option<&Value>) -> TokenUsage {
         prompt_cache_hit_tokens: u64_field(value, "prompt_cache_hit_tokens")
             .max(u64_field(value, "/prompt_tokens_details/cached_tokens")),
         prompt_cache_miss_tokens: u64_field(value, "prompt_cache_miss_tokens"),
+        ..TokenUsage::default()
     }
 }
 
