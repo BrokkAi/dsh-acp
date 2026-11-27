@@ -6,6 +6,20 @@ All notable changes to `dsh-acp` are recorded here. The format follows
 
 ## Unreleased
 
+## 0.8.2 - 2026-11-27
+
+### Fixed
+
+- Native DSH turns now accumulate disjoint per-call token usage (`inputTokens`,
+  `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`, and optional
+  `reasoningTokens`) into `SessionRecord.usage` instead of overwriting the
+  session total on each model call and dropping cache counters, while keeping
+  `context_used` equal to the last call's total tokens.
+- ACP v1 `session/prompt` responses and ACP v2 idle notifications now return
+  the turn's usage delta with `mjolnir.dev/usage-scope = "turn"`, inclusive
+  `input_tokens` (`input + output == total`), and separate `cached_read_tokens`
+  and `cached_write_tokens` counters.
+
 ## 0.8.1 - 2026-11-25
 
 ### Fixed
